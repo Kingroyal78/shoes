@@ -84,6 +84,26 @@
         },
         "file": { "type": "string", "description": "Optional log file path. The CLI -l/--log-file can add destinations." }
       }
+    },
+    "outbounds": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/outbound" },
+      "description": "Optional local outbounds for node-side routing. Credentials live in this local file; keep it private (chmod 0600)."
+    },
+    "default_out": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Fallback outbound tag used when no route rule matches. Must be a configured outbound tag; absent means direct (today's behavior)."
+    },
+    "route_rules": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "CRS one-liners (DOMAIN-SUFFIX/DOMAIN/DOMAIN-KEYWORD/DOMAIN-REGEX/IP-CIDR/IP-CIDR6/GEOSITE/GEOIP/PROTOCOL/MATCH). Matched in order, first match wins; MATCH is the explicit catch-all."
+    },
+    "rule_providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule_provider" },
+      "description": "External CRS rule files, hot-reloaded by mtime."
     }
   },
   "$defs": {
@@ -94,6 +114,79 @@
       "properties": {
         "cert_file": { "type": "string", "description": "Readable PEM certificate chain path." },
         "key_file": { "type": "string", "description": "Readable PEM private key path." }
+      }
+    },
+    "outbound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag"],
+      "properties": {
+        "tag": { "type": "string", "minLength": 1, "description": "Unique outbound tag referenced by route rules, default_out, and chains." },
+        "chain": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Chain of outbound tags to forward through. When present, type/server and credentials are ignored. Hops must exist; cycles are rejected."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["direct", "http", "socks", "socks5", "ss", "shadowsocks", "snell", "vless", "trojan", "vmess", "anytls", "naive", "naiveproxy", "shadowtls", "ws", "websocket"],
+          "description": "Protocol type. Aliases socks5, ss, naive, and ws/websocket match the client protocol stack names. ws/websocket alone is rejected (use transport: {type: ws} with a proxy type)."
+        },
+        "server": { "type": "string", "minLength": 1, "description": "Upstream server hostname or IP." },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Upstream server port." },
+        "user_id": { "type": "string", "minLength": 1, "description": "Required for vless and vmess." },
+        "password": { "type": "string", "description": "Required for trojan, anytls, ss, snell, and naiveproxy. For shadowtls it is both the ShadowTLS secret and the inner Shadowsocks password." },
+        "cipher": { "type": "string", "minLength": 1, "description": "Required for ss, snell, and shadowtls (inner Shadowsocks cipher); required for vmess." },
+        "username": { "type": "string", "description": "Optional for http/socks; required for naiveproxy." },
+        "udp": { "type": "boolean", "default": true, "description": "Enable UDP forwarding where the protocol supports it." },
+        "tls": { "$ref": "#/$defs/outbound_tls" },
+        "reality": { "$ref": "#/$defs/outbound_reality" },
+        "transport": { "$ref": "#/$defs/outbound_transport" }
+      }
+    },
+    "outbound_tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Default is inferred: trojan/anytls/naiveproxy imply TLS; vless/vmess need an explicit true."
+        },
+        "sni": { "type": "string", "minLength": 1, "description": "TLS SNI hostname; defaults to the server hostname." },
+        "allow_insecure": { "type": "boolean", "default": false, "description": "Skip server certificate verification (verify=false)." },
+        "cert_file": { "type": "string", "minLength": 1, "description": "Readable PEM file with the private CA that signs the upstream server certificate; its contents are embedded in the client TLS config. Checked by validate." },
+        "alpn": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "TLS ALPN protocols, e.g. h2, http/1.1." }
+      }
+    },
+    "outbound_reality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_key"],
+      "properties": {
+        "public_key": { "type": "string", "minLength": 1, "description": "REALITY public key (base64url)." },
+        "short_id": { "type": "string", "description": "REALITY short id (hex, up to 16 chars); defaults to all zeros." },
+        "server_name": { "type": "string", "minLength": 1, "description": "REALITY SNI; required." }
+      }
+    },
+    "outbound_transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["ws", "websocket"], "description": "WebSocket is supported; grpc/httpupgrade/xhttp are rejected by validate for now." },
+        "path": { "type": "string", "description": "WebSocket path, default /." },
+        "host": { "type": "string", "description": "Host header sent by the WebSocket client." }
+      }
+    },
+    "rule_provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "path"],
+      "properties": {
+        "tag": { "type": "string", "minLength": 1, "description": "Unique provider tag used in diagnostics." },
+        "path": { "type": "string", "minLength": 1, "description": "File containing CRS one-liners, one per line. Must exist and parse; checked by validate." },
+        "reload_interval_secs": { "type": "integer", "minimum": 1, "default": 300, "description": "mtime poll interval for hot reload." }
       }
     },
     "hysteria2_masquerade": {
