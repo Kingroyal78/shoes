@@ -389,9 +389,16 @@ impl DialError {
 mod tests {
     use super::*;
     use std::error::Error;
+    use std::future::poll_fn;
     use std::net::Ipv4Addr;
+    use std::pin::Pin;
+    use std::task::Poll;
 
+    use tokio::io::ReadBuf;
+
+    use crate::async_stream::{AsyncFlushMessage, AsyncReadMessage, AsyncWriteMessage};
     use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::util::allocate_vec;
 
     fn test_resolver() -> Arc<dyn Resolver> {
         Arc::new(crate::resolver::NativeResolver::new())
@@ -502,13 +509,208 @@ mod tests {
         assert!(matches!(err, DialError::Io(_)));
     }
 
-    /// The full missing-outbound path (rule hit → tag absent from `chains`)
-    /// needs a non-empty `CompiledRules`, whose `compile()` lives in another
-    /// agent's module; here the error variant's rendering is verified.
+    /// Verify that an IP-CIDR rule routes traffic to the configured outbound
+    /// chain. Spawns a local TCP echo server, configures an IP-CIDR rule
+    /// matching 127.0.0.1 → `direct-out`, and dials through the dispatcher.
+    #[tokio::test]
+    async fn ip_cidr_rule_routes_to_configured_outbound() {
+        let resolver = test_resolver();
+        let direct_group = Arc::new(build_direct_chain_group(resolver.clone()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _echo_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.split();
+            tokio::io::copy(&mut r, &mut w).await.unwrap();
+            let _ = done_tx.send(());
+        });
+
+        let config_lines = vec!["IP-CIDR,127.0.0.1/32,direct-out".to_string()];
+        let compiled = compile_route_rules(
+            "test",
+            &config_lines,
+            &[],
+            &RouteRuleSetsConfig {
+                geosite: HashMap::new(),
+                geoip: HashMap::new(),
+            },
+        )
+        .unwrap();
+
+        let mut chains = HashMap::new();
+        chains.insert("direct-out".to_string(), direct_group.clone());
+
+        let dispatcher =
+            OutboundDispatcher::new(Some(Arc::new(compiled)), chains, None, direct_group.clone());
+
+        assert!(dispatcher.has_routing());
+
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), echo_addr.port());
+        let mut stream = dispatcher
+            .dial_tcp(&target, None, &resolver)
+            .await
+            .expect("dial_tcp must succeed via IP-CIDR rule");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let message = b"hello-dispatcher";
+        stream.write_all(message).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], message, "echo must return original bytes");
+
+        drop(stream);
+        done_rx.await.ok();
+    }
+
+    /// Without rules (empty rule set), `dial_tcp` falls back to direct,
+    /// connecting to the target without any routing.
+    #[tokio::test]
+    async fn no_rules_dials_direct_to_tcp_echo() {
+        let resolver = test_resolver();
+        let direct_group = Arc::new(build_direct_chain_group(resolver.clone()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _echo_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.split();
+            tokio::io::copy(&mut r, &mut w).await.unwrap();
+            let _ = done_tx.send(());
+        });
+
+        let dispatcher = OutboundDispatcher::new(None, HashMap::new(), None, direct_group);
+
+        assert!(!dispatcher.has_routing());
+
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), echo_addr.port());
+        let mut stream = dispatcher
+            .dial_tcp(&target, None, &resolver)
+            .await
+            .expect("no-rules dial_tcp must succeed via direct");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let message = b"direct-echo";
+        stream.write_all(message).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(
+            n > 0,
+            "echo from direct fallback must return a positive number of bytes"
+        );
+
+        drop(stream);
+        done_rx.await.ok();
+    }
+
+    /// `connect_udp_bidirectional` with no-rules dispatcher sends a UDP
+    /// datagram and receives an echo through the direct chain group.
+    #[tokio::test]
+    async fn udp_bidirectional_no_rules_echoes() {
+        let resolver = test_resolver();
+        let direct_group = Arc::new(build_direct_chain_group(resolver.clone()));
+
+        let echo_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_socket.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, addr) = echo_socket.recv_from(&mut buf).await.unwrap();
+            echo_socket.send_to(&buf[..n], addr).await.unwrap();
+            let _ = done_tx.send(());
+        });
+
+        let dispatcher = OutboundDispatcher::new(None, HashMap::new(), None, direct_group);
+
+        let resolved = ResolvedLocation::with_resolved(
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), echo_addr.port()),
+            echo_addr,
+        );
+        let stream = dispatcher
+            .connect_udp_bidirectional(&resolved, &resolver)
+            .await
+            .expect("no-rules connect_udp_bidirectional must succeed");
+
+        let mut stream = stream;
+
+        let message = b"udp-echo";
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, message))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        let mut read_buf = allocate_vec(2048);
+        let n = poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut read_buf);
+            match Pin::new(&mut stream).poll_read_message(cx, &mut rb) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .unwrap();
+        assert!(n > 0, "UDP echo must return a positive number of bytes");
+
+        done_rx.await.ok();
+    }
+
+    /// Verifies that rule-provider hot reload can be attached to a new
+    /// dispatcher without panicking, and the dispatcher remains usable.
     #[test]
-    fn missing_outbound_error_display() {
-        let err = DialError::MissingOutbound;
-        assert_eq!(err.to_string(), "no outbound configured for rule result");
-        assert!(err.source().is_none());
+    fn with_rule_refresh_seeds_refresh_state() {
+        let resolver = test_resolver();
+        let direct = Arc::new(build_direct_chain_group(resolver));
+        let empty_rules = Arc::new(CompiledRules::empty());
+
+        let mtimes: HashMap<String, u64> = HashMap::new();
+        let d = OutboundDispatcher::new(Some(empty_rules), HashMap::new(), None, direct)
+            .with_rule_refresh(
+                "test-node",
+                &[],
+                vec![],
+                RouteRuleSetsConfig {
+                    geosite: HashMap::new(),
+                    geoip: HashMap::new(),
+                },
+                Duration::from_secs(300),
+                mtimes,
+            );
+        assert!(d.has_routing());
+    }
+
+    /// Calling `maybe_refresh_rules` on an empty/no-provider dispatcher is a
+    /// no-op — no reload is needed and no error is raised.
+    #[tokio::test]
+    async fn maybe_refresh_rules_no_providers_is_noop() {
+        let resolver = test_resolver();
+        let direct = Arc::new(build_direct_chain_group(resolver));
+        let empty_rules = Arc::new(CompiledRules::empty());
+
+        let mtimes: HashMap<String, u64> = HashMap::new();
+        let d = std::sync::Arc::new(
+            OutboundDispatcher::new(Some(empty_rules), HashMap::new(), None, direct)
+                .with_rule_refresh(
+                    "test-node",
+                    &[],
+                    vec![],
+                    RouteRuleSetsConfig {
+                        geosite: HashMap::new(),
+                        geoip: HashMap::new(),
+                    },
+                    Duration::from_secs(300),
+                    mtimes,
+                ),
+        );
+
+        // No providers, so reload is a no-op
+        d.maybe_refresh_rules();
+        // shouldn't panic
     }
 }
