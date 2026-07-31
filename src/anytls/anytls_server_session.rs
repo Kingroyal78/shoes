@@ -13,7 +13,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_handler::AuthenticatedUser;
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult};
 use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
@@ -50,6 +50,9 @@ pub struct AnyTlsSession {
     /// Channel for receiving outgoing data from streams (bounded for backpressure)
     outgoing_rx: Mutex<mpsc::Receiver<(u32, Bytes)>>,
     outgoing_tx: mpsc::Sender<(u32, Bytes)>,
+
+    /// Node-side outbound dispatcher for stream dials.
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
 
     /// Session state
     is_closed: Arc<AtomicBool>,
@@ -105,6 +108,7 @@ pub struct AnyTlsServerSessionContext {
     pub padding: Arc<PaddingFactory>,
     pub resolver: Arc<dyn Resolver>,
     pub proxy_provider: Arc<ClientProxySelector>,
+    pub outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
     pub udp_enabled: bool,
     pub user_name: String,
     pub authenticated_user: Option<AuthenticatedUser>,
@@ -127,6 +131,7 @@ impl AnyTlsSession {
             padding,
             resolver,
             proxy_provider,
+            outbound_dispatcher,
             udp_enabled,
             user_name,
             authenticated_user,
@@ -160,6 +165,7 @@ impl AnyTlsSession {
             // Stream handling dependencies (always required)
             resolver,
             proxy_provider,
+            outbound_dispatcher,
             udp_enabled,
             user_name,
             authenticated_user,
@@ -210,6 +216,7 @@ impl AnyTlsSession {
             received_client_settings: AtomicBool::new(false),
             resolver: Arc::new(NativeResolver),
             proxy_provider,
+            outbound_dispatcher: None,
             udp_enabled: false,
             user_name: String::new(),
             authenticated_user: None,
@@ -812,11 +819,23 @@ impl AnyTlsSession {
                     remote_location
                 );
 
-                // Connect through the proxy chain
-                let client_result = match chain_group
-                    .connect_tcp(remote_location, &self.resolver)
-                    .await
-                {
+                // Node-side local routing takes over the dial when configured.
+                let client_result = match &self.outbound_dispatcher {
+                    Some(dispatcher) => dispatcher
+                        .dial_tcp(remote_location.location(), None, &self.resolver)
+                        .await
+                        .map(|client_stream| TcpClientSetupResult {
+                            client_stream,
+                            early_data: None,
+                        })
+                        .map_err(|e| std::io::Error::other(e.to_string())),
+                    None => {
+                        chain_group
+                            .connect_tcp(remote_location, &self.resolver)
+                            .await
+                    }
+                };
+                let client_result = match client_result {
                     Ok(result) => result,
                     Err(e) => {
                         // Send SYNACK with error message (protocol v2)

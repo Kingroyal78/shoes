@@ -219,6 +219,7 @@ impl TcpServerHandler for SnellServerHandler {
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
                 initial_remote_data: None,
                 proxy_selector: self.proxy_selector.clone(),
+                outbound_dispatcher: None,
                 authenticated_user: None,
             })
         } else {

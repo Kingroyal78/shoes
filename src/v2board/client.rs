@@ -5,7 +5,7 @@ use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
 
 use super::plugin_api::{
     ConfigRevision, OpaqueEtag, PluginApiError, PluginConfigCandidate, PluginConfigObserved,
-    PluginRuntimeManifest, PluginStatusReport, PluginTransportErrorKind,
+    PluginStatusReport, PluginTransportErrorKind,
 };
 use super::types::{AliveList, AlivePayload, ServerConfig, TrafficPayload, UserList};
 
@@ -491,6 +491,10 @@ mod tests {
             runtime: RuntimeConfig::default(),
             tls: None,
             log: LogConfig::default(),
+            outbounds: Vec::new(),
+            default_out: None,
+            route_rules: Vec::new(),
+            rule_providers: Vec::new(),
         };
         (app, node)
     }

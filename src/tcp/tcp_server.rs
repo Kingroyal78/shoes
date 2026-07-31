@@ -46,6 +46,7 @@ use crate::tcp::tcp_handler::{
 #[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
+use crate::v2board::outbound::dispatcher::{DialError, OutboundDispatcher};
 
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
@@ -197,6 +198,7 @@ pub async fn handle_server_setup_result(
                 stream: mut server_stream,
                 need_initial_flush: server_need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher,
                 connection_success_response,
                 initial_remote_data,
                 authenticated_user,
@@ -234,7 +236,11 @@ pub async fn handle_server_setup_result(
                 let mut initial_remote_data = initial_remote_data.map(Vec::from);
                 let pre_metered_initial_upload_len =
                     initial_remote_data.as_ref().map_or(0, Vec::len);
-                let sniffed_protocol = if proxy_selector.requires_protocol_sniff() {
+                let sniffed_protocol = if proxy_selector.requires_protocol_sniff()
+                    || outbound_dispatcher
+                        .as_ref()
+                        .is_some_and(|dispatcher| dispatcher.requires_protocol_sniff())
+                {
                     sniff_tcp_forward_protocol(&mut server_stream, &mut initial_remote_data).await?
                 } else {
                     None
@@ -248,6 +254,7 @@ pub async fn handle_server_setup_result(
                         resolver,
                         remote_location.clone(),
                         sniffed_protocol,
+                        outbound_dispatcher.as_deref(),
                     ),
                 );
 
@@ -1717,9 +1724,10 @@ pub async fn setup_client_tcp_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
     sniffed_protocol: Option<SniffedProtocol>,
+    outbound_dispatcher: Option<&OutboundDispatcher>,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
     let action = client_proxy_selector
-        .judge_with_protocol(remote_location.into(), &resolver, sniffed_protocol)
+        .judge_with_protocol(remote_location.clone().into(), &resolver, sniffed_protocol)
         .await?;
 
     match action {
@@ -1727,6 +1735,27 @@ pub async fn setup_client_tcp_stream(
             chain_group,
             remote_location,
         } => {
+            // Node-side local routing: when an outbound dispatcher is
+            // configured it takes over the dial (its chain groups include
+            // direct), keeping the v2board selector as the block gate.
+            if let Some(dispatcher) = outbound_dispatcher {
+                let client_stream = dispatcher
+                    .dial_tcp(remote_location.location(), sniffed_protocol, &resolver)
+                    .await
+                    .map_err(|e| {
+                        let kind = match &e {
+                            DialError::Blocked(_) => std::io::ErrorKind::ConnectionRefused,
+                            DialError::MissingOutbound => std::io::ErrorKind::NotFound,
+                            DialError::Io(io) => io.kind(),
+                        };
+                        std::io::Error::new(
+                            kind,
+                            format!("failed to dispatch outbound to {remote_location}: {e}"),
+                        )
+                    })?;
+                return Ok(Some(client_stream));
+            }
+
             let TcpClientSetupResult {
                 client_stream,
                 early_data,
@@ -2547,6 +2576,7 @@ mod tests {
                 connection_success_response: None,
                 initial_remote_data: Some(initial_remote_data.clone().into_boxed_slice()),
                 proxy_selector: direct_allow_selector(resolver.clone(), false),
+                outbound_dispatcher: None,
                 authenticated_user,
             },
             resolver,
@@ -2582,6 +2612,7 @@ mod tests {
                 connection_success_response: None,
                 initial_remote_data: Some(prefix.into_boxed_slice()),
                 proxy_selector: direct_allow_selector(resolver.clone(), true),
+                outbound_dispatcher: None,
                 authenticated_user,
             },
             resolver,
@@ -2641,6 +2672,7 @@ mod tests {
                 connection_success_response: None,
                 initial_remote_data: None,
                 proxy_selector: Arc::new(ClientProxySelector::new(Vec::new())),
+                outbound_dispatcher: None,
                 authenticated_user,
             }),
         };

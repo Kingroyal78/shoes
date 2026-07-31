@@ -33,6 +33,19 @@ pub struct VlessTcpServerHandler {
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     fallback: Option<NetLocation>,
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+}
+
+impl VlessTcpServerHandler {
+    /// Attaches the node-side outbound dispatcher used for the TCP forward
+    /// dial. `None` (the default) keeps the legacy selector direct dial.
+    pub fn with_outbound_dispatcher(
+        mut self,
+        outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+    ) -> Self {
+        self.outbound_dispatcher = outbound_dispatcher;
+        self
+    }
 }
 
 pub trait VlessVisionUserLookup {
@@ -103,6 +116,7 @@ impl VlessTcpServerHandler {
             proxy_selector,
             resolver,
             fallback,
+            outbound_dispatcher: None,
         }
     }
 
@@ -128,6 +142,7 @@ impl VlessTcpServerHandler {
             proxy_selector,
             resolver,
             fallback,
+            outbound_dispatcher: None,
         }
     }
 }
@@ -319,6 +334,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                         Some(unparsed_data.to_vec().into_boxed_slice())
                     },
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 })
             }
@@ -390,6 +406,7 @@ pub async fn setup_custom_tls_vision_vless_server_stream<IO, U>(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     fallback: Option<NetLocation>,
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
 ) -> std::io::Result<TcpServerSetupResult>
 where
     IO: AsyncStream + 'static,
@@ -445,10 +462,12 @@ where
         flow,
         udp_enabled,
         proxy_selector,
+        outbound_dispatcher,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_custom_tls_vision_vless_server_stream_after_auth<IO>(
     mut tls_stream: CryptoTlsStream<IO>,
     mut stream_reader: StreamReader,
@@ -457,6 +476,7 @@ async fn setup_custom_tls_vision_vless_server_stream_after_auth<IO>(
     flow: String,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
 ) -> std::io::Result<TcpServerSetupResult>
 where
     IO: AsyncStream + 'static,
@@ -496,6 +516,7 @@ where
                 connection_success_response: None, // VisionStream will send VLESS response with first write
                 initial_remote_data: None,         // Data fed to VisionStream instead
                 proxy_selector: proxy_selector.clone(),
+                outbound_dispatcher: outbound_dispatcher.clone(),
                 authenticated_user,
             })
         }
@@ -727,6 +748,7 @@ mod tests {
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -762,6 +784,7 @@ mod tests {
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,
             None,
+            None,
         )
         .await;
         let err = match result {
@@ -793,6 +816,7 @@ mod tests {
             true,
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,
+            None,
             None,
         )
         .await;

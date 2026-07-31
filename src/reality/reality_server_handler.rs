@@ -297,6 +297,7 @@ pub async fn setup_reality_server_stream(
                 target.effective_selector.clone(),
                 resolver,
                 vision_cfg.fallback.clone(),
+                None,
             )
             .await
         }

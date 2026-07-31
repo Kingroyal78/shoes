@@ -675,6 +675,10 @@ mod tests {
             },
             tls: None,
             log: LogConfig::default(),
+            outbounds: Vec::new(),
+            default_out: None,
+            route_rules: Vec::new(),
+            rule_providers: Vec::new(),
         });
         let tracker = Arc::new(
             TrafficTracker::new(data_dir.path().to_path_buf())

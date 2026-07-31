@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 pub trait TrafficRecorder: Send + Sync + Debug {
     fn add_traffic(&self, node_tag: &str, uid: u64, upload: u64, download: u64);
@@ -52,6 +53,9 @@ pub enum TcpServerSetupResult {
         initial_remote_data: Option<Box<[u8]>>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        /// Node-side outbound dispatcher for local routing rules; `None`
+        /// keeps the legacy selector direct-dial behavior.
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         authenticated_user: Option<AuthenticatedUser>,
     },
     BidirectionalUdp {

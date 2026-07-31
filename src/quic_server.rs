@@ -146,6 +146,7 @@ async fn process_streams(
                 stream: mut server_stream,
                 need_initial_flush: server_need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher: _,
                 connection_success_response,
                 initial_remote_data,
                 authenticated_user: _,
@@ -157,6 +158,7 @@ async fn process_streams(
                         proxy_selector,
                         resolver,
                         remote_location.clone(),
+                        None,
                         None,
                     ),
                 );

@@ -54,6 +54,20 @@ pub struct TrojanTcpHandler {
     /// TLS-decoded destination for unauthenticated or malformed probe traffic.
     fallback: Option<crate::address::NetLocation>,
     fallback_proxy_selector: Option<Arc<ClientProxySelector>>,
+    /// Node-side outbound dispatcher for server handler use.
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+}
+
+impl TrojanTcpHandler {
+    /// Attaches the node-side outbound dispatcher used for the TCP forward
+    /// dial. `None` (the default) keeps the legacy selector direct dial.
+    pub fn with_outbound_dispatcher(
+        mut self,
+        outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+    ) -> Self {
+        self.outbound_dispatcher = outbound_dispatcher;
+        self
+    }
 }
 
 const TROJAN_PASSWORD_HASH_LEN: usize = 56;
@@ -647,6 +661,7 @@ impl TrojanTcpHandler {
             resolver,
             fallback,
             fallback_proxy_selector,
+            outbound_dispatcher: None,
         }
     }
 
@@ -720,6 +735,7 @@ impl TrojanTcpHandler {
                 .fallback_proxy_selector
                 .clone()
                 .expect("fallback proxy selector required when fallback is configured"),
+            outbound_dispatcher: None,
             authenticated_user: None,
         }
     }
@@ -828,6 +844,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                 .proxy_selector
                 .clone()
                 .expect("proxy_selector required for server handler"),
+            outbound_dispatcher: self.outbound_dispatcher.clone(),
             authenticated_user,
         })
     }

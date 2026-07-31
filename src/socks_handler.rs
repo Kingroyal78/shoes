@@ -367,6 +367,7 @@ pub async fn setup_socks_server_stream_inner(
         connection_success_response: Some(connection_success_response.to_vec().into_boxed_slice()),
         initial_remote_data: stream_reader.unparsed_data_owned(),
         proxy_selector: proxy_selector.clone(),
+        outbound_dispatcher: None,
         authenticated_user: None,
     })
 }

@@ -57,6 +57,8 @@ pub struct ShadowsocksTcpHandler {
     http_obfs: Option<ShadowsocksHttpObfs>,
     h2mux_server_enabled: bool,
     h2mux_padding: bool,
+    /// Node-side outbound dispatcher for server handler use.
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +95,18 @@ impl ShadowsocksTcpHandler {
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
+            outbound_dispatcher: None,
         }
+    }
+
+    /// Attaches the node-side outbound dispatcher used for the TCP forward
+    /// dial. `None` (the default) keeps the legacy selector direct dial.
+    pub fn with_outbound_dispatcher(
+        mut self,
+        outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+    ) -> Self {
+        self.outbound_dispatcher = outbound_dispatcher;
+        self
     }
 
     pub fn with_http_obfs(mut self, http_obfs: ShadowsocksHttpObfs) -> Self {
@@ -187,6 +200,7 @@ impl ShadowsocksTcpHandler {
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
+            outbound_dispatcher: None,
         }
     }
 
@@ -210,6 +224,7 @@ impl ShadowsocksTcpHandler {
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
+            outbound_dispatcher: None,
         }
     }
 
@@ -239,6 +254,7 @@ impl ShadowsocksTcpHandler {
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
+            outbound_dispatcher: None,
         }
     }
 
@@ -266,6 +282,7 @@ impl ShadowsocksTcpHandler {
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
+            outbound_dispatcher: None,
         }
     }
 
@@ -716,6 +733,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 .proxy_selector
                 .clone()
                 .expect("proxy_selector required for server handler"),
+            outbound_dispatcher: self.outbound_dispatcher.clone(),
             authenticated_user,
         })
     }

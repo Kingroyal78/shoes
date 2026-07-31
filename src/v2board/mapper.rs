@@ -10,12 +10,14 @@ use tokio::task::JoinHandle;
 use crate::address::{Address, AddressMask, NetLocation, NetLocationMask};
 use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::async_stream::AsyncStream;
-use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
+use crate::backend_config::{AppConfig, NodeType, OutboundConfig, OutboundSpec, V2BoardNodeConfig};
+use crate::client_proxy_chain::ClientChainGroup;
 use crate::client_proxy_selector::{
     ClientProxySelector, ConnectAction, ConnectMatcher, ConnectRule, SniffedProtocol,
 };
 use crate::config::{
-    BindLocation, ClientChainHop, ClientConfig, ConfigSelection, TcpConfig, WebsocketPingType,
+    BindLocation, ClientChain, ClientChainHop, ClientConfig, ConfigSelection, TcpConfig,
+    WebsocketPingType,
 };
 use crate::hysteria2_obfs::Hysteria2Obfs;
 use crate::hysteria2_server::{
@@ -26,7 +28,7 @@ use crate::naiveproxy::UserLookup;
 use crate::naiveproxy::naive_h3_service::{
     start_naive_h3_server, validate_naive_quic_congestion_control,
 };
-use crate::option_util::OneOrSome;
+use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{RealityServerTarget, decode_private_key, decode_short_id};
 use crate::resolver::Resolver;
 use crate::rustls_config_util::create_server_config;
@@ -47,7 +49,9 @@ use crate::ss_plugins::shadow_tls::{ClientChainShadowTlsConnector, ShadowTlsPlug
 use crate::ss_plugins::v2ray::{
     V2rayPluginServerConfig, V2rayPluginServerHandler, V2rayTransportMode,
 };
-use crate::tcp::chain_builder::{build_client_proxy_chain, build_direct_chain_group};
+use crate::tcp::chain_builder::{
+    build_client_chain_group, build_client_proxy_chain, build_direct_chain_group,
+};
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpServerHandler, TcpServerSetupResult,
 };
@@ -61,6 +65,8 @@ use crate::tuic_server::{TuicServerUser, TuicServerUsers, start_tuic_server};
 use crate::v2board::grpc::GrpcServerHandler;
 use crate::v2board::http::{V2RayHttp2ServerHandler, V2RayHttpServerHandler};
 use crate::v2board::httpupgrade::HttpUpgradeServerHandler;
+use crate::v2board::outbound::compiler::compile_route_rules;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 use crate::v2board::proxy_protocol::ProxyProtocolServerHandler;
 use crate::v2board::route_rule_set::{load_geoip_matchers, load_geosite_matchers};
 use crate::v2board::runtime_model::{
@@ -75,7 +81,7 @@ use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
 use super::plugin_api::{
     GostPluginOptions, KcptunCrypt, KcptunMode, KcptunOptions, ObfsMode, ObfsOptions,
-    PluginRuntimeManifest, RuntimePlugin, V2rayPluginOptions,
+    PluginRuntimeManifest, RuntimePlugin,
 };
 use super::types::{ServerConfig, UserInfo};
 
@@ -483,11 +489,13 @@ pub fn map_node(
         );
     }
     let spec = normalize_node(app_config, node, server, users)?;
+    let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
     build_runtime_node(
         spec,
         tracker,
         resolver,
         app_config.runtime.max_legacy_shadowsocks_users,
+        outbound_dispatcher,
     )
 }
 
@@ -537,12 +545,14 @@ pub fn map_shadowsocks_plugin_nodes(
             node.tag
         ));
     }
+    let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
     let raw_public = build_runtime_node_with_shadowsocks_mux(
         spec,
         tracker,
         resolver.clone(),
         app_config.runtime.max_legacy_shadowsocks_users,
         multiplex.map(|mux| mux.padding),
+        outbound_dispatcher,
     )?;
     let Some(plugin) = manifest.plugin.as_ref() else {
         return Ok(vec![raw_public]);
@@ -852,11 +862,100 @@ fn plugin_bind_location(host: &str, port: u16, tag: &str) -> std::io::Result<Bin
         })
 }
 
+/// Builds the node-side outbound dispatcher from local routing config.
+///
+/// Returns `None` when no routing is configured (outbounds, route rules,
+/// rule providers, or `default_out` all absent), preserving the legacy
+/// direct-only dial path.
+fn build_outbound_dispatcher(
+    app_config: &AppConfig,
+    node_tag: &str,
+    resolver: &Arc<dyn Resolver>,
+) -> std::io::Result<Option<Arc<OutboundDispatcher>>> {
+    if app_config.outbounds.is_empty()
+        && app_config.route_rules.is_empty()
+        && app_config.rule_providers.is_empty()
+        && app_config.default_out.is_none()
+    {
+        return Ok(None);
+    }
+    let rules = Arc::new(compile_route_rules(
+        node_tag,
+        &app_config.route_rules,
+        &app_config.rule_providers,
+        &app_config.v2board.route_rule_sets,
+    )?);
+    let direct = Arc::new(build_direct_chain_group(resolver.clone()));
+    let by_tag: HashMap<&str, &OutboundConfig> = app_config
+        .outbounds
+        .iter()
+        .map(|outbound| (outbound.tag.as_str(), outbound))
+        .collect();
+    let mut resolved: HashMap<&str, Vec<ClientConfig>> = HashMap::new();
+    let mut chains: HashMap<String, Arc<ClientChainGroup>> = HashMap::new();
+    for outbound in &app_config.outbounds {
+        let hops = resolve_outbound_hops(&outbound.tag, &by_tag, &mut resolved)?;
+        let group = if matches!(outbound.spec, OutboundSpec::Direct) {
+            direct.clone()
+        } else {
+            Arc::new(build_client_chain_group(
+                NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::Some(
+                        hops.into_iter()
+                            .map(|config| ClientChainHop::Single(ConfigSelection::Config(config)))
+                            .collect(),
+                    ),
+                }),
+                resolver.clone(),
+            ))
+        };
+        chains.insert(outbound.tag.clone(), group);
+    }
+    Ok(Some(Arc::new(OutboundDispatcher::new(
+        Some(rules),
+        chains,
+        app_config.default_out.clone(),
+        direct,
+    ))))
+}
+
+/// Resolves the full hop `ClientConfig` list for an outbound tag, expanding
+/// `chain` references (nested chains are flattened depth-first). The
+/// memoization key is the outbound tag; `validate_outbounds` has already
+/// rejected cycles and unknown references.
+fn resolve_outbound_hops<'a>(
+    tag: &'a str,
+    by_tag: &HashMap<&'a str, &'a OutboundConfig>,
+    resolved: &mut HashMap<&'a str, Vec<ClientConfig>>,
+) -> std::io::Result<Vec<ClientConfig>> {
+    if let Some(hops) = resolved.get(tag) {
+        return Ok(hops.clone());
+    }
+    let outbound = by_tag.get(tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("outbound `{tag}` is referenced but not configured"),
+        )
+    })?;
+    let hops = if let Some(chain) = &outbound.chain {
+        let mut hops = Vec::new();
+        for hop in chain {
+            hops.extend(resolve_outbound_hops(hop, by_tag, resolved)?);
+        }
+        hops
+    } else {
+        vec![outbound.to_client_config()?]
+    };
+    resolved.insert(tag, hops.clone());
+    Ok(hops)
+}
+
 fn build_runtime_node(
     spec: RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
     max_legacy_shadowsocks_users: usize,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<RuntimeNode> {
     build_runtime_node_with_shadowsocks_mux(
         spec,
@@ -864,6 +963,7 @@ fn build_runtime_node(
         resolver,
         max_legacy_shadowsocks_users,
         None,
+        outbound_dispatcher,
     )
 }
 
@@ -873,10 +973,13 @@ fn build_runtime_node_with_shadowsocks_mux(
     resolver: Arc<dyn Resolver>,
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let proxy_selector = Arc::new(build_v2board_proxy_selector(&spec, resolver.clone())?);
     match spec.node_type {
+        // UDP-only listeners do not use the outbound dispatcher yet; the
+        // legacy selector dial path applies.
         NodeType::Tuic => return build_tuic_runtime_node(spec, tracker, proxy_selector),
         NodeType::Hysteria => {
             return build_hysteria2_runtime_node(spec, tracker, proxy_selector);
@@ -893,6 +996,7 @@ fn build_runtime_node_with_shadowsocks_mux(
         resolver.clone(),
         max_legacy_shadowsocks_users,
         shadowsocks_mux_padding,
+        outbound_dispatcher,
     )?;
     let transport = build_transport_handler(&spec, protocol, resolver.clone())?;
     let mut handler = build_security_handler(&spec, transport, tracker, proxy_selector, resolver)?;
@@ -2180,6 +2284,7 @@ fn build_protocol_handler(
     resolver: Arc<dyn Resolver>,
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     let server_users = server_users(spec, tracker.clone())?;
 
@@ -2206,23 +2311,27 @@ fn build_protocol_handler(
                 }
             }
             validate_vless_user_ids(spec)?;
-            Arc::new(VlessTcpServerHandler::new_multi(
-                server_users,
-                true,
-                proxy_selector,
-                resolver,
-                None,
-            ))
+            Arc::new(
+                VlessTcpServerHandler::new_multi(
+                    server_users,
+                    true,
+                    proxy_selector,
+                    resolver,
+                    None,
+                )
+                .with_outbound_dispatcher(outbound_dispatcher.clone()),
+            )
         }
-        (NodeType::Vmess, RuntimeProtocol::Vmess { security }) => {
-            Arc::new(VmessTcpServerHandler::new_multi(
+        (NodeType::Vmess, RuntimeProtocol::Vmess { security }) => Arc::new(
+            VmessTcpServerHandler::new_multi(
                 security,
                 server_users,
                 true,
                 proxy_selector,
                 resolver,
-            ))
-        }
+            )
+            .with_outbound_dispatcher(outbound_dispatcher.clone()),
+        ),
         (NodeType::Trojan, RuntimeProtocol::Trojan { fallback, .. }) => {
             if matches!(spec.security, RuntimeSecurity::None) {
                 return invalid(format!(
@@ -2230,13 +2339,16 @@ fn build_protocol_handler(
                     spec.tag
                 ));
             }
-            Arc::new(TrojanTcpHandler::new_multi_server(
-                server_users,
-                &None,
-                proxy_selector,
-                resolver,
-                fallback.clone(),
-            ))
+            Arc::new(
+                TrojanTcpHandler::new_multi_server(
+                    server_users,
+                    &None,
+                    proxy_selector,
+                    resolver,
+                    fallback.clone(),
+                )
+                .with_outbound_dispatcher(outbound_dispatcher.clone()),
+            )
         }
         (NodeType::Anytls, RuntimeProtocol::Anytls { padding_scheme }) => {
             if matches!(spec.security, RuntimeSecurity::None) {
@@ -2246,14 +2358,17 @@ fn build_protocol_handler(
                 ));
             }
             validate_duplicate_credentials(spec, "anytls")?;
-            Arc::new(AnyTlsServerHandler::new_authenticated(
-                server_users,
-                anytls_padding_factory(spec, padding_scheme)?,
-                resolver,
-                proxy_selector,
-                true,
-                None,
-            ))
+            Arc::new(
+                AnyTlsServerHandler::new_authenticated(
+                    server_users,
+                    anytls_padding_factory(spec, padding_scheme)?,
+                    resolver,
+                    proxy_selector,
+                    true,
+                    None,
+                )
+                .with_outbound_dispatcher(outbound_dispatcher.clone()),
+            )
         }
         (
             NodeType::Shadowsocks,
@@ -2297,7 +2412,8 @@ fn build_protocol_handler(
                     true,
                     proxy_selector,
                     resolver,
-                );
+                )
+                .with_outbound_dispatcher(outbound_dispatcher.clone());
                 if let Some(http_obfs) = http_obfs {
                     handler = handler.with_http_obfs(http_obfs);
                 }
@@ -2322,7 +2438,8 @@ fn build_protocol_handler(
                 true,
                 proxy_selector,
                 resolver,
-            );
+            )
+            .with_outbound_dispatcher(outbound_dispatcher.clone());
             if let Some(http_obfs) = http_obfs {
                 handler = handler.with_http_obfs(http_obfs);
             }
@@ -2872,7 +2989,6 @@ mod tests {
         RuntimeBaseConfig, RuntimeBind, RuntimeReality, RuntimeRoute, RuntimeTls, RuntimeUser,
         UserPolicy,
     };
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
 
@@ -2895,7 +3011,7 @@ mod tests {
     }
 
     fn expect_build_err(spec: RuntimeNodeSpec) -> std::io::Error {
-        match build_runtime_node(spec, test_tracker(), test_resolver(), 10) {
+        match build_runtime_node(spec, test_tracker(), test_resolver(), 10, None) {
             Ok(_) => panic!("expected runtime node build to fail"),
             Err(err) => err,
         }
@@ -3217,7 +3333,7 @@ mod tests {
         let (tls, _dir) = runtime_tls_with_certificate();
         let spec = tuic_tls_spec(tls);
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Tuic {
@@ -3251,7 +3367,7 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3295,7 +3411,7 @@ mod tests {
             }),
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3319,7 +3435,7 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 { obfs, .. } => {
@@ -3389,7 +3505,7 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 { obfs, .. } => {
@@ -3433,7 +3549,7 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3470,7 +3586,8 @@ mod tests {
         assert_eq!(validated.name, "user-1");
         assert_eq!(validated.authenticated_user.unwrap().uid, 1);
 
-        let node = build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10).unwrap();
+        let node =
+            build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::Tcp { .. } => {}
@@ -3497,7 +3614,7 @@ mod tests {
         };
         spec.transport = RuntimeTransport::Quic;
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::NaiveH3 {
@@ -3527,7 +3644,7 @@ mod tests {
         };
         spec.transport = RuntimeTransport::TcpAndQuic;
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         match node.kind {
             RuntimeNodeKind::NaiveCombined {
@@ -3675,7 +3792,7 @@ mod tests {
                 *udp_relay_mode = Some(mode.to_string());
             }
 
-            build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+            build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
         }
     }
 
@@ -3982,7 +4099,7 @@ mod tests {
             response_headers: HashMap::from([("X-Edge".to_string(), "ok".to_string())]),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
     }
 
     #[test]
@@ -3998,7 +4115,7 @@ mod tests {
             }),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
     }
 
     #[test]
@@ -4012,7 +4129,7 @@ mod tests {
             response_headers: HashMap::new(),
         };
 
-        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10).unwrap();
+        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
         assert_eq!(tls_alpn_for_transport(&spec, &runtime_tls()), vec!["h2"]);
     }
 
@@ -4028,7 +4145,7 @@ mod tests {
             }),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
     }
 
     #[test]
@@ -4036,7 +4153,7 @@ mod tests {
         let (tls, _dir) = runtime_tls_with_certificate();
         let spec = anytls_tls_spec(tls);
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         assert_eq!(node.tag, "anytls-tls");
     }
@@ -4086,7 +4203,7 @@ mod tests {
         spec.config_node_type = NodeType::V2Node;
         spec.security = RuntimeSecurity::Reality(runtime_reality());
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         assert_eq!(node.tag, "anytls-tls");
     }
@@ -4115,7 +4232,7 @@ mod tests {
             response_headers: HashMap::new(),
         };
 
-        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10).unwrap();
+        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
         assert_eq!(selected_reality_alpn(&spec), Some("h2".to_string()));
     }
 
@@ -4226,7 +4343,7 @@ mod tests {
             encryption_settings: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         assert_eq!(node.tag, "ss-node");
     }
@@ -4307,7 +4424,7 @@ mod tests {
             )],
         );
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10).unwrap();
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
 
         assert_eq!(node.tag, "ss-node");
     }
@@ -4355,6 +4472,94 @@ mod tests {
 
             assert!(err.to_string().contains("unsupported shadowsocks cipher"));
         }
+    }
+
+    fn routing_app_config() -> AppConfig {
+        serde_yaml::from_str::<AppConfig>(
+            r#"
+v2board:
+  api_host: "https://panel.example.com"
+  api_key: "server-token"
+  nodes:
+    - tag: "node-a"
+      node_id: 7
+      node_type: "vless"
+outbounds:
+  - tag: "unlock"
+    type: "vless"
+    server: "203.0.113.10"
+    port: 443
+    user_id: "00000000-0000-4000-8000-000000000001"
+  - tag: "direct"
+    type: "direct"
+  - tag: "via-socks"
+    chain: ["unlock"]
+default_out: "direct"
+route_rules:
+  - "DOMAIN-SUFFIX,netflix.com,unlock"
+  - "PROTOCOL,http,unlock"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn outbound_dispatcher_absent_without_routing_config() {
+        let (mut app, _node) = {
+            let config = routing_app_config();
+            (config, ())
+        };
+        app.outbounds.clear();
+        app.route_rules.clear();
+        app.default_out = None;
+        let resolver = test_resolver();
+        assert!(
+            build_outbound_dispatcher(&app, "node-a", &resolver)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn outbound_dispatcher_builds_chains_and_rules() {
+        let app = routing_app_config();
+        let resolver = test_resolver();
+        let dispatcher = build_outbound_dispatcher(&app, "node-a", &resolver)
+            .unwrap()
+            .expect("routing config must produce a dispatcher");
+        assert!(dispatcher.has_routing());
+        let tags = app
+            .outbounds
+            .iter()
+            .map(|o| o.tag.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tags, vec!["unlock", "direct", "via-socks"]);
+        let rules = compile_route_rules(
+            "node-a",
+            &app.route_rules,
+            &app.rule_providers,
+            &app.v2board.route_rule_sets,
+        )
+        .unwrap();
+        assert_eq!(rules.match_domain("api.netflix.com"), Some("unlock"));
+        assert_eq!(rules.match_domain("netflix.com"), Some("unlock"));
+        assert_eq!(rules.match_domain("netflix.org"), None);
+        assert!(rules.has_protocol_rules());
+    }
+
+    #[test]
+    fn outbound_dispatcher_expands_chains_into_hop_configs() {
+        let app = routing_app_config();
+        let by_tag: HashMap<&str, &OutboundConfig> =
+            app.outbounds.iter().map(|o| (o.tag.as_str(), o)).collect();
+        let mut resolved = HashMap::new();
+        let hops = resolve_outbound_hops("via-socks", &by_tag, &mut resolved).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].address.to_string(), "203.0.113.10:443");
+        assert!(matches!(
+            hops[0].protocol,
+            crate::config::ClientProxyConfig::Vless { .. }
+        ));
     }
 
     #[test]

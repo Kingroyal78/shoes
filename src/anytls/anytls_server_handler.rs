@@ -56,6 +56,8 @@ pub struct AnyTlsServerHandler {
     udp_enabled: bool,
     /// Fallback destination for failed authentication
     fallback: Option<NetLocation>,
+    /// Node-side outbound dispatcher for stream dials.
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
 }
 
 impl AnyTlsServerHandler {
@@ -118,6 +120,16 @@ impl AnyTlsServerHandler {
         )
     }
 
+    /// Attaches the node-side outbound dispatcher used for stream dials.
+    /// `None` (the default) keeps the legacy selector direct dial.
+    pub fn with_outbound_dispatcher(
+        mut self,
+        outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+    ) -> Self {
+        self.outbound_dispatcher = outbound_dispatcher;
+        self
+    }
+
     fn from_users(
         users: Vec<(String, String, Option<AuthenticatedUser>)>,
         padding: Arc<PaddingFactory>,
@@ -156,6 +168,7 @@ impl AnyTlsServerHandler {
             proxy_provider,
             udp_enabled,
             fallback,
+            outbound_dispatcher: None,
         }
     }
 }
@@ -251,6 +264,7 @@ impl AnyTlsServerHandler {
                 padding: Arc::clone(&self.padding),
                 resolver: Arc::clone(&self.resolver),
                 proxy_provider: Arc::clone(&self.proxy_provider),
+                outbound_dispatcher: self.outbound_dispatcher.clone(),
                 udp_enabled: self.udp_enabled,
                 user_name: user.name,
                 authenticated_user: user.authenticated_user,

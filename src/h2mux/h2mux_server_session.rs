@@ -527,6 +527,7 @@ async fn handle_h2mux_stream(
             connection_success_response: None,
             initial_remote_data: None,
             proxy_selector,
+            outbound_dispatcher: None,
             authenticated_user,
         };
         handle_server_setup_result(setup_result, resolver, peer_addr).await

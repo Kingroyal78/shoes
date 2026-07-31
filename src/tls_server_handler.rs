@@ -195,6 +195,7 @@ impl TcpServerHandler for TlsServerHandler {
                             effective_selector.clone(),
                             &self.fallback_resolver,
                             vision_cfg.fallback.clone(),
+                            None,
                         )
                         .await
                     }

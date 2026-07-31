@@ -46,6 +46,7 @@ impl TcpServerHandler for PortForwardServerHandler {
             connection_success_response: None,
             initial_remote_data: None,
             proxy_selector: self.proxy_selector.clone(),
+            outbound_dispatcher: None,
             authenticated_user: None,
         })
     }

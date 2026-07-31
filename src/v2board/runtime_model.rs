@@ -1618,6 +1618,10 @@ mod tests {
                 runtime: RuntimeConfig::default(),
                 tls: None,
                 log: Default::default(),
+                outbounds: Vec::new(),
+                default_out: None,
+                route_rules: Vec::new(),
+                rule_providers: Vec::new(),
             },
             node,
         )

@@ -748,6 +748,7 @@ async fn process_tcp_stream(
             resolver,
             remote_location.clone(),
             sniffed_protocol,
+            None,
         ),
     );
 

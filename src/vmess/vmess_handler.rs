@@ -69,6 +69,19 @@ pub struct VmessTcpServerHandler {
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+}
+
+impl VmessTcpServerHandler {
+    /// Attaches the node-side outbound dispatcher used for the TCP forward
+    /// dial. `None` (the default) keeps the legacy selector direct dial.
+    pub fn with_outbound_dispatcher(
+        mut self,
+        outbound_dispatcher: Option<Arc<crate::v2board::outbound::dispatcher::OutboundDispatcher>>,
+    ) -> Self {
+        self.outbound_dispatcher = outbound_dispatcher;
+        self
+    }
 }
 
 struct VmessServerUser {
@@ -101,6 +114,7 @@ impl VmessTcpServerHandler {
             udp_enabled,
             proxy_selector,
             resolver,
+            outbound_dispatcher: None,
         }
     }
 
@@ -122,6 +136,7 @@ impl VmessTcpServerHandler {
             udp_enabled,
             proxy_selector,
             resolver,
+            outbound_dispatcher: None,
         }
     }
 }
@@ -660,6 +675,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                         connection_success_response: None,
                         initial_remote_data: None,
                         proxy_selector: self.proxy_selector.clone(),
+                        outbound_dispatcher: self.outbound_dispatcher.clone(),
                         authenticated_user: authenticated_user.clone(),
                     });
                 }
@@ -690,6 +706,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     connection_success_response: None,
                     initial_remote_data: None,
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 })
             }

@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use ::http::{HeaderMap, Method, Request, Response, StatusCode};
+use ::http::{HeaderMap, Request, Response, StatusCode};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -605,6 +605,7 @@ fn h2_error(e: h2::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use ::http::Method;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};

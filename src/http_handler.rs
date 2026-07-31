@@ -362,6 +362,7 @@ pub async fn setup_http_server_stream_inner(
         connection_success_response,
         initial_remote_data,
         proxy_selector,
+        outbound_dispatcher: None,
         authenticated_user: None,
     })
 }
