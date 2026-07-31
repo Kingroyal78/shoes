@@ -13,12 +13,14 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_server::run_udp_copy;
+use crate::tcp::tcp_handler::AuthenticatedUser;
+use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
@@ -88,9 +90,26 @@ pub struct AnyTlsSession {
     /// Authenticated user name for logging
     user_name: String,
 
+    /// Authenticated V2Board user context for accounting and policy enforcement.
+    authenticated_user: Option<AuthenticatedUser>,
+
+    /// Peer address of the underlying AnyTLS TCP connection.
+    peer_addr: Option<SocketAddr>,
+
     /// Initial data buffered during auth (to be prepended to first read)
     /// Uses std::sync::Mutex since it's only accessed once with no await points
     initial_data: std::sync::Mutex<Option<Box<[u8]>>>,
+}
+
+pub struct AnyTlsServerSessionContext {
+    pub padding: Arc<PaddingFactory>,
+    pub resolver: Arc<dyn Resolver>,
+    pub proxy_provider: Arc<ClientProxySelector>,
+    pub udp_enabled: bool,
+    pub user_name: String,
+    pub authenticated_user: Option<AuthenticatedUser>,
+    pub peer_addr: Option<SocketAddr>,
+    pub initial_data: Option<Box<[u8]>>,
 }
 
 impl AnyTlsSession {
@@ -99,16 +118,22 @@ impl AnyTlsSession {
     /// If `initial_data` is provided, it will be prepended to the first read in recv_loop.
     pub fn new_server_with_initial_data<IO>(
         conn: IO,
-        padding: Arc<PaddingFactory>,
-        resolver: Arc<dyn Resolver>,
-        proxy_provider: Arc<ClientProxySelector>,
-        udp_enabled: bool,
-        user_name: String,
-        initial_data: Option<Box<[u8]>>,
+        context: AnyTlsServerSessionContext,
     ) -> Arc<Self>
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        let AnyTlsServerSessionContext {
+            padding,
+            resolver,
+            proxy_provider,
+            udp_enabled,
+            user_name,
+            authenticated_user,
+            peer_addr,
+            initial_data,
+        } = context;
+
         let (reader, writer) = tokio::io::split(conn);
         // Use bounded channel for outgoing data to provide backpressure
         // Buffer size is per-session, shared across all streams
@@ -137,6 +162,8 @@ impl AnyTlsSession {
             proxy_provider,
             udp_enabled,
             user_name,
+            authenticated_user,
+            peer_addr,
             initial_data: std::sync::Mutex::new(initial_data),
         })
     }
@@ -185,6 +212,8 @@ impl AnyTlsSession {
             proxy_provider,
             udp_enabled: false,
             user_name: String::new(),
+            authenticated_user: None,
+            peer_addr: None,
             initial_data: std::sync::Mutex::new(None),
         })
     }
@@ -757,6 +786,15 @@ impl AnyTlsSession {
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
+        let scope =
+            match AuthenticatedConnectionScope::start(&self.authenticated_user, self.peer_addr) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    let _ = self.send_synack(stream_id, Some(&e.to_string())).await;
+                    let _ = stream.shutdown().await;
+                    return Err(e);
+                }
+            };
 
         let action = self
             .proxy_provider
@@ -798,10 +836,11 @@ impl AnyTlsSession {
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
                 // Bidirectional copy
+                let mut server_stream = scope.wrap_stream(Box::new(stream));
                 let result =
-                    copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
+                    copy_bidirectional(&mut server_stream, &mut *client_stream, false, false).await;
 
-                let _ = stream.shutdown().await;
+                let _ = server_stream.shutdown().await;
                 let _ = client_stream.shutdown().await;
 
                 if let Err(e) = &result {
@@ -894,6 +933,14 @@ impl AnyTlsSession {
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
+        let scope =
+            match AuthenticatedConnectionScope::start(&self.authenticated_user, self.peer_addr) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    let _ = self.send_synack(stream_id, Some(&e.to_string())).await;
+                    return Err(e);
+                }
+            };
 
         // Use ClientProxySelector for routing
         let action = self
@@ -914,7 +961,7 @@ impl AnyTlsSession {
 
                 // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
                 let server_stream: Box<dyn AsyncMessageStream> =
-                    Box::new(VlessMessageStream::new(stream));
+                    scope.wrap_message_stream(Box::new(VlessMessageStream::new(stream)));
 
                 // Connect through the proxy chain
                 let client_stream = match chain_group
@@ -970,6 +1017,14 @@ impl AnyTlsSession {
     /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_multi_destination(&self, stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
+        let scope =
+            match AuthenticatedConnectionScope::start(&self.authenticated_user, self.peer_addr) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    let _ = self.send_synack(stream_id, Some(&e.to_string())).await;
+                    return Err(e);
+                }
+            };
 
         log::debug!(
             "AnyTLS stream {} UoT multi-dest: starting per-destination routing",
@@ -978,7 +1033,7 @@ impl AnyTlsSession {
 
         // Wrap AnyTlsStream as AsyncTargetedMessageStream (UotV1ServerStream)
         let server_stream: Box<dyn AsyncTargetedMessageStream> =
-            Box::new(UotV1ServerStream::new_uot(stream));
+            scope.wrap_targeted_message_stream(Box::new(UotV1ServerStream::new_uot(stream)));
 
         // Send successful SYNACK (protocol v2)
         let _ = self.send_synack(stream_id, None).await;
@@ -1220,10 +1275,10 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n > 0 {
-                assert_eq!(buf[0], Command::Alert as u8);
-            }
+        if let Ok(Ok(n)) = result
+            && n > 0
+        {
+            assert_eq!(buf[0], Command::Alert as u8);
         }
 
         session.close().await;
@@ -1261,10 +1316,10 @@ mod tests {
         let mut response_buf = vec![0u8; 16];
         let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n >= 7 {
-                assert_eq!(response_buf[0], Command::HeartResponse as u8);
-            }
+        if let Ok(Ok(n)) = result
+            && n >= 7
+        {
+            assert_eq!(response_buf[0], Command::HeartResponse as u8);
         }
 
         session.close().await;
@@ -1501,16 +1556,15 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n >= 7 {
-                // Could be ServerSettings or UpdatePaddingScheme
-                // Either is valid response
-                let cmd = buf[0];
-                assert!(
-                    cmd == Command::UpdatePaddingScheme as u8
-                        || cmd == Command::ServerSettings as u8
-                );
-            }
+        if let Ok(Ok(n)) = result
+            && n >= 7
+        {
+            // Could be ServerSettings or UpdatePaddingScheme
+            // Either is valid response
+            let cmd = buf[0];
+            assert!(
+                cmd == Command::UpdatePaddingScheme as u8 || cmd == Command::ServerSettings as u8
+            );
         }
 
         session.close().await;

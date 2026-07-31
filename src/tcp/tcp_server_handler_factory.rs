@@ -148,11 +148,13 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
-        } => Box::new(TrojanTcpHandler::new_server(
+            fallback,
+        } => Box::new(TrojanTcpHandler::new_server_with_fallback(
             &password,
             &shadowsocks,
             client_proxy_selector.clone(),
             resolver.clone(),
+            fallback,
         )),
         ServerProxyConfig::Tls {
             tls_targets,
@@ -377,7 +379,7 @@ fn create_tls_server_target(
                 .expect("Invalid user_id UUID")
                 .into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
+                users: vec![(user_id_bytes, None)],
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
@@ -477,6 +479,7 @@ fn create_reality_server_target(
         dest_client_chain,
         override_rules,
     } = reality_server_config;
+    let selected_alpn = reality_selected_alpn_for_protocol(&protocol);
 
     // Decode private key from base64url (validated during config load)
     let private_key_bytes = crate::reality::decode_private_key(&private_key)
@@ -536,7 +539,7 @@ fn create_reality_server_target(
                 .expect("Invalid user_id UUID")
                 .into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
+                users: vec![(user_id_bytes, None)],
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
@@ -577,10 +580,19 @@ fn create_reality_server_target(
         min_client_version,
         max_client_version,
         cipher_suites: cipher_suites.into_vec(),
+        selected_alpn,
         effective_selector,
         inner_protocol,
         dest_client_chain,
     })
+}
+
+fn reality_selected_alpn_for_protocol(protocol: &ServerProxyConfig) -> Option<String> {
+    if matches!(protocol, ServerProxyConfig::Naiveproxy { .. }) {
+        Some("h2".to_string())
+    } else {
+        None
+    }
 }
 
 fn create_websocket_server_target(
@@ -621,7 +633,105 @@ fn create_websocket_server_target(
     WebsocketServerTarget {
         matching_path,
         matching_headers,
+        max_early_data: None,
+        early_data_header_name: None,
         ping_type,
         handler,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use crate::address::NetLocation;
+    use crate::client_proxy_selector::ClientProxySelector;
+    use crate::config::server::NaiveUserConfig;
+    use crate::config::{RealityServerConfig, ServerProxyConfig};
+    use crate::option_util::{NoneOrSome, OneOrSome};
+    use crate::resolver::Resolver;
+    use crate::tls_server_handler::TlsServerTarget;
+
+    use super::create_reality_server_target;
+
+    #[derive(Debug)]
+    struct NoopResolver;
+
+    impl Resolver for NoopResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn reality_config(protocol: ServerProxyConfig) -> RealityServerConfig {
+        RealityServerConfig {
+            private_key: crate::reality::generate_keypair().unwrap().0,
+            short_ids: OneOrSome::One("0123456789abcdef".to_string()),
+            dest: NetLocation::from_str("example.com:443", None).unwrap(),
+            max_time_diff: Some(60_000),
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: NoneOrSome::None,
+            vision: false,
+            protocol,
+            dest_client_chain: NoneOrSome::None,
+            override_rules: NoneOrSome::None,
+        }
+    }
+
+    fn test_selector() -> Arc<ClientProxySelector> {
+        Arc::new(ClientProxySelector::new(Vec::new()))
+    }
+
+    fn test_resolver() -> Arc<dyn Resolver> {
+        Arc::new(NoopResolver)
+    }
+
+    #[test]
+    fn reality_naiveproxy_selects_h2_alpn() {
+        let target = create_reality_server_target(
+            reality_config(ServerProxyConfig::Naiveproxy {
+                users: OneOrSome::One(NaiveUserConfig {
+                    name: "user".to_string(),
+                    username: "user".to_string(),
+                    password: "pass".to_string(),
+                }),
+                padding: true,
+                fallback: None,
+                udp_enabled: true,
+            }),
+            &test_selector(),
+            &test_resolver(),
+            None,
+        );
+
+        let TlsServerTarget::Reality(target) = target else {
+            panic!("expected REALITY target");
+        };
+        assert_eq!(target.selected_alpn.as_deref(), Some("h2"));
+    }
+
+    #[test]
+    fn reality_plain_protocol_leaves_alpn_unselected() {
+        let target = create_reality_server_target(
+            reality_config(ServerProxyConfig::Http {
+                username: None,
+                password: None,
+            }),
+            &test_selector(),
+            &test_resolver(),
+            None,
+        );
+
+        let TlsServerTarget::Reality(target) = target else {
+            panic!("expected REALITY target");
+        };
+        assert_eq!(target.selected_alpn, None);
     }
 }

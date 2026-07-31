@@ -1,0 +1,27 @@
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config cmake clang make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --bin shoes
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home-dir /var/lib/shoes --create-home --shell /usr/sbin/nologin shoes \
+    && mkdir -p /etc/shoes /var/log/shoes \
+    && chown -R shoes:shoes /var/lib/shoes /var/log/shoes
+
+COPY --from=builder /src/target/release/shoes /usr/local/bin/shoes
+COPY --chmod=0644 config/config.yml.example /etc/shoes/config.yml.example
+COPY --chmod=0644 config/config.schema.json /etc/shoes/config.schema.json
+
+USER shoes
+ENTRYPOINT ["shoes"]
+CMD ["run", "-c", "/etc/shoes/config.yml"]

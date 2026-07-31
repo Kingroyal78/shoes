@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "shoes V2Board backend config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v2board"],
+  "properties": {
+    "v2board": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_host", "api_key", "nodes"],
+      "properties": {
+        "api_host": { "type": "string", "minLength": 1, "description": "V2Board panel base URL." },
+        "api_key": { "type": "string", "minLength": 1, "description": "V2Board server_token." },
+        "api_timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "HTTP timeout for V2Board API calls." },
+        "error_body_limit_bytes": { "type": "integer", "minimum": 1, "default": 4096, "description": "Maximum panel error body bytes retained in errors/logs." },
+        "user_list_body_limit_bytes": { "type": "integer", "minimum": 1, "default": 10485760, "description": "Maximum user-list response body size." },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tag", "node_id", "node_type"],
+            "properties": {
+              "tag": { "type": "string", "minLength": 1, "description": "Unique local runtime name." },
+              "node_id": { "type": "integer", "minimum": 1, "description": "V2Board server ID." },
+              "node_type": {
+                "type": "string",
+                "enum": ["shadowsocks", "ss", "vmess", "v2ray", "vless", "trojan", "anytls", "tuic", "hysteria", "hysteria2", "naive", "naiveproxy", "naive_proxy", "naive-proxy", "v2node"],
+                "description": "V2Board node type. Aliases ss, v2ray, hysteria2, and naive are normalized to shadowsocks, vmess, hysteria, and naiveproxy for UniProxy."
+              },
+              "listen": { "type": "string", "default": "0.0.0.0", "description": "Local listen IP. The port comes from the panel node config." },
+              "api_host": { "type": "string", "description": "Optional per-node panel URL override." },
+              "api_key": { "type": "string", "description": "Optional per-node server_token override." },
+              "pull_interval_secs": { "type": "integer", "minimum": 1, "description": "Optional per-node config/user pull interval override." },
+              "push_interval_secs": { "type": "integer", "minimum": 1, "description": "Optional per-node traffic/alive push interval override." },
+              "tls": { "$ref": "#/$defs/tls", "description": "Optional per-node TLS certificate files. Overrides top-level tls." }
+            }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data_dir": { "type": "string", "default": "/var/lib/shoes", "description": "Directory for pending traffic/alive state." },
+        "pull_interval_secs": { "type": "integer", "minimum": 1, "default": 60, "description": "Fallback config/user pull interval." },
+        "push_interval_secs": { "type": "integer", "minimum": 1, "default": 60, "description": "Fallback traffic/alive push interval." },
+        "node_report_min_traffic": { "type": "integer", "minimum": 0, "default": 0, "description": "Fallback minimum bytes before user traffic is pushed." },
+        "device_online_min_traffic": { "type": "integer", "minimum": 0, "default": 0, "description": "Fallback minimum bytes before alive IPs are pushed." },
+        "max_legacy_shadowsocks_users": { "type": "integer", "minimum": 1, "default": 10000, "description": "Startup guard for O(n) legacy Shadowsocks multi-user authentication." },
+        "tcp_fast_open": { "type": "boolean", "default": false, "description": "Parsed but not wired in the V2Board runtime yet." }
+      }
+    },
+    "tls": { "$ref": "#/$defs/tls" },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["error", "warn", "info", "debug", "trace", "off"],
+          "default": "info"
+        },
+        "file": { "type": "string", "description": "Optional log file path. The CLI -l/--log-file can add destinations." }
+      }
+    }
+  },
+  "$defs": {
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cert_file", "key_file"],
+      "properties": {
+        "cert_file": { "type": "string", "description": "Readable PEM certificate chain path." },
+        "key_file": { "type": "string", "description": "Readable PEM private key path." }
+      }
+    }
+  }
+}

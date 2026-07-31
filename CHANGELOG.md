@@ -1,5 +1,47 @@
 # Changelog
 
+> Product scope note: `shoes` is now documented and accepted as a dedicated
+> V2Board node server. Historical entries below also describe the inherited
+> generic local-YAML client/outbound, TUN, and utility-listener engine; those
+> entries are release history, not current production support claims. See
+> [README.md](README.md) and
+> [docs/v2board-runtime-support.md](docs/v2board-runtime-support.md) for the
+> current server-only support boundary.
+
+## Unreleased
+
+### V2Board Server Protocol Remediation
+
+- NaiveProxy padding negotiation is now opt-in for both HTTP/2 and HTTP/3:
+  ordinary CONNECT requests run unpadded, while supported client offers retain
+  Naive padding. The real V2Board Docker policy suite covers padded and
+  unpadded H2/H3 downloads.
+- The server-side WebSocket binary proxy profile now validates RFC 6455 masking,
+  RSV/opcodes, canonical lengths, fragmentation and control frames, Ping/Pong,
+  streaming text UTF-8, and passive/active Close behavior. Invalid UTF-8 uses
+  Close 1007. An external conformance/fuzz suite is still pending.
+- TUIC pre-authentication unidirectional tasks are paused with bounded parser
+  state and no payload-sized allocation, then resumed only inside the
+  authenticated connection scope. Bounded parser lookahead may retain a small
+  payload prefix, but no task is forwarded before authentication. Independent
+  wire encoding plus a real Quinn session ticket verifies accepted 0-RTT,
+  no pre-auth forwarding, post-auth delivery, and invalid-auth rejection.
+- Trojan nodes can opt into a local direct fallback for malformed or
+  unauthenticated TLS-decoded probes. Already-read bytes are preserved, invalid
+  traffic does not create authenticated accounting state, and the fallback
+  must use a different port from the listener. A real V2Board/TLS network E2E
+  covers exact replay, fail-closed behavior, and accounting isolation.
+- Hysteria2 nodes can opt into a bounded static HTTP/3 masquerade response.
+  HEAD responses omit the body and body-forbidden statuses are rejected.
+  A real TLS/QUIC/H3 test covers ordinary and failed-auth requests, repeated
+  requests, the authentication window, and fresh-connection authentication.
+  Reverse-proxy masquerade is not implemented.
+- TUIC and Hysteria2 fragmented UDP reassembly now limits each logical packet
+  to 65,535 bytes and each connection's incomplete-fragment cache to 4 MiB.
+- Shadowsocks obfs remains deferred because the current V1 UniProxy response
+  removes `obfs` and `obfs_settings`; implementation requires a V2Board
+  control-plane contract first.
+
 ## v0.2.7
 
 ### Improvements
@@ -250,6 +292,14 @@ protocol:
 ```
 
 Note: 0-RTT is vulnerable to replay attacks. Only enable if the latency benefit outweighs security concerns.
+
+Current server-audit correction: non-authentication unidirectional task headers
+received before TUIC authentication are paused with bounded parser state and
+resumed only after successful authentication. A wire encoder independent of
+the server parser now establishes a real Quinn session ticket, reconnects with
+accepted early data, proves zero target forwarding before AUTH, verifies
+delivery after AUTH, and verifies zero forwarding after invalid AUTH; see
+[docs/v2board-alignment-audit.md](docs/v2board-alignment-audit.md).
 
 ### Reality Cipher Suites
 Both Reality server and client now support specifying TLS 1.3 cipher suites.

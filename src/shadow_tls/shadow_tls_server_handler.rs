@@ -90,6 +90,8 @@ const TLS_HEADER_LEN: usize = 5;
 // although draft-mattsson-tls-super-jumbo-record-limit-01 would increase that.
 // we set the limit to 5 + u16::MAX to allow for the maximum possible record size.
 const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
+const MAX_TLS_PAYLOAD_LEN: usize = u16::MAX as usize;
+const MAX_SHADOWTLS_MODIFIABLE_PAYLOAD_LEN: usize = MAX_TLS_PAYLOAD_LEN - 4;
 
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
@@ -140,13 +142,14 @@ fn validate_shadowtls_client_hello(
         ));
     }
 
-    if client_hello_record_legacy_version_major != 3
-        || client_hello_record_legacy_version_minor != 1
-    {
+    let record_protocol_version_ok = client_hello_record_legacy_version_major == 3
+        && (client_hello_record_legacy_version_minor == 1
+            || client_hello_record_legacy_version_minor == 3);
+    if !record_protocol_version_ok {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "expected client TLS record protocol 1.0 (major/minor 3.1), got major/minor {}.{}",
+                "expected client TLS record protocol 1.0 or 1.2 (major/minor 3.1 or 3.3), got major/minor {}.{}",
                 client_hello_record_legacy_version_major, client_hello_record_legacy_version_minor
             ),
         ));
@@ -676,6 +679,47 @@ pub fn parse_validated_server_hello(
     Ok(parsed)
 }
 
+#[inline]
+fn validate_server_app_data_can_add_hmac(payload_size: usize) -> std::io::Result<()> {
+    if payload_size > MAX_SHADOWTLS_MODIFIABLE_PAYLOAD_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server payload too large to modify",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn split_verified_client_application_data<'a>(
+    client_payload_bytes: &'a [u8],
+    hmac_client_data: &ShadowTlsHmac,
+) -> Option<&'a [u8]> {
+    if client_payload_bytes.len() < 4 {
+        return None;
+    }
+
+    let mut tmp_hmac = hmac_client_data.clone();
+    tmp_hmac.update(&client_payload_bytes[4..]);
+
+    let digest = tmp_hmac.finalized_digest();
+    if digest.as_slice() == &client_payload_bytes[..4] {
+        Some(&client_payload_bytes[4..])
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn commit_verified_client_application_data(
+    hmac_client_data: &mut ShadowTlsHmac,
+    initial_client_data: &[u8],
+) {
+    hmac_client_data.update(initial_client_data);
+    let digest = hmac_client_data.digest();
+    hmac_client_data.update(&digest);
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 async fn setup_remote_handshake(
@@ -813,12 +857,7 @@ async fn setup_remote_handshake(
 
                 let server_content_type = server_frame[0];
                 if server_content_type == CONTENT_TYPE_APPLICATION_DATA {
-                   if server_payload_size > TLS_FRAME_MAX_LEN - 4 {
-                       return Err(std::io::Error::new(
-                           std::io::ErrorKind::InvalidData,
-                           "server payload too large to modify",
-                       ));
-                   }
+                   validate_server_app_data_can_add_hmac(server_payload_size)?;
                    // TODO: do this in a single loop, see the same comment in local handshake
                    let iter = server_frame[TLS_HEADER_LEN..TLS_HEADER_LEN + server_payload_size].iter_mut().zip(server_app_data_xor.iter().cycle());
                    for (byte, &key) in iter {
@@ -869,38 +908,42 @@ async fn setup_remote_handshake(
                         format!("failed to read TLS payload from client during handshake (size {client_payload_size}): {e}")
                     ))?;
 
-                if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
-                    let mut tmp_hmac = hmac_client_data.clone();
-                    tmp_hmac.update(&client_payload_bytes[4..]);
+                if client_content_type == CONTENT_TYPE_APPLICATION_DATA
+                    && let Some(initial_client_data) = split_verified_client_application_data(
+                        client_payload_bytes,
+                        &hmac_client_data,
+                    )
+                {
+                    commit_verified_client_application_data(
+                        &mut hmac_client_data,
+                        initial_client_data,
+                    );
 
-                    if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
-                        let initial_client_data = &client_payload_bytes[4..];
+                    let _ = client_stream.shutdown().await;
 
-                        hmac_client_data.update(initial_client_data);
-                        hmac_client_data.update(&hmac_client_data.digest());
+                    let mut shadow_tls_stream = ShadowTlsStream::new(
+                        server_stream,
+                        initial_client_data,
+                        hmac_client_data,
+                        hmac_server_data,
+                        None,
+                    )
+                    .map_err(|e| {
+                        std::io::Error::other(format!("failed to create ShadowTlsStream: {e}"))
+                    })?;
 
-                        let _ = client_stream.shutdown().await;
-
-                        let mut shadow_tls_stream = ShadowTlsStream::new(
-                            server_stream,
-                            initial_client_data,
-                            hmac_client_data,
-                            hmac_server_data,
-                            None,
-                        ).map_err(|e| std::io::Error::other(
-                            format!("failed to create ShadowTlsStream: {e}")
-                        ))?;
-
-                        let unparsed_data = client_reader.unparsed_data();
-                        if !unparsed_data.is_empty() {
-                            shadow_tls_stream.feed_initial_read_data(unparsed_data)
-                                .map_err(|e| std::io::Error::other(
-                                    format!("failed to feed initial data to ShadowTlsStream: {e}")
-                                ))?;
-                        }
-
-                        return Ok(shadow_tls_stream);
+                    let unparsed_data = client_reader.unparsed_data();
+                    if !unparsed_data.is_empty() {
+                        shadow_tls_stream
+                            .feed_initial_read_data(unparsed_data)
+                            .map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "failed to feed initial data to ShadowTlsStream: {e}"
+                                ))
+                            })?;
                     }
+
+                    return Ok(shadow_tls_stream);
                 }
 
                 client_frame.extend_from_slice(client_payload_bytes);
@@ -1045,12 +1088,7 @@ async fn setup_local_handshake(
             }
 
             if server_content_type == CONTENT_TYPE_APPLICATION_DATA {
-                if server_payload_size > TLS_FRAME_MAX_LEN - 4 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "server payload too large to modify",
-                    ));
-                }
+                validate_server_app_data_can_add_hmac(server_payload_size)?;
                 // Modifying frame requires shifting all following frames back by 4 bytes.
                 if server_data_end_index > TLS_FRAME_MAX_LEN + TLS_HEADER_LEN - 4 {
                     return Err(std::io::Error::new(
@@ -1115,32 +1153,27 @@ async fn setup_local_handshake(
             .read_slice(&mut server_stream, client_payload_size as usize)
             .await?;
 
-        if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
-            let mut tmp_hmac = hmac_client_data.clone();
-            tmp_hmac.update(&client_payload_bytes[4..]);
+        if client_content_type == CONTENT_TYPE_APPLICATION_DATA
+            && let Some(initial_client_data) =
+                split_verified_client_application_data(client_payload_bytes, &hmac_client_data)
+        {
+            commit_verified_client_application_data(&mut hmac_client_data, initial_client_data);
 
-            if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
-                let initial_client_data = &client_payload_bytes[4..];
+            let mut shadow_tls_stream = ShadowTlsStream::new(
+                server_stream,
+                initial_client_data,
+                hmac_client_data,
+                hmac_server_data,
+                None,
+            )?;
 
-                hmac_client_data.update(initial_client_data);
-                hmac_client_data.update(&hmac_client_data.digest());
-
-                let mut shadow_tls_stream = ShadowTlsStream::new(
-                    server_stream,
-                    initial_client_data,
-                    hmac_client_data,
-                    hmac_server_data,
-                    None,
-                )?;
-
-                // Feeds any leftover data from the reader to the stream.
-                let leftover = client_reader.unparsed_data();
-                if !leftover.is_empty() {
-                    shadow_tls_stream.feed_initial_read_data(leftover)?;
-                }
-
-                return Ok(shadow_tls_stream);
+            // Feeds any leftover data from the reader to the stream.
+            let leftover = client_reader.unparsed_data();
+            if !leftover.is_empty() {
+                shadow_tls_stream.feed_initial_read_data(leftover)?;
             }
+
+            return Ok(shadow_tls_stream);
         }
 
         feed_rustls_server_connection(&mut server_connection, &client_header_bytes)?;
@@ -1189,4 +1222,179 @@ fn read_server_connection_once(
             )
         })?;
     Ok(server_data_cursor.position() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex};
+
+    use super::*;
+    use crate::async_stream::{AsyncPing, AsyncStream};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            unreachable!("test stream does not support ping")
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn hmac_for_password(password: &[u8]) -> ShadowTlsHmac {
+        let key =
+            aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, password);
+        ShadowTlsHmac::new(&key)
+    }
+
+    fn push_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_u24(out: &mut Vec<u8>, value: usize) {
+        let value = value as u32;
+        out.extend_from_slice(&value.to_be_bytes()[1..]);
+    }
+
+    fn make_shadowtls_client_hello(record_minor: u8, password: &[u8]) -> Vec<u8> {
+        let server_name = b"example.com";
+
+        let mut extensions = Vec::new();
+        push_u16(&mut extensions, 0x0000);
+        let server_name_list_len = 1 + 2 + server_name.len();
+        push_u16(&mut extensions, (2 + server_name_list_len) as u16);
+        push_u16(&mut extensions, server_name_list_len as u16);
+        extensions.push(0);
+        push_u16(&mut extensions, server_name.len() as u16);
+        extensions.extend_from_slice(server_name);
+
+        push_u16(&mut extensions, TLS_EXT_SUPPORTED_VERSIONS);
+        push_u16(&mut extensions, 3);
+        extensions.push(2);
+        extensions.extend_from_slice(&[0x03, 0x04]);
+
+        let mut hello_body = Vec::new();
+        hello_body.extend_from_slice(&[0x03, 0x03]);
+        hello_body.extend_from_slice(&[0x11; 32]);
+        hello_body.push(32);
+        hello_body.extend_from_slice(&[0x22; 28]);
+        hello_body.extend_from_slice(&[0, 0, 0, 0]);
+        push_u16(&mut hello_body, 2);
+        hello_body.extend_from_slice(&[0x13, 0x01]);
+        hello_body.push(1);
+        hello_body.push(0);
+        push_u16(&mut hello_body, extensions.len() as u16);
+        hello_body.extend_from_slice(&extensions);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[
+            CONTENT_TYPE_HANDSHAKE,
+            0x03,
+            record_minor,
+            0,
+            (1 + 3 + hello_body.len()) as u8,
+        ]);
+        frame.push(HANDSHAKE_TYPE_CLIENT_HELLO);
+        push_u24(&mut frame, hello_body.len());
+        frame.extend_from_slice(&hello_body);
+
+        let digest_start = TLS_HEADER_LEN + 1 + 3 + 2 + 32 + 1 + 28;
+        let digest_end = digest_start + 4;
+        let mut hmac = hmac_for_password(password);
+        hmac.update(&frame[TLS_HEADER_LEN..digest_start]);
+        hmac.update(&[0, 0, 0, 0]);
+        hmac.update(&frame[digest_end..]);
+        let digest = hmac.finalized_digest();
+        frame[digest_start..digest_end].copy_from_slice(&digest);
+
+        frame
+    }
+
+    #[tokio::test]
+    async fn validates_client_hello_with_tls12_record_legacy_version() {
+        let password = b"shadowtls-password";
+        let frame = make_shadowtls_client_hello(0x03, password);
+        let (mut client_io, server_io) = duplex(4096);
+        client_io.write_all(&frame).await.unwrap();
+
+        let mut server_stream: Box<dyn AsyncStream> = Box::new(TestStream(server_io));
+        let parsed = read_client_hello(&mut server_stream).await.unwrap();
+        assert_eq!(parsed.client_hello_record_legacy_version_minor, 0x03);
+        assert_eq!(parsed.requested_server_name.as_deref(), Some("example.com"));
+
+        let hmac = hmac_for_password(password);
+        validate_shadowtls_client_hello(&parsed, &hmac).unwrap();
+    }
+
+    #[test]
+    fn client_app_data_verifier_rejects_short_payload_without_panic() {
+        let hmac = hmac_for_password(b"shadowtls-password");
+        assert!(split_verified_client_application_data(&[0, 1, 2], &hmac).is_none());
+    }
+
+    #[test]
+    fn client_app_data_verifier_returns_verified_payload() {
+        let mut hmac = hmac_for_password(b"shadowtls-password");
+        let payload = b"hello";
+        hmac.update(payload);
+        let digest = hmac.digest();
+
+        let mut frame_payload = Vec::new();
+        frame_payload.extend_from_slice(&digest);
+        frame_payload.extend_from_slice(payload);
+
+        let verifier_hmac = hmac_for_password(b"shadowtls-password");
+        let verified =
+            split_verified_client_application_data(&frame_payload, &verifier_hmac).unwrap();
+        assert_eq!(verified, payload);
+    }
+
+    #[test]
+    fn rejects_server_app_data_that_cannot_fit_added_hmac() {
+        validate_server_app_data_can_add_hmac(MAX_SHADOWTLS_MODIFIABLE_PAYLOAD_LEN).unwrap();
+        let err = validate_server_app_data_can_add_hmac(MAX_SHADOWTLS_MODIFIABLE_PAYLOAD_LEN + 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

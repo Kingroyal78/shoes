@@ -4,6 +4,7 @@
 //! Includes idle timeout support matching sing-mux behavior.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,11 +15,10 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
-use crate::copy_bidirectional::copy_bidirectional;
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::resolver::Resolver;
-use crate::routing::{ServerStream, run_udp_routing};
-use crate::tcp::tcp_server::run_udp_copy;
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
+use crate::tcp::tcp_server::handle_server_setup_result;
 use crate::uot::SocksPacketAddrStream;
 use crate::vless::VlessMessageStream;
 
@@ -68,7 +68,23 @@ impl H2MuxServerSession {
     /// 2. Apply padding layer if client requested it
     /// 3. Perform HTTP/2 server handshake over (potentially padded) stream
     /// 4. Start accepting streams with idle timeout monitoring
-    pub async fn new<IO>(mut conn: IO) -> io::Result<Self>
+    pub async fn new<IO>(conn: IO) -> io::Result<Self>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::new_inner(conn, None).await
+    }
+
+    /// Create a server session and require the client's padding negotiation to
+    /// exactly match the listener configuration.
+    pub async fn new_with_expected_padding<IO>(conn: IO, expected_padding: bool) -> io::Result<Self>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::new_inner(conn, Some(expected_padding)).await
+    }
+
+    async fn new_inner<IO>(mut conn: IO, expected_padding: Option<bool>) -> io::Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -79,6 +95,18 @@ impl H2MuxServerSession {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported mux protocol: {:?}", session_req.protocol),
+            ));
+        }
+
+        if let Some(expected_padding) = expected_padding
+            && session_req.padding != expected_padding
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "mux padding configuration mismatch: server={expected_padding}, client={}",
+                    session_req.padding
+                ),
             ));
         }
 
@@ -338,11 +366,73 @@ pub async fn handle_h2mux_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    handle_h2mux_session_inner(
+        stream,
+        initial_data,
+        udp_enabled,
+        proxy_selector,
+        resolver,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Handle an H2MUX session with server-side negotiation and accounting
+/// context. Each logical stream is passed through the same setup-result path
+/// as a standalone inbound connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_h2mux_session_with_context<S>(
+    stream: S,
+    initial_data: Option<Box<[u8]>>,
+    udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    expected_padding: bool,
+    authenticated_user: Option<AuthenticatedUser>,
+    peer_addr: Option<SocketAddr>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_h2mux_session_inner(
+        stream,
+        initial_data,
+        udp_enabled,
+        proxy_selector,
+        resolver,
+        Some(expected_padding),
+        authenticated_user,
+        peer_addr,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_h2mux_session_inner<S>(
+    stream: S,
+    initial_data: Option<Box<[u8]>>,
+    udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    expected_padding: Option<bool>,
+    authenticated_user: Option<AuthenticatedUser>,
+    peer_addr: Option<SocketAddr>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!("H2MUX: Starting server session");
 
     // Wrap with PrependStream if there's initial data from protocol parsing
     let stream = PrependStream::new(stream, initial_data);
-    let mut session = H2MuxServerSession::new(stream).await?;
+    let mut session = match expected_padding {
+        Some(expected_padding) => {
+            H2MuxServerSession::new_with_expected_padding(stream, expected_padding).await?
+        }
+        None => H2MuxServerSession::new(stream).await?,
+    };
 
     info!(
         "H2MUX: Session established (protocol={:?}, padding={})",
@@ -353,10 +443,18 @@ where
     while let Some(inbound) = session.accept().await {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let authenticated_user = authenticated_user.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
+            if let Err(e) = handle_h2mux_stream(
+                inbound,
+                udp_enabled,
+                proxy_selector,
+                resolver,
+                authenticated_user,
+                peer_addr,
+            )
+            .await
             {
                 debug!("H2MUX stream error: {}", e);
             }
@@ -373,6 +471,8 @@ async fn handle_h2mux_stream(
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    authenticated_user: Option<AuthenticatedUser>,
+    peer_addr: Option<SocketAddr>,
 ) -> io::Result<()> {
     let InboundStream {
         mut stream,
@@ -400,130 +500,64 @@ async fn handle_h2mux_stream(
             ));
         }
 
-        // UDP stream - wrap in message stream
-        if packet_addr {
+        let setup_result = if packet_addr {
             // Per-packet addressing (like UoT V1)
-            handle_h2mux_udp_packet_addr(stream, proxy_selector, resolver).await
+            TcpServerSetupResult::MultiDirectionalUdp {
+                stream: Box::new(SocksPacketAddrStream::new_socks(Box::new(stream))),
+                need_initial_flush: false,
+                proxy_selector,
+                authenticated_user,
+            }
         } else {
             // Fixed destination
-            handle_h2mux_udp(stream, destination, proxy_selector, resolver).await
-        }
+            TcpServerSetupResult::BidirectionalUdp {
+                remote_location: destination,
+                stream: Box::new(VlessMessageStream::new(Box::new(stream))),
+                need_initial_flush: false,
+                proxy_selector,
+                authenticated_user,
+            }
+        };
+        handle_server_setup_result(setup_result, resolver, peer_addr).await
     } else {
-        // TCP stream - regular forwarding
-        handle_h2mux_tcp(stream, destination, proxy_selector, resolver).await
+        let setup_result = TcpServerSetupResult::TcpForward {
+            remote_location: destination,
+            stream: Box::new(stream),
+            need_initial_flush: false,
+            connection_success_response: None,
+            initial_remote_data: None,
+            proxy_selector,
+            authenticated_user,
+        };
+        handle_server_setup_result(setup_result, resolver, peer_addr).await
     }
-}
-
-/// Handle TCP stream from h2mux
-async fn handle_h2mux_tcp(
-    mut stream: H2MuxServerStream,
-    destination: crate::address::NetLocation,
-    proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-) -> io::Result<()> {
-    let action = proxy_selector
-        .judge(destination.clone().into(), &resolver)
-        .await?;
-
-    match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            debug!("H2MUX TCP: connecting to {} via chain", remote_location);
-
-            let client_result = chain_group.connect_tcp(remote_location, &resolver).await?;
-            let mut client_stream = client_result.client_stream;
-
-            // Bidirectional copy
-            let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
-
-            let _ = stream.shutdown().await;
-            let _ = client_stream.shutdown().await;
-
-            result
-        }
-        ConnectDecision::Block => {
-            debug!("H2MUX TCP: blocked by rules: {}", destination);
-            let _ = stream
-                .write_error_response("Connection blocked by rules")
-                .await;
-            let _ = stream.shutdown().await;
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("Connection to {} blocked", destination),
-            ))
-        }
-    }
-}
-
-/// Handle UDP stream with fixed destination
-async fn handle_h2mux_udp(
-    mut stream: H2MuxServerStream,
-    destination: crate::address::NetLocation,
-    proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-) -> io::Result<()> {
-    debug!("H2MUX UDP fixed: {}", destination);
-
-    let action = proxy_selector.judge(destination.into(), &resolver).await?;
-
-    match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            // Connect to destination
-            let client_stream = chain_group
-                .connect_udp_bidirectional(&resolver, remote_location)
-                .await?;
-
-            // Wrap in VlessMessageStream for length-prefixed packets
-            let server_stream = VlessMessageStream::new(Box::new(stream));
-
-            run_udp_copy(Box::new(server_stream), client_stream, false, false).await
-        }
-        ConnectDecision::Block => {
-            let _ = stream
-                .write_error_response("Connection blocked by rules")
-                .await;
-            let _ = stream.shutdown().await;
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "UDP connection blocked by rules",
-            ))
-        }
-    }
-}
-
-/// Handle UDP stream with per-packet addressing (packet_addr mode)
-async fn handle_h2mux_udp_packet_addr(
-    stream: H2MuxServerStream,
-    proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-) -> io::Result<()> {
-    debug!("H2MUX UDP packet_addr mode - entering");
-
-    // Uses the sing-mux SOCKS packet serializer for h2mux `packet_addr`.
-    let packet_stream = SocksPacketAddrStream::new_socks(Box::new(stream));
-
-    debug!("H2MUX UDP packet_addr mode - starting routing");
-    let result = run_udp_routing(
-        ServerStream::Targeted(Box::new(packet_stream)),
-        proxy_selector,
-        resolver,
-        false,
-    )
-    .await;
-
-    debug!("H2MUX UDP packet_addr mode - routing ended: {:?}", result);
-    result
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    use super::*;
+    use crate::h2mux::h2mux_protocol::VERSION_0;
+
     #[tokio::test]
     async fn test_server_session_creation() {
         // Verifies types compile correctly; full integration tests require a matching client
+    }
+
+    #[tokio::test]
+    async fn rejects_padding_negotiation_mismatch_before_h2_handshake() {
+        let (mut client, server) = duplex(64);
+        client
+            .write_all(&[VERSION_0, MuxProtocol::H2Mux as u8])
+            .await
+            .unwrap();
+
+        let error = match H2MuxServerSession::new_with_expected_padding(server, true).await {
+            Ok(_) => panic!("padding mismatch unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("mismatch"));
     }
 }

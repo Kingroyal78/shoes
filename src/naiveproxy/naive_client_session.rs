@@ -132,9 +132,14 @@ impl NaiveClientSession {
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        // No ready() call needed - matches h2 benchmarks pattern
-        let (response_future, send_stream) = self
+        let mut send_request = self
             .send_request
+            .clone()
+            .ready()
+            .await
+            .map_err(|e| io::Error::other(format!("H2 client not ready: {}", e)))?;
+
+        let (response_future, send_stream) = send_request
             .send_request(request, false)
             .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
 

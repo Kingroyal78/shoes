@@ -16,7 +16,6 @@ use crate::resolver::Resolver;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
-use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -112,16 +111,17 @@ impl TcpServerHandler for SnellServerHandler {
             None,
         );
 
-        let mut stream_reader = StreamReader::new_with_buffer_size(400);
+        let mut snell_header = [0u8; 3];
+        server_stream.read_exact(&mut snell_header).await?;
 
-        let version = stream_reader.read_u8(&mut server_stream).await?;
+        let version = snell_header[0];
         if version != 1 {
             return Err(std::io::Error::other(format!(
                 "unexpected snell version: {version}"
             )));
         }
 
-        let command_type = stream_reader.read_u8(&mut server_stream).await?;
+        let command_type = snell_header[1];
         let is_udp = match command_type {
             0 => {
                 // Ping command
@@ -148,18 +148,20 @@ impl TcpServerHandler for SnellServerHandler {
             }
         };
 
-        let client_id_len = stream_reader.read_u8(&mut server_stream).await?;
+        let client_id_len = snell_header[2];
         if client_id_len > 0 {
-            stream_reader
-                .read_slice(&mut server_stream, client_id_len as usize)
-                .await?;
+            let mut client_id = vec![0u8; client_id_len as usize];
+            server_stream.read_exact(&mut client_id).await?;
         }
 
         if !is_udp {
-            let hostname_len = stream_reader.read_u8(&mut server_stream).await? as usize;
+            let mut hostname_len = [0u8; 1];
+            server_stream.read_exact(&mut hostname_len).await?;
+            let hostname_len = hostname_len[0] as usize;
 
-            let hostname_and_port_bytes = stream_reader
-                .read_slice(&mut server_stream, hostname_len + 2)
+            let mut hostname_and_port_bytes = vec![0u8; hostname_len + 2];
+            server_stream
+                .read_exact(&mut hostname_and_port_bytes)
                 .await?;
 
             let hostname_str = match std::str::from_utf8(&hostname_and_port_bytes[0..hostname_len])
@@ -191,12 +193,10 @@ impl TcpServerHandler for SnellServerHandler {
                 let resolver = self.resolver.clone();
                 let udp_enabled = self.udp_enabled;
 
-                let initial_data = stream_reader.unparsed_data_owned();
-
                 tokio::spawn(async move {
                     if let Err(e) = handle_h2mux_session(
                         server_stream,
-                        initial_data,
+                        None,
                         udp_enabled,
                         proxy_selector,
                         resolver,
@@ -217,11 +217,13 @@ impl TcpServerHandler for SnellServerHandler {
                 // flush the tunnel response
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
-                initial_remote_data: stream_reader.unparsed_data_owned(),
+                initial_remote_data: None,
                 proxy_selector: self.proxy_selector.clone(),
+                authenticated_user: None,
             })
         } else {
             write_all(&mut server_stream, UDP_READY_RESPONSE).await?;
+            server_stream.flush().await?;
 
             let udp_stream = SnellUdpStream::new(
                 Box::new(server_stream),
@@ -230,8 +232,9 @@ impl TcpServerHandler for SnellServerHandler {
 
             Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),
-                need_initial_flush: true,
+                need_initial_flush: false,
                 proxy_selector: self.proxy_selector.clone(),
+                authenticated_user: None,
             })
         }
     }
@@ -378,5 +381,125 @@ impl TcpClientHandler for SnellClientHandler {
             SnellFixedTargetStream::new(snell_udp_client_stream, target.into_location());
 
         Ok(Box::new(fixed_target_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future::poll_fn;
+    use std::future::Future;
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex};
+
+    use crate::async_stream::{AsyncPing, AsyncReadTargetedMessage};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[derive(Debug)]
+    struct NoopResolver;
+
+    impl Resolver for NoopResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_setup_preserves_first_packet_coalesced_with_header() {
+        let (client_io, server_io) = duplex(8192);
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
+            "secretpass",
+            cipher.algorithm().key_len(),
+        )));
+        let mut client_stream = ShadowsocksStream::new(
+            Box::new(TestStream(client_io)),
+            ShadowsocksStreamType::Aead,
+            cipher.algorithm(),
+            cipher.salt_len(),
+            key,
+            None,
+        );
+        let mut first_write = vec![1, 6, 0, 1, 0, 4, 127, 0, 0, 1];
+        first_write.extend_from_slice(&53u16.to_be_bytes());
+        first_write.extend_from_slice(b"query");
+        client_stream.write_all(&first_write).await.unwrap();
+        client_stream.flush().await.unwrap();
+
+        let handler = SnellServerHandler::new(
+            cipher,
+            "secretpass",
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NoopResolver),
+        );
+        let setup_result = handler
+            .setup_server_stream(Box::new(TestStream(server_io)))
+            .await
+            .unwrap();
+        let mut stream = match setup_result {
+            TcpServerSetupResult::MultiDirectionalUdp { stream, .. } => stream,
+            _ => panic!("expected Snell UDP setup"),
+        };
+
+        let mut payload = [0u8; 32];
+        let mut read = ReadBuf::new(&mut payload);
+        let target = poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut read))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), 53)
+        );
+        assert_eq!(read.filled(), b"query");
     }
 }

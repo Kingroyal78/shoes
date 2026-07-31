@@ -8,12 +8,21 @@ use std::collections::HashMap;
 use base64::engine::{Engine as _, general_purpose::STANDARD as BASE64};
 use subtle::ConstantTimeEq;
 
+use crate::tcp::tcp_handler::AuthenticatedUser;
+
 /// Single user credential entry
 struct UserEntry {
     /// Base64-encoded "user:pass" for comparison
     encoded: Vec<u8>,
     /// Display name (for logging)
     name: String,
+    /// Optional authenticated runtime user for traffic accounting and policy enforcement.
+    authenticated_user: Option<AuthenticatedUser>,
+}
+
+pub struct ValidatedUser<'a> {
+    pub name: &'a str,
+    pub authenticated_user: Option<&'a AuthenticatedUser>,
 }
 
 /// O(1) user lookup with constant-time credential comparison.
@@ -41,6 +50,21 @@ impl UserLookup {
     /// # Panics
     /// Panics if credentials is empty (config validation should prevent this).
     pub fn new(credentials: Vec<(String, String, String)>) -> Self {
+        Self::new_with_authenticated_users(
+            credentials
+                .into_iter()
+                .map(|(name, username, password)| (name, username, password, None))
+                .collect(),
+        )
+    }
+
+    /// Create a new user lookup table from (name, username, password, authenticated user) tuples.
+    ///
+    /// # Panics
+    /// Panics if credentials is empty (config validation should prevent this).
+    pub fn new_with_authenticated_users(
+        credentials: Vec<(String, String, String, Option<AuthenticatedUser>)>,
+    ) -> Self {
         assert!(
             !credentials.is_empty(),
             "NaiveProxy requires at least one user"
@@ -48,21 +72,27 @@ impl UserLookup {
         let mut lookup = HashMap::with_capacity(credentials.len());
         let mut users = Vec::with_capacity(credentials.len());
 
-        for (i, (name, username, password)) in credentials.into_iter().enumerate() {
+        for (i, (name, username, password, authenticated_user)) in
+            credentials.into_iter().enumerate()
+        {
             let cred_string = format!("{}:{}", username, password);
             let encoded = BASE64.encode(&cred_string).into_bytes();
             let hash = blake3::hash(&encoded);
             lookup.insert(*hash.as_bytes(), i);
-            users.push(UserEntry { encoded, name });
+            users.push(UserEntry {
+                encoded,
+                name,
+                authenticated_user,
+            });
         }
 
         Self { lookup, users }
     }
 
-    /// Validate credentials, returning the user's name if valid.
+    /// Validate credentials, returning the user's runtime identity if valid.
     ///
     /// O(1) lookup via hash, then constant-time comparison for security.
-    pub fn validate(&self, auth_header: &str) -> Option<&str> {
+    pub fn validate(&self, auth_header: &str) -> Option<ValidatedUser<'_>> {
         let encoded = auth_header.strip_prefix("Basic ")?.as_bytes();
         let hash = blake3::hash(encoded);
         let idx = self.lookup.get(hash.as_bytes())?;
@@ -70,7 +100,10 @@ impl UserLookup {
 
         // Constant-time comparison as defense in depth
         if user.encoded.ct_eq(encoded).unwrap_u8() == 1 {
-            Some(&user.name)
+            Some(ValidatedUser {
+                name: &user.name,
+                authenticated_user: user.authenticated_user.as_ref(),
+            })
         } else {
             None
         }
@@ -89,7 +122,7 @@ mod tests {
             "pass".to_string(),
         )]);
         // Base64 of "user:pass" is "dXNlcjpwYXNz"
-        assert_eq!(lookup.validate("Basic dXNlcjpwYXNz"), Some("alice"));
+        assert_eq!(lookup.validate("Basic dXNlcjpwYXNz").unwrap().name, "alice");
         assert_eq!(lookup.users.len(), 1);
     }
 
@@ -104,7 +137,7 @@ mod tests {
         // Encode "user:p@ss:w0rd!" to base64
         let encoded = BASE64.encode("user:p@ss:w0rd!");
         let header = format!("Basic {}", encoded);
-        assert_eq!(lookup.validate(&header), Some("bob"));
+        assert_eq!(lookup.validate(&header).unwrap().name, "bob");
     }
 
     #[test]
@@ -116,7 +149,7 @@ mod tests {
         )]);
         let encoded = BASE64.encode("user:");
         let header = format!("Basic {}", encoded);
-        assert_eq!(lookup.validate(&header), Some("test"));
+        assert_eq!(lookup.validate(&header).unwrap().name, "test");
     }
 
     #[test]
@@ -126,10 +159,10 @@ mod tests {
             "user".to_string(),
             "pass".to_string(),
         )]);
-        assert_eq!(lookup.validate("Basic invalid"), None);
-        assert_eq!(lookup.validate("Basic d3Jvbmc6cGFzcw=="), None); // wrong:pass
-        assert_eq!(lookup.validate("Bearer token"), None);
-        assert_eq!(lookup.validate(""), None);
+        assert!(lookup.validate("Basic invalid").is_none());
+        assert!(lookup.validate("Basic d3Jvbmc6cGFzcw==").is_none()); // wrong:pass
+        assert!(lookup.validate("Bearer token").is_none());
+        assert!(lookup.validate("").is_none());
     }
 
     #[test]
@@ -153,8 +186,32 @@ mod tests {
         let bob_header = format!("Basic {}", BASE64.encode("bob:bob456"));
         let charlie_header = format!("Basic {}", BASE64.encode("charlie:charlie789"));
 
-        assert_eq!(lookup.validate(&alice_header), Some("alice"));
-        assert_eq!(lookup.validate(&bob_header), Some("bob"));
-        assert_eq!(lookup.validate(&charlie_header), Some("charlie"));
+        assert_eq!(lookup.validate(&alice_header).unwrap().name, "alice");
+        assert_eq!(lookup.validate(&bob_header).unwrap().name, "bob");
+        assert_eq!(lookup.validate(&charlie_header).unwrap().name, "charlie");
+    }
+
+    #[test]
+    fn test_user_lookup_returns_authenticated_user() {
+        let authenticated_user = AuthenticatedUser {
+            node_tag: "node-a".to_string(),
+            uid: 42,
+            user_key: "user-42".to_string(),
+            speed_limit: Some(10),
+            device_limit: Some(2),
+            recorder: None,
+        };
+        let lookup = UserLookup::new_with_authenticated_users(vec![(
+            "alice".to_string(),
+            "user-42".to_string(),
+            "secret".to_string(),
+            Some(authenticated_user),
+        )]);
+
+        let header = format!("Basic {}", BASE64.encode("user-42:secret"));
+        let user = lookup.validate(&header).unwrap();
+
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.authenticated_user.unwrap().uid, 42);
     }
 }

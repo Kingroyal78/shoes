@@ -59,6 +59,15 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                 let payload_len = u16::from_be_bytes([this.read_buf[0], this.read_buf[1]]) as usize;
                 let total_len = 2 + payload_len;
                 if this.read_end_index >= total_len {
+                    if payload_len == 0 {
+                        if this.read_end_index > total_len {
+                            this.read_buf.copy_within(total_len..this.read_end_index, 0);
+                            this.read_end_index -= total_len;
+                        } else {
+                            this.read_end_index = 0;
+                        }
+                        continue;
+                    }
                     if out_buf.remaining() < payload_len {
                         return Poll::Ready(Err(Error::other(
                             "out_buf is too small to hold the message",
@@ -195,3 +204,94 @@ impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
 }
 
 impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, duplex};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[tokio::test]
+    async fn read_message_skips_zero_length_frames() {
+        let (mut writer, reader) = duplex(64);
+        writer
+            .write_all(&[0, 0, 0, 3, b'a', b'b', b'c'])
+            .await
+            .unwrap();
+        let mut stream = VlessMessageStream::new(TestStream(reader));
+
+        let mut buf = [0u8; 8];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut read_buf))
+            .await
+            .unwrap();
+
+        assert_eq!(read_buf.filled(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn read_message_skips_zero_length_initial_data() {
+        let (_writer, reader) = duplex(64);
+        let mut stream = VlessMessageStream::new(TestStream(reader));
+        stream
+            .feed_initial_read_data(&[0, 0, 0, 3, b'x', b'y', b'z'])
+            .unwrap();
+
+        let mut buf = [0u8; 8];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut read_buf))
+            .await
+            .unwrap();
+
+        assert_eq!(read_buf.filled(), b"xyz");
+    }
+}

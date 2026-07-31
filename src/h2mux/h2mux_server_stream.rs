@@ -7,7 +7,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
@@ -78,29 +77,28 @@ impl AsyncWrite for H2MuxServerStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // First write prepends the status response
+        // Write the one-byte response first, then let the inner stream register
+        // the caller's waker if the user payload cannot be accepted yet. A
+        // combined temporary buffer cannot safely report the case where only
+        // the status byte was written.
         if !self.response_written {
-            // Create combined buffer: status + data
-            let mut combined = BytesMut::with_capacity(1 + buf.len());
-            combined.put_u8(STATUS_SUCCESS);
-            combined.put_slice(buf);
-
-            match Pin::new(&mut self.inner).poll_write(cx, &combined) {
-                Poll::Ready(Ok(written)) => {
+            match Pin::new(&mut self.inner).poll_write(cx, &[STATUS_SUCCESS]) {
+                Poll::Ready(Ok(1)) => {
                     self.response_written = true;
-                    // Return amount of user data written (subtract status byte)
-                    if written >= 1 {
-                        Poll::Ready(Ok((written - 1).min(buf.len())))
-                    } else {
-                        Poll::Ready(Ok(0))
-                    }
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write h2mux success response",
+                    )));
+                }
+                Poll::Ready(Ok(_)) => unreachable!("one-byte response wrote more than one byte"),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-        } else {
-            Pin::new(&mut self.inner).poll_write(cx, buf)
         }
+
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

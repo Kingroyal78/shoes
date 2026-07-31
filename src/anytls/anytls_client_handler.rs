@@ -10,6 +10,7 @@
 //! - Add config options like idle_session_timeout, min_idle_session (similar to sing-box)
 
 use async_trait::async_trait;
+use std::io;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -101,7 +102,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
         // UoT V2 header: isConnect(1) + destination
         stream.write_u8(1).await?;
         stream
-            .write_all(&encode_socks_address(target.location()))
+            .write_all(&encode_socks_address(target.location())?)
             .await?;
         stream.flush().await?;
 
@@ -112,7 +113,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
 }
 
 /// Encode a NetLocation to SOCKS address format
-fn encode_socks_address(location: &NetLocation) -> Vec<u8> {
+fn encode_socks_address(location: &NetLocation) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(32);
 
     match location.address() {
@@ -125,6 +126,12 @@ fn encode_socks_address(location: &NetLocation) -> Vec<u8> {
             buf.extend_from_slice(&ip.octets());
         }
         Address::Hostname(host) => {
+            if host.len() > u8::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SOCKS domain name exceeds 255 bytes",
+                ));
+            }
             buf.push(0x03); // Domain
             buf.push(host.len() as u8);
             buf.extend_from_slice(host.as_bytes());
@@ -132,5 +139,32 @@ fn encode_socks_address(location: &NetLocation) -> Vec<u8> {
     }
 
     buf.extend_from_slice(&location.port().to_be_bytes());
-    buf
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_socks_address_rejects_domain_over_255_bytes() {
+        let host = "a".repeat(256);
+        let location = NetLocation::new(Address::Hostname(host), 53);
+
+        let err = encode_socks_address(&location).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("exceeds 255 bytes"));
+    }
+
+    #[test]
+    fn encode_socks_address_encodes_hostname_target() {
+        let location = NetLocation::new(Address::Hostname("example.com".to_string()), 443);
+
+        let encoded = encode_socks_address(&location).unwrap();
+
+        assert_eq!(encoded[0], 0x03);
+        assert_eq!(encoded[1], 11);
+        assert_eq!(&encoded[2..13], b"example.com");
+        assert_eq!(&encoded[13..15], &443u16.to_be_bytes());
+    }
 }

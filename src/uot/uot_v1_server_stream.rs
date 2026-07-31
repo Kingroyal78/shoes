@@ -226,6 +226,12 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for PacketAddrStream<S> {
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write packet-address frame",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.write_buf_sent += n;
                 }
@@ -275,6 +281,12 @@ impl<S: AsyncStream> AsyncFlushMessage for PacketAddrStream<S> {
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write packet-address frame",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.write_buf_sent += n;
                 }
@@ -320,13 +332,60 @@ pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
+    use std::io::ErrorKind;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    struct ZeroWriteStream;
+
+    impl AsyncRead for ZeroWriteStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ZeroWriteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ZeroWriteStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ZeroWriteStream {}
 
     async fn tcp_pair() -> std::io::Result<(TcpStream, TcpStream)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -482,5 +541,21 @@ mod tests {
         let mut actual = vec![0u8; expected.len()];
         server.read_exact(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn flush_returns_write_zero_when_underlying_makes_no_progress() {
+        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 13), 9002));
+        let mut stream = PacketAddrStream::new_uot(ZeroWriteStream);
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_sourced_message(cx, b"payload", &source))
+            .await
+            .unwrap();
+
+        let err = poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::WriteZero);
     }
 }

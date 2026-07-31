@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ pub struct RealityServerTarget {
     pub min_client_version: Option<[u8; 3]>,
     pub max_client_version: Option<[u8; 3]>,
     pub cipher_suites: Vec<super::CipherSuite>,
+    pub selected_alpn: Option<String>,
     /// The effective proxy selector for this REALITY target.
     /// For Vision mode, this is passed to the VLESS setup function.
     /// Inner handler already has this selector from construction.
@@ -57,6 +59,7 @@ pub async fn setup_reality_server_stream(
     target: &RealityServerTarget,
     parsed_client_hello: ParsedClientHello,
     resolver: &Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
 ) -> std::io::Result<TcpServerSetupResult> {
     let client_hello_frame = &parsed_client_hello.client_hello_frame;
     log::debug!(
@@ -110,6 +113,7 @@ pub async fn setup_reality_server_stream(
         min_client_version: target.min_client_version,
         max_client_version: target.max_client_version,
         cipher_suites: target.cipher_suites.clone(),
+        selected_alpn: target.selected_alpn.clone(),
     };
 
     let mut reality_conn = RealityServerConnection::new(reality_config)?;
@@ -279,12 +283,16 @@ pub async fn setup_reality_server_stream(
     let tls_stream = CryptoTlsStream::new(server_stream, connection);
     log::debug!("REALITY: TLS 1.3 handshake completed successfully");
 
-    match &target.inner_protocol {
-        InnerProtocol::Normal(handler) => handler.setup_server_stream(Box::new(tls_stream)).await,
+    let mut target_setup_result = match &target.inner_protocol {
+        InnerProtocol::Normal(handler) => {
+            handler
+                .setup_server_stream_with_peer_addr(Box::new(tls_stream), peer_addr)
+                .await
+        }
         InnerProtocol::VisionVless(vision_cfg) => {
             crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                 tls_stream,
-                &vision_cfg.user_id,
+                &vision_cfg.users,
                 vision_cfg.udp_enabled,
                 target.effective_selector.clone(),
                 resolver,
@@ -298,10 +306,20 @@ pub async fn setup_reality_server_stream(
                 naive_cfg,
                 target.effective_selector.clone(),
                 resolver.clone(),
+                peer_addr,
             )
             .await
         }
+    };
+
+    if let Ok(ref mut setup_result) = target_setup_result {
+        if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
+            return target_setup_result;
+        }
+        setup_result.set_need_initial_flush(true);
     }
+
+    target_setup_result
 }
 
 /// Forward dest records to client and spawn bidirectional copy.

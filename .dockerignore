@@ -1,0 +1,7 @@
+target
+.git
+.gitignore
+examples
+android
+scripts/build-android.sh
+scripts/build-ios.sh

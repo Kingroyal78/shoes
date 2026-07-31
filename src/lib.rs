@@ -65,13 +65,19 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
+#[cfg(feature = "e2e-client")]
+pub mod e2e_server;
+#[cfg(feature = "e2e-client")]
+pub mod e2e_support;
 mod h2mux;
 mod http_handler;
+mod hysteria2_obfs;
 mod hysteria2_server;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;
 mod port_forward_handler;
+mod protocol_sniff;
 mod quic_server;
 mod quic_stream;
 mod reality;
@@ -87,6 +93,7 @@ mod snell;
 mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;
+pub mod ss_plugins;
 mod stream_reader;
 mod sync_adapter;
 mod tcp;

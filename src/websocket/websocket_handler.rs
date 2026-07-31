@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
@@ -11,6 +14,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
+use crate::h2mux::PrependStream;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -20,6 +24,8 @@ use crate::tcp::tcp_handler::{
 pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
     pub matching_headers: Option<FxHashMap<String, String>>,
+    pub max_early_data: Option<u32>,
+    pub early_data_header_name: Option<String>,
     pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
 }
@@ -33,13 +39,11 @@ impl WebsocketTcpServerHandler {
     pub fn new(server_targets: Vec<WebsocketServerTarget>) -> Self {
         Self { server_targets }
     }
-}
 
-#[async_trait]
-impl TcpServerHandler for WebsocketTcpServerHandler {
-    async fn setup_server_stream(
+    async fn run(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<std::net::SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedHttpData {
             mut first_line,
@@ -74,15 +78,22 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let WebsocketServerTarget {
                 matching_path,
                 matching_headers,
+                max_early_data,
+                early_data_header_name,
                 ping_type,
                 handler,
             } = server_target;
 
-            if let Some(path) = matching_path
-                && path != &request_path
-            {
+            let Some(early_data) = match_path_and_decode_early_data(
+                &request_path,
+                &request_headers,
+                matching_path.as_deref(),
+                *max_early_data,
+                early_data_header_name.as_deref(),
+            )?
+            else {
                 continue;
-            }
+            };
 
             if let Some(headers) = matching_headers {
                 for (header_key, header_val) in headers {
@@ -100,8 +111,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             };
 
             let websocket_version_response_header =
-                match request_headers.get("sec-websocket_version") {
+                match request_headers.get("sec-websocket-version") {
                     Some(v) => format!("Sec-WebSocket-Version: {v}\r\n"),
+                    None => "".to_string(),
+                };
+
+            let websocket_protocol_response_header =
+                match request_headers.get("sec-websocket-protocol") {
+                    Some(v) => format!("Sec-WebSocket-Protocol: {v}\r\n"),
                     None => "".to_string(),
                 };
 
@@ -113,21 +130,32 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                     "Connection: Upgrade\r\n",
                     "{}",
                     "Sec-WebSocket-Accept: {}\r\n",
+                    "{}",
                     "\r\n"
                 ),
-                host_response_header, websocket_version_response_header, websocket_key_response,
+                host_response_header,
+                websocket_version_response_header,
+                websocket_key_response,
+                websocket_protocol_response_header,
             );
 
             server_stream.write_all(http_response.as_bytes()).await?;
+            server_stream.flush().await?;
 
-            let websocket_stream = Box::new(WebsocketStream::new(
+            let websocket_stream = WebsocketStream::new(
                 server_stream,
                 false,
                 ping_type.clone(),
                 stream_reader.unparsed_data(),
-            ));
+            );
+            let websocket_stream: Box<dyn AsyncStream> = match early_data {
+                Some(data) => Box::new(PrependStream::new(websocket_stream, Some(data))),
+                None => Box::new(websocket_stream),
+            };
 
-            let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
+            let mut target_setup_result = handler
+                .setup_server_stream_with_peer_addr(websocket_stream, peer_addr)
+                .await;
 
             if let Ok(ref mut setup_result) = target_setup_result {
                 if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
@@ -142,6 +170,90 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 
         Err(std::io::Error::other("No matching websocket targets"))
     }
+}
+
+#[async_trait]
+impl TcpServerHandler for WebsocketTcpServerHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.run(server_stream, None).await
+    }
+
+    async fn setup_server_stream_with_peer_addr(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.run(server_stream, peer_addr).await
+    }
+}
+
+fn match_path_and_decode_early_data(
+    request_path: &str,
+    request_headers: &HashMap<String, String>,
+    matching_path: Option<&str>,
+    max_early_data: Option<u32>,
+    early_data_header_name: Option<&str>,
+) -> std::io::Result<Option<Option<Box<[u8]>>>> {
+    let max_early_data = max_early_data.unwrap_or(0);
+    let early_data_header_name = early_data_header_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+
+    if (max_early_data == 0 || early_data_header_name.is_some())
+        && let Some(path) = matching_path
+        && request_path != path
+    {
+        return Ok(None);
+    }
+
+    if max_early_data == 0 {
+        return Ok(Some(None));
+    }
+
+    let early_data = if let Some(header_name) = early_data_header_name {
+        let header_name = header_name.to_ascii_lowercase();
+        request_headers
+            .get(&header_name)
+            .filter(|value| !value.is_empty())
+            .map(|value| decode_early_data(value, max_early_data))
+            .transpose()?
+    } else if let Some(path) = matching_path {
+        let Some(encoded) = request_path.strip_prefix(path) else {
+            return Ok(None);
+        };
+        if encoded.is_empty() {
+            None
+        } else {
+            Some(decode_early_data(encoded, max_early_data)?)
+        }
+    } else {
+        None
+    };
+
+    Ok(Some(early_data.map(Vec::into_boxed_slice)))
+}
+
+fn decode_early_data(encoded: &str, max_early_data: u32) -> std::io::Result<Vec<u8>> {
+    let data = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("websocket early-data is not valid base64url: {e}"),
+        )
+    })?;
+    if data.len() > max_early_data as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "websocket early-data length {} exceeds configured limit {}",
+                data.len(),
+                max_early_data
+            ),
+        ));
+    }
+    Ok(data)
 }
 
 #[derive(Debug)]
@@ -325,4 +437,58 @@ fn create_websocket_key_response(key: String) -> String {
     input.extend_from_slice(WS_GUID);
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_header_early_data_after_exact_path_match() {
+        let mut headers = HashMap::new();
+        headers.insert("sec-websocket-protocol".to_string(), "aGVsbG8".to_string());
+
+        let data = match_path_and_decode_early_data(
+            "/ws",
+            &headers,
+            Some("/ws"),
+            Some(2048),
+            Some("Sec-WebSocket-Protocol"),
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&*data, b"hello");
+    }
+
+    #[test]
+    fn decodes_path_early_data_suffix() {
+        let headers = HashMap::new();
+
+        let data =
+            match_path_and_decode_early_data("/wsaGk", &headers, Some("/ws"), Some(2048), None)
+                .unwrap()
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(&*data, b"hi");
+    }
+
+    #[test]
+    fn rejects_early_data_over_configured_limit() {
+        let mut headers = HashMap::new();
+        headers.insert("sec-websocket-protocol".to_string(), "aGVsbG8".to_string());
+
+        let err = match_path_and_decode_early_data(
+            "/ws",
+            &headers,
+            Some("/ws"),
+            Some(4),
+            Some("Sec-WebSocket-Protocol"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("exceeds configured limit"));
+    }
 }

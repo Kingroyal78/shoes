@@ -21,18 +21,62 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 name = "shoes"
 path = "src/main.rs"
 
+[[bin]]
+name = "shoes-naiveproxy-e2e-client"
+path = "src/bin/shoes-naiveproxy-e2e-client.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-basic-proxy-e2e-server"
+path = "src/bin/shoes-basic-proxy-e2e-server.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-snell-e2e-server"
+path = "src/bin/shoes-snell-e2e-server.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-shadowtls-e2e-server"
+path = "src/bin/shoes-shadowtls-e2e-server.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-quic-e2e-server"
+path = "src/bin/shoes-quic-e2e-server.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-ss-obfs-e2e-client"
+path = "src/bin/shoes-ss-obfs-e2e-client.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
+name = "shoes-vless-xhttp-e2e-client"
+path = "src/bin/shoes-vless-xhttp-e2e-client.rs"
+required-features = ["e2e-client"]
+
 [features]
 default = []
+e2e-client = ["dep:rustls-pemfile", "dep:tokio-rustls"]
 ffi = []  # Enable FFI module for non-Android builds
 
 [dependencies]
 async-trait = "*"
+aes = "0.8.4"
+aes-gcm = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
+blake2 = "*"
 blake3 = "*"
+blowfish = "0.9.1"
 bytes = "*"
+cast5 = "0.11.1"
 chrono = "*"
+cipher = "0.4.4"
+crc32fast = "1.5.0"
 dashmap = "*"
+des = "0.8.1"
 digest = "*"
 etherparse = "*"
 futures = "*"
@@ -45,6 +89,7 @@ http-body-util = "*"
 hyper = { version = "*", features = ["server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
+kcp = "0.6.0"
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
@@ -53,29 +98,42 @@ memchr = "*"
 mime_guess = "*"
 notify = "*"
 parking_lot = "*"
+pbkdf2 = "0.13.0"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+reed-solomon-erasure = "6.0.0"
+regex = "*"
 rust-argon2 = "*"
 rustc-hash = "*"
+rustls-pemfile = { version = "*", optional = true }
 rustls = "*"
+salsa20 = "0.10.2"
 serde = { version = "*", features = ["derive", "std"] }
+serde_json = "*"
 serde_yaml = "*"
+sha1 = "0.11.0"
+snap = "1.1.2"
+rmp-serde = "*"
+reqwest = { version = "*", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
 socket2 = "*"
 subtle = "*"
+twofish = "0.7.1"
 tokio = { version = "*", features = [
     "fs",
     "io-util",
     "macros",
     "net",
     "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
+tokio-rustls = { version = "*", optional = true }
 tokio-util = { version = "*", features = ["time"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
@@ -84,10 +142,8 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 
 [dev-dependencies]
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustls-pemfile = "*"
 serde_json = "*"
 tempfile = "*"
-tokio-rustls = "*"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

@@ -25,7 +25,7 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     if [ -n "${NDK_HOME:-}" ]; then
         export ANDROID_NDK_HOME="$NDK_HOME"
     elif [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
-        ANDROID_NDK_HOME="$(ls -d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1)"
+        ANDROID_NDK_HOME="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
         ANDROID_NDK_HOME="${ANDROID_NDK_HOME%/}"
         export ANDROID_NDK_HOME
     else

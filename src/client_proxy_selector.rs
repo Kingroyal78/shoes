@@ -1,6 +1,7 @@
 use log::{debug, error};
 use lru::LruCache;
 use parking_lot::RwLock;
+use regex::{Regex, RegexBuilder};
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
@@ -112,13 +113,104 @@ impl RoutingCache {
 
 #[derive(Debug)]
 pub struct ConnectRule {
-    pub masks: Vec<NetLocationMask>,
+    pub matchers: Vec<ConnectMatcher>,
     pub action: ConnectAction,
 }
 
 impl ConnectRule {
     pub fn new(masks: Vec<NetLocationMask>, action: ConnectAction) -> Self {
-        Self { masks, action }
+        Self::new_matchers(
+            masks.into_iter().map(ConnectMatcher::Location).collect(),
+            action,
+        )
+    }
+
+    pub fn new_matchers(matchers: Vec<ConnectMatcher>, action: ConnectAction) -> Self {
+        Self { matchers, action }
+    }
+
+    fn requires_protocol_sniff(&self) -> bool {
+        self.matchers
+            .iter()
+            .any(ConnectMatcher::requires_protocol_sniff)
+    }
+}
+
+#[derive(Debug)]
+pub enum ConnectMatcher {
+    Location(NetLocationMask),
+    DomainKeyword(String),
+    DomainFull(String),
+    DomainSuffix(String),
+    DomainRegex(Regex),
+    Protocol(SniffedProtocol),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SniffedProtocol {
+    Http,
+    Tls,
+    Quic,
+    Bittorrent,
+    Ssh,
+}
+
+impl SniffedProtocol {
+    pub const SUPPORTED_LABELS: &'static [&'static str] =
+        &["http", "tls", "quic", "bittorrent", "ssh"];
+
+    pub fn from_route_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "http" => Some(Self::Http),
+            "tls" | "https" => Some(Self::Tls),
+            "quic" => Some(Self::Quic),
+            "bittorrent" | "bt" => Some(Self::Bittorrent),
+            "ssh" => Some(Self::Ssh),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Tls => "tls",
+            Self::Quic => "quic",
+            Self::Bittorrent => "bittorrent",
+            Self::Ssh => "ssh",
+        }
+    }
+}
+
+impl ConnectMatcher {
+    pub fn location(mask: NetLocationMask) -> Self {
+        Self::Location(mask)
+    }
+
+    pub fn domain_keyword(value: impl Into<String>) -> Self {
+        Self::DomainKeyword(value.into().to_ascii_lowercase())
+    }
+
+    pub fn domain_full(value: impl Into<String>) -> Self {
+        Self::DomainFull(value.into().to_ascii_lowercase())
+    }
+
+    pub fn domain_suffix(value: impl Into<String>) -> Self {
+        Self::DomainSuffix(value.into().to_ascii_lowercase())
+    }
+
+    pub fn domain_regex(value: impl AsRef<str>) -> Result<Self, regex::Error> {
+        RegexBuilder::new(value.as_ref())
+            .case_insensitive(true)
+            .build()
+            .map(Self::DomainRegex)
+    }
+
+    pub fn protocol(protocol: SniffedProtocol) -> Self {
+        Self::Protocol(protocol)
+    }
+
+    fn requires_protocol_sniff(&self) -> bool {
+        matches!(self, Self::Protocol(_))
     }
 }
 
@@ -256,7 +348,10 @@ impl ClientProxySelector {
         // Enable caching if:
         // 1. DNS resolution is enabled (expensive operation), OR
         // 2. Many rules (linear scan becomes expensive)
-        let cache = if resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD {
+        let requires_protocol_sniff = rules.iter().any(ConnectRule::requires_protocol_sniff);
+        let cache = if !requires_protocol_sniff
+            && (resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD)
+        {
             Some(RoutingCache::new(cache_capacity.max(1)))
         } else {
             None
@@ -285,6 +380,24 @@ impl ClientProxySelector {
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_inner(location, resolver, None).await
+    }
+
+    pub async fn judge_with_protocol<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        sniffed_protocol: Option<SniffedProtocol>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_inner(location, resolver, sniffed_protocol).await
+    }
+
+    async fn judge_inner<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        sniffed_protocol: Option<SniffedProtocol>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
         // Derive resolved_ip from any pre-resolved address
         let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
 
@@ -292,7 +405,9 @@ impl ClientProxySelector {
         let cache = match &self.cache {
             Some(c) => c,
             None => {
-                return self.judge_uncached(location, resolved_ip, resolver).await;
+                return self
+                    .judge_uncached_with_protocol(location, resolved_ip, resolver, sniffed_protocol)
+                    .await;
             }
         };
 
@@ -310,6 +425,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            sniffed_protocol,
         )
         .await?
         {
@@ -334,6 +450,17 @@ impl ClientProxySelector {
         resolved_ip: Option<u128>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_uncached_with_protocol(location, resolved_ip, resolver, None)
+            .await
+    }
+
+    pub async fn judge_uncached_with_protocol<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolved_ip: Option<u128>,
+        resolver: &Arc<dyn Resolver>,
+        sniffed_protocol: Option<SniffedProtocol>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
         match match_rule(
             &self.rules,
@@ -341,6 +468,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            sniffed_protocol,
         )
         .await?
         {
@@ -379,6 +507,10 @@ impl ClientProxySelector {
     #[cfg(test)]
     fn is_cache_enabled(&self) -> bool {
         self.cache.is_some()
+    }
+
+    pub fn requires_protocol_sniff(&self) -> bool {
+        self.rules.iter().any(ConnectRule::requires_protocol_sniff)
     }
 }
 
@@ -425,22 +557,24 @@ async fn match_rule(
     mut resolved_ip: Option<u128>,
     resolver: &Arc<dyn Resolver>,
     resolve_rule_hostnames: bool,
+    sniffed_protocol: Option<SniffedProtocol>,
 ) -> std::io::Result<Option<usize>> {
     for (rule_index, rule) in rules.iter().enumerate() {
-        for mask in rule.masks.iter() {
-            match match_mask(
-                mask,
+        for matcher in rule.matchers.iter() {
+            match match_matcher(
+                matcher,
                 location,
                 &mut resolved_ip,
                 resolver,
                 resolve_rule_hostnames,
+                sniffed_protocol,
             )
             .await
             {
                 Ok(is_match) => {
                     if is_match {
                         debug!(
-                            "Found matching mask for {} -> {mask:?}",
+                            "Found matching route matcher for {} -> {matcher:?}",
                             location.location()
                         );
                         return Ok(Some(rule_index));
@@ -448,13 +582,13 @@ async fn match_rule(
                 }
                 Err(MatchMaskError::Fatal(e)) => {
                     return Err(std::io::Error::other(format!(
-                        "fatal error while matching mask for {}: {e}",
+                        "fatal error while matching route matcher for {}: {e}",
                         location.location()
                     )));
                 }
                 Err(MatchMaskError::NonFatal(e)) => {
                     error!(
-                        "Non-fatal error while trying to match mask for {}: {e}",
+                        "Non-fatal error while trying to match route matcher for {}: {e}",
                         location.location()
                     );
                 }
@@ -473,6 +607,56 @@ enum MatchMaskError {
 #[cfg(test)]
 pub fn matches_domain_for_test(base_domain: &str, hostname: &str) -> bool {
     matches_domain(base_domain, hostname)
+}
+
+#[inline]
+async fn match_matcher(
+    matcher: &ConnectMatcher,
+    location: &mut ResolvedLocation,
+    resolved_ip: &mut Option<u128>,
+    resolver: &Arc<dyn Resolver>,
+    resolve_rule_hostnames: bool,
+    sniffed_protocol: Option<SniffedProtocol>,
+) -> std::result::Result<bool, MatchMaskError> {
+    match matcher {
+        ConnectMatcher::Location(mask) => {
+            match_mask(
+                mask,
+                location,
+                resolved_ip,
+                resolver,
+                resolve_rule_hostnames,
+            )
+            .await
+        }
+        ConnectMatcher::DomainKeyword(keyword) => Ok(location
+            .location()
+            .address()
+            .hostname()
+            .map(|hostname| !keyword.is_empty() && hostname.to_ascii_lowercase().contains(keyword))
+            .unwrap_or(false)),
+        ConnectMatcher::DomainFull(domain) => Ok(location
+            .location()
+            .address()
+            .hostname()
+            .map(|hostname| !domain.is_empty() && hostname.eq_ignore_ascii_case(domain))
+            .unwrap_or(false)),
+        ConnectMatcher::DomainSuffix(domain) => Ok(location
+            .location()
+            .address()
+            .hostname()
+            .map(|hostname| {
+                !domain.is_empty() && matches_domain(domain, &hostname.to_ascii_lowercase())
+            })
+            .unwrap_or(false)),
+        ConnectMatcher::DomainRegex(regex) => Ok(location
+            .location()
+            .address()
+            .hostname()
+            .map(|hostname| regex.is_match(hostname))
+            .unwrap_or(false)),
+        ConnectMatcher::Protocol(protocol) => Ok(sniffed_protocol == Some(*protocol)),
+    }
 }
 
 /// Match a single mask against the location.
@@ -722,6 +906,123 @@ mod tests {
         assert!(matches_domain_for_test("localhost", "localhost"));
         assert!(!matches_domain_for_test("localhost", "notlocalhost"));
         assert!(!matches_domain_for_test("host", "localhost")); // partial suffix
+    }
+
+    #[tokio::test]
+    async fn test_domain_keyword_matcher_blocks_substring() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::domain_keyword("video")],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+        let resolver = mock_resolver();
+
+        let location =
+            NetLocation::new(Address::Hostname("cdn-video.example.com".to_string()), 443);
+        let decision = selector.judge(location.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Block));
+    }
+
+    #[tokio::test]
+    async fn test_domain_full_matcher_requires_exact_hostname() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::domain_full("api.example.com")],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+        let resolver = mock_resolver();
+
+        let exact = NetLocation::new(Address::Hostname("api.example.com".to_string()), 443);
+        let decision = selector.judge(exact.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Block));
+
+        let subdomain = NetLocation::new(Address::Hostname("www.api.example.com".to_string()), 443);
+        let decision = selector.judge(subdomain.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_domain_suffix_matcher_blocks_subdomains() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::domain_suffix("example.com")],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+        let resolver = mock_resolver();
+
+        let subdomain = NetLocation::new(Address::Hostname("www.example.com".to_string()), 443);
+        let decision = selector.judge(subdomain.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Block));
+
+        let partial = NetLocation::new(Address::Hostname("badexample.com".to_string()), 443);
+        let decision = selector.judge(partial.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_domain_regex_matcher_blocks_matching_hostname() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::domain_regex(r"^cdn-[0-9]+\.example\.com$").unwrap()],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+        let resolver = mock_resolver();
+
+        let matched = NetLocation::new(Address::Hostname("CDN-42.example.com".to_string()), 443);
+        let decision = selector.judge(matched.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Block));
+
+        let allowed = NetLocation::new(Address::Hostname("cdn-main.example.com".to_string()), 443);
+        let decision = selector.judge(allowed.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_protocol_matcher_uses_sniffed_protocol_only() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::protocol(SniffedProtocol::Http)],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+        let resolver = mock_resolver();
+        let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(198, 51, 100, 10)), 80);
+
+        let decision = selector
+            .judge(location.clone().into(), &resolver)
+            .await
+            .unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
+
+        let decision = selector
+            .judge_with_protocol(
+                location.clone().into(),
+                &resolver,
+                Some(SniffedProtocol::Http),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(decision, ConnectDecision::Block));
+
+        let decision = selector
+            .judge_with_protocol(location.into(), &resolver, Some(SniffedProtocol::Tls))
+            .await
+            .unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
     }
 
     #[tokio::test]
@@ -1735,6 +2036,21 @@ mod tests {
         ];
         let selector = ClientProxySelector::with_options(rules, true);
         assert!(selector.is_cache_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_selector_cache_disabled_for_protocol_rules() {
+        let rules = vec![
+            ConnectRule::new_matchers(
+                vec![ConnectMatcher::protocol(SniffedProtocol::Http)],
+                ConnectAction::new_block(),
+            ),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::with_options(rules, true);
+
+        assert!(selector.requires_protocol_sniff());
+        assert!(!selector.is_cache_enabled());
     }
 
     #[tokio::test]

@@ -8,11 +8,12 @@ use crate::crypto::CryptoTlsStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
 use crate::uuid_util::parse_uuid;
+use crate::xudp::XudpFixedMessageStream;
 
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_response_stream::VlessResponseStream;
-use super::vless_util::{COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
+use super::vless_util::{COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
 
 pub struct VlessTcpClientHandler {
     user_id: Box<[u8]>,
@@ -92,6 +93,27 @@ where
     let response_stream = Box::new(VlessResponseStream::new(stream));
     let message_stream = VlessMessageStream::new(response_stream);
     Ok(Box::new(message_stream))
+}
+
+pub async fn setup_vless_vision_xudp_bidirectional<IO>(
+    mut tls_stream: CryptoTlsStream<IO>,
+    user_id: &[u8],
+    target: NetLocation,
+) -> std::io::Result<Box<dyn AsyncMessageStream>>
+where
+    IO: crate::async_stream::AsyncStream + 'static,
+{
+    write_vless_mux_header(&mut tls_stream, user_id, vision_flow_addon_data()).await?;
+    tls_stream.flush().await?;
+
+    let (io, connection) = tls_stream.into_inner();
+    let mut user_uuid = [0u8; 16];
+    user_uuid.copy_from_slice(user_id);
+    let vision_stream = VisionStream::new_client(io, connection, user_uuid);
+    Ok(Box::new(XudpFixedMessageStream::new(
+        Box::new(vision_stream),
+        target,
+    )))
 }
 
 pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
@@ -181,6 +203,29 @@ async fn write_vless_udp_header<S: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+async fn write_vless_mux_header<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    user_id: &[u8],
+    addon_data: &[u8],
+) -> std::io::Result<()> {
+    let base_header_size = 1 + 16 + 1 + addon_data.len() + 1;
+    let mut header_bytes = allocate_vec(base_header_size);
+
+    header_bytes[0] = 0;
+    header_bytes[1..17].copy_from_slice(user_id);
+    header_bytes[17] = addon_data.len() as u8;
+
+    if !addon_data.is_empty() {
+        header_bytes[18..18 + addon_data.len()].copy_from_slice(addon_data);
+    }
+
+    header_bytes[18 + addon_data.len()] = COMMAND_MUX;
+
+    write_all(stream, &header_bytes).await?;
+
+    Ok(())
+}
+
 async fn write_vless_header<S: AsyncWriteExt + Unpin>(
     stream: &mut S,
     user_id: &[u8],
@@ -246,4 +291,32 @@ async fn write_vless_header<S: AsyncWriteExt + Unpin>(
     write_all(stream, &header_bytes).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, duplex};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn write_vless_mux_header_includes_vision_flow_and_no_destination() {
+        let user_id = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
+        let addon = vision_flow_addon_data();
+        let (mut writer, mut reader) = duplex(128);
+
+        write_vless_mux_header(&mut writer, &user_id, addon)
+            .await
+            .unwrap();
+
+        let mut received = vec![0u8; 1 + 16 + 1 + addon.len() + 1];
+        reader.read_exact(&mut received).await.unwrap();
+
+        assert_eq!(received[0], 0);
+        assert_eq!(&received[1..17], &user_id[..]);
+        assert_eq!(received[17], addon.len() as u8);
+        assert_eq!(&received[18..18 + addon.len()], addon);
+        assert_eq!(received[18 + addon.len()], COMMAND_MUX);
+        assert_eq!(received.len(), 1 + 16 + 1 + addon.len() + 1);
+    }
 }

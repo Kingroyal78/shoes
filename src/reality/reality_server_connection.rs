@@ -54,6 +54,8 @@ pub struct RealityServerConfig {
     pub max_client_version: Option<[u8; 3]>,
     /// Supported TLS 1.3 cipher suites (empty = use defaults)
     pub cipher_suites: Vec<CipherSuite>,
+    /// Optional ALPN protocol selected by the REALITY server.
+    pub selected_alpn: Option<String>,
 }
 
 /// Handshake state machine for REALITY server
@@ -566,7 +568,8 @@ impl RealityServerConnection {
         let (cert, signing_key) = generate_hmac_certificate(&info.auth_key, dest_hostname)?;
 
         // Build encrypted handshake messages
-        let encrypted_extensions = construct_encrypted_extensions()?;
+        let encrypted_extensions =
+            construct_encrypted_extensions(self.config.selected_alpn.as_deref())?;
         handshake_transcript.update(&encrypted_extensions);
 
         let certificate = construct_certificate(cert)?;
@@ -1105,6 +1108,7 @@ mod tests {
             min_client_version: None,
             max_client_version: None,
             cipher_suites: Vec::new(),
+            selected_alpn: None,
         };
 
         let conn = RealityServerConnection::new(config).unwrap();
@@ -1122,6 +1126,7 @@ mod tests {
             min_client_version: None,
             max_client_version: None,
             cipher_suites: Vec::new(),
+            selected_alpn: None,
         };
 
         let mut conn = RealityServerConnection::new(config).unwrap();

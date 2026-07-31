@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
@@ -20,6 +21,97 @@ const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 fn create_http_auth_token(username: &str, password: &str) -> String {
     BASE64.encode(format!("{username}:{password}"))
+}
+
+fn parse_connect_authority(authority: &str) -> std::io::Result<NetLocation> {
+    parse_authority(authority, None)
+}
+
+fn parse_authority(authority: &str, default_port: Option<u16>) -> std::io::Result<NetLocation> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid IPv6 authority")
+        })?;
+        let host = &rest[..end];
+        let after_host = &rest[end + 1..];
+        let port = if let Some(port_str) = after_host.strip_prefix(':') {
+            if port_str.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid address format",
+                ));
+            }
+            port_str
+                .parse::<u16>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        } else if after_host.is_empty() {
+            default_port
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "No port"))?
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid IPv6 authority",
+            ));
+        };
+
+        return Ok(NetLocation::new(Address::from(host)?, port));
+    }
+
+    let (host, port) = match authority.rfind(':') {
+        Some(separator_index) => {
+            let host = &authority[..separator_index];
+            let port_str = &authority[separator_index + 1..];
+            if host.is_empty() || port_str.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid address format",
+                ));
+            }
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            (host, port)
+        }
+        None => (
+            authority,
+            default_port
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "No port"))?,
+        ),
+    };
+
+    Ok(NetLocation::new(Address::from(host)?, port))
+}
+
+fn parse_http_forward_url(raw_url: &str) -> std::io::Result<(NetLocation, String)> {
+    let url = Url::parse(raw_url)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if url.scheme() != "http" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Unsupported http forward url: {raw_url}"),
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "HTTP URL missing host")
+    })?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = url.port_or_known_default().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "HTTP URL missing port")
+    })?;
+
+    let mut location = url.path().to_string();
+    if location.is_empty() {
+        location.push('/');
+    }
+    if let Some(query) = url.query() {
+        location.push('?');
+        location.push_str(query);
+    }
+
+    Ok((NetLocation::new(Address::from(host)?, port), location))
 }
 
 #[derive(Debug)]
@@ -97,25 +189,7 @@ pub async fn setup_http_server_stream_inner(
     let (remote_location, connection_success_response, initial_remote_data, need_initial_flush) =
         if line.starts_with("CONNECT ") {
             let address = &line[8..line.len() - 9];
-
-            let separator_index = address.find(':').ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address format")
-            })?;
-
-            if address.len() <= separator_index + 1 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Invalid address format",
-                ));
-            }
-
-            let domain_name = &address[0..separator_index];
-
-            let port = address[separator_index + 1..]
-                .parse::<u16>()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let remote_location = NetLocation::new(Address::from(domain_name)?, port);
+            let remote_location = parse_connect_authority(address)?;
 
             // wait for an empty \r\n before connecting, and check for auth header line if needed.
             let mut need_auth = auth_token.is_some();
@@ -189,30 +263,7 @@ pub async fn setup_http_server_stream_inner(
             let directive = &line[0..space_index];
             let url = &line[space_index + 1..];
 
-            if !url.starts_with("http://") {
-                // we can't handle https
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unsupported http forward url: {url}"),
-                ));
-            }
-
-            let url = &url[7..]; // strip "http://"
-
-            let (address, location) = match url.find('/') {
-                Some(i) => (&url[0..i], &url[i..]),
-                None => (url, "/"),
-            };
-
-            let remote_location = match address.find(':') {
-                Some(i) => {
-                    let port = address[i + 1..]
-                        .parse::<u16>()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    NetLocation::new(Address::from(&address[0..i])?, port)
-                }
-                None => NetLocation::new(Address::from(address)?, 80),
-            };
+            let (remote_location, location) = parse_http_forward_url(url)?;
 
             let mut request = format!("{directive} {location} {http_version}\r\n");
 
@@ -311,6 +362,7 @@ pub async fn setup_http_server_stream_inner(
         connection_success_response,
         initial_remote_data,
         proxy_selector,
+        authenticated_user: None,
     })
 }
 
@@ -447,5 +499,56 @@ impl TcpClientHandler for HttpTcpClientHandler {
             client_stream,
             early_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    #[test]
+    fn connect_authority_parses_bracketed_ipv6() {
+        let location = parse_connect_authority("[::1]:443").unwrap();
+        assert_eq!(
+            location,
+            NetLocation::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 443)
+        );
+    }
+
+    #[test]
+    fn connect_authority_parses_hostname() {
+        let location = parse_connect_authority("example.com:8443").unwrap();
+        assert_eq!(
+            location,
+            NetLocation::new(Address::Hostname("example.com".to_string()), 8443)
+        );
+    }
+
+    #[test]
+    fn forward_url_parses_ipv6_host_and_query() {
+        let (location, path) = parse_http_forward_url("http://[::1]:8080/path?q=1").unwrap();
+        assert_eq!(
+            location,
+            NetLocation::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 8080)
+        );
+        assert_eq!(path, "/path?q=1");
+    }
+
+    #[test]
+    fn forward_url_defaults_to_port_80() {
+        let (location, path) = parse_http_forward_url("http://127.0.0.1").unwrap();
+        assert_eq!(
+            location,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80)
+        );
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn forward_url_rejects_https() {
+        let err = parse_http_forward_url("https://example.com/").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

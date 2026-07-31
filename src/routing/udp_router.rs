@@ -33,6 +33,7 @@ use crate::async_stream::{
     AsyncWriteSessionMessage, AsyncWriteSourcedMessage,
 };
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::protocol_sniff::sniff_udp_protocol;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::util::allocate_vec;
 
@@ -1038,12 +1039,19 @@ impl<'a> UdpRouter<'a> {
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination.clone();
+        let sniffed_protocol = if selector.requires_protocol_sniff() {
+            sniff_udp_protocol(data)
+        } else {
+            None
+        };
 
         let future: SessionCreateFuture = Box::pin(async move {
             let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
             // Create ResolvedLocation with pre-resolved address
             let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
-            let decision = selector.judge(resolved_location, &resolver).await?;
+            let decision = selector
+                .judge_with_protocol(resolved_location, &resolver, sniffed_protocol)
+                .await?;
 
             match decision {
                 ConnectDecision::Allow {

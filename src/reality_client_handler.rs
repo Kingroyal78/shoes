@@ -154,7 +154,7 @@ impl TcpClientHandler for RealityClientHandler {
                     .await
             }
             RealityInnerClientHandler::VisionVless { uuid, .. } => {
-                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+                crate::vless::vless_client_handler::setup_vless_vision_xudp_bidirectional(
                     tls_stream,
                     uuid,
                     target.into_location(),

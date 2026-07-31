@@ -266,9 +266,12 @@ impl H2MuxClientSession {
             .send_request(http_request, false)
             .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
 
-        // Create unified client stream with lazy response resolution
-        let client_stream =
+        // Create unified client stream with lazy response resolution.
+        // Send StreamRequest immediately so server-first destinations do not deadlock waiting for
+        // a first user-data write before the server can route the stream.
+        let mut client_stream =
             H2MuxClientStream::new(send_stream, response_future, destination.clone(), is_tcp)?;
+        client_stream.write_stream_request().await?;
 
         self.active_streams.fetch_add(1, Ordering::Relaxed);
 
@@ -281,10 +284,49 @@ impl H2MuxClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::{Address, NetLocation};
+    use crate::h2mux::H2MuxServerSession;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn test_session_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<H2MuxClientSession>();
+    }
+
+    #[tokio::test]
+    async fn stream_request_is_sent_before_user_data_for_server_first() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let destination = NetLocation::new(Address::Hostname("example.test".to_string()), 443);
+        let expected_destination = destination.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut session = H2MuxServerSession::new(server_io).await.unwrap();
+            let inbound = timeout(Duration::from_secs(2), session.accept())
+                .await
+                .unwrap()
+                .expect("server should receive h2mux stream request");
+            assert_eq!(inbound.request.destination, expected_destination);
+
+            let mut stream = inbound.stream;
+            stream.write_all(b"banner").await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut client_session = H2MuxClientSession::new(client_io, &H2MuxOptions::default())
+            .await
+            .unwrap();
+        let mut stream = client_session.open_tcp(&destination).await.unwrap();
+
+        let mut out = [0u8; 6];
+        timeout(Duration::from_secs(2), stream.read_exact(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out, b"banner");
+
+        server_task.await.unwrap();
     }
 }

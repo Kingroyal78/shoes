@@ -174,6 +174,10 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let this = self.get_mut();
 
         // If read side is shut down, return EOF immediately
@@ -370,6 +374,8 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.session.writer().flush()?;
+
         // 1. First drain any pending application data (before sending close_notify)
         //    This is important because REALITY's write_tls() does lazy encryption -
         //    plaintext is encrypted when write_tls() is called, not when written to

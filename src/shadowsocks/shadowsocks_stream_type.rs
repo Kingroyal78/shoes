@@ -1,3 +1,4 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowsocksStreamType {
     Aead,
     AEAD2022Server,

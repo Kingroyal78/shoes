@@ -91,7 +91,7 @@ pub fn construct_server_hello(
 }
 
 /// Construct EncryptedExtensions message
-pub fn construct_encrypted_extensions() -> Result<Vec<u8>> {
+pub fn construct_encrypted_extensions(selected_alpn: Option<&str>) -> Result<Vec<u8>> {
     let mut encrypted_extensions = Vec::new();
 
     // EncryptedExtensions structure:
@@ -102,15 +102,42 @@ pub fn construct_encrypted_extensions() -> Result<Vec<u8>> {
 
     encrypted_extensions.push(HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
 
-    // Empty extensions for minimal setup
-    let extensions_length: u16 = 0;
-    let payload_length = 2; // Just the extensions_length field
+    let mut extensions = Vec::new();
+    if let Some(protocol) = selected_alpn.filter(|protocol| !protocol.is_empty()) {
+        if protocol.len() > u8::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ALPN protocol name is too long",
+            ));
+        }
+
+        extensions.extend_from_slice(&[0x00, 0x10]); // Extension type: ALPN (16)
+        let protocol_list_len = 1 + protocol.len();
+        let extension_len = 2 + protocol_list_len;
+        extensions.extend_from_slice(&(extension_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&(protocol_list_len as u16).to_be_bytes());
+        extensions.push(protocol.len() as u8);
+        extensions.extend_from_slice(protocol.as_bytes());
+    }
+
+    let extensions_length = u16::try_from(extensions.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EncryptedExtensions extension list is too long",
+        )
+    })?;
+    let payload_length = 2 + extensions.len();
 
     // Payload length (3 bytes)
-    encrypted_extensions.extend_from_slice(&[0x00, 0x00, payload_length as u8]);
+    encrypted_extensions.extend_from_slice(&[
+        ((payload_length >> 16) & 0xff) as u8,
+        ((payload_length >> 8) & 0xff) as u8,
+        (payload_length & 0xff) as u8,
+    ]);
 
     // Extensions length (2 bytes)
     encrypted_extensions.extend_from_slice(&extensions_length.to_be_bytes());
+    encrypted_extensions.extend_from_slice(&extensions);
 
     Ok(encrypted_extensions)
 }
@@ -447,10 +474,23 @@ mod tests {
 
     #[test]
     fn test_construct_encrypted_extensions() {
-        let result = construct_encrypted_extensions();
+        let result = construct_encrypted_extensions(None);
         assert!(result.is_ok());
         let msg = result.unwrap();
         assert_eq!(msg[0], HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
+    }
+
+    #[test]
+    fn test_construct_encrypted_extensions_with_alpn() {
+        let msg = construct_encrypted_extensions(Some("h2")).unwrap();
+        assert_eq!(msg[0], HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
+        assert_eq!(&msg[1..4], &[0x00, 0x00, 0x0b]);
+        assert_eq!(
+            &msg[4..],
+            &[
+                0x00, 0x09, 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, b'h', b'2'
+            ]
+        );
     }
 
     #[test]

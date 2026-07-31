@@ -1,27 +1,34 @@
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error};
 use lru::LruCache;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, SniffedProtocol};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::tcp_handler::AuthenticatedUser;
+use crate::tcp::tcp_server::{AuthenticatedConnectionScope, setup_client_tcp_stream};
 use crate::util::{allocate_vec, write_all};
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
@@ -32,7 +39,9 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 
 // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
-const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
+// version (1) + command (1) + assoc id (2) + packet id (2)
+// + fragment total/id (2) + payload size (2) + address
+const MAX_HEADER_LEN: usize = 1 + 1 + 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,22 +49,197 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum number of fragmented packets to track per connection.
 /// Old entries are automatically evicted when this limit is reached.
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
+/// A reassembled TUIC packet is still one UDP datagram and cannot exceed the
+/// protocol's 16-bit payload length.
+const MAX_REASSEMBLED_UDP_PACKET_SIZE: usize = u16::MAX as usize;
+/// Bound bytes retained by incomplete packets independently of the LRU key
+/// count. This is per QUIC connection.
+const MAX_FRAGMENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum number of unidirectional tasks accepted before authentication.
+///
+/// TUIC v5 permits clients to send task headers before AUTH (notably with
+/// resumed QUIC sessions). Those tasks must be paused rather than discarded,
+/// but keeping their streams alive consumes QUIC flow-control and heap state.
+const MAX_PENDING_UNI_TASKS: usize = 32;
+
 /// Heartbeat interval - server sends heartbeat datagrams to client at this interval.
 /// Default is 10 seconds per sing-box reference implementation.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const PROTOCOL_SNIFF_MAX_BYTES: usize = 2048;
+const PROTOCOL_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+type UdpFragmentMap = LruCache<UdpFragmentKey, FragmentedPacket>;
+type UdpFragmentCache = Arc<Mutex<UdpFragmentMap>>;
+type PreAuthParser =
+    Pin<Box<dyn Future<Output = std::io::Result<PreAuthUniStream>> + Send + 'static>>;
+type PreAuthParsers = FuturesUnordered<PreAuthParser>;
+
+#[derive(Clone)]
+struct TuicUniStreamContext {
+    connection: quinn::Connection,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    udp_session_map: UdpSessionMap,
+    udp_fragments: UdpFragmentCache,
+    cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
+}
+
+struct TuicAuthenticationResult {
+    authenticated_user: Option<AuthenticatedUser>,
+    pending_uni_tasks: Vec<PendingTuicUniTask>,
+    pending_parsers: PreAuthParsers,
+}
+
+enum PreAuthUniStream {
+    Authenticate {
+        specified_uuid: [u8; 16],
+        token: [u8; 32],
+    },
+    Task(PendingTuicUniTask),
+}
+
+struct PendingTuicUniTask {
+    recv_stream: quinn::RecvStream,
+    stream_reader: StreamReader,
+    header: TuicUniTaskHeader,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TuicUniTaskHeader {
+    Dissociate {
+        assoc_id: u16,
+    },
+    Packet {
+        assoc_id: u16,
+        packet_id: u16,
+        frag_total: u8,
+        frag_id: u8,
+        payload_size: u16,
+        remote_location: Option<NetLocation>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UdpFragmentKey {
+    assoc_id: u16,
+    packet_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuicCongestionControl {
+    Cubic,
+    NewReno,
+    Bbr,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuicServerUser {
+    pub uuid: [u8; 16],
+    pub password: String,
+    pub authenticated_user: Option<AuthenticatedUser>,
+}
+
+impl TuicServerUser {
+    pub fn new(
+        uuid: [u8; 16],
+        password: String,
+        authenticated_user: Option<AuthenticatedUser>,
+    ) -> Self {
+        Self {
+            uuid,
+            password,
+            authenticated_user,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TuicServerUsers {
+    users_by_uuid: Arc<HashMap<[u8; 16], TuicServerUser>>,
+}
+
+impl TuicServerUsers {
+    pub fn new(users: Vec<TuicServerUser>) -> std::io::Result<Self> {
+        if users.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tuic server requires at least one user",
+            ));
+        }
+
+        let mut users_by_uuid = HashMap::with_capacity(users.len());
+        for user in users {
+            if user.password.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tuic user password must not be empty",
+                ));
+            }
+            if users_by_uuid.insert(user.uuid, user).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "duplicate tuic user uuid",
+                ));
+            }
+        }
+
+        Ok(Self {
+            users_by_uuid: Arc::new(users_by_uuid),
+        })
+    }
+
+    fn get(&self, uuid: &[u8; 16]) -> Option<&TuicServerUser> {
+        self.users_by_uuid.get(uuid)
+    }
+}
+
+fn parse_tuic_congestion_control(value: Option<&str>) -> std::io::Result<TuicCongestionControl> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(TuicCongestionControl::Cubic);
+    };
+    match value.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "cubic" => Ok(TuicCongestionControl::Cubic),
+        "newreno" | "reno" => Ok(TuicCongestionControl::NewReno),
+        "bbr" => Ok(TuicCongestionControl::Bbr),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported tuic congestion_control `{value}`"),
+        )),
+    }
+}
+
+fn apply_tuic_congestion_control(
+    transport: &mut quinn::TransportConfig,
+    congestion_control: TuicCongestionControl,
+) {
+    match congestion_control {
+        TuicCongestionControl::Cubic => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        TuicCongestionControl::NewReno => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        TuicCongestionControl::Bbr => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+    }
+}
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    uuid: &'static [u8],
-    password: &'static str,
+    users: TuicServerUsers,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
@@ -79,8 +263,8 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
-        Ok(Ok(())) => {}
+    let auth_result = match timeout(AUTH_TIMEOUT, auth_connection(&connection, &users)).await {
+        Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
             return Err(e);
@@ -93,7 +277,12 @@ async fn process_connection(
                 "authentication timeout",
             ));
         }
-    }
+    };
+
+    let connection_scope = Arc::new(AuthenticatedConnectionScope::start(
+        &auth_result.authenticated_user,
+        Some(connection.remote_address()),
+    )?);
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
@@ -112,28 +301,39 @@ async fn process_connection(
     let bi_connection = connection.clone();
     let bi_client_proxy_selector = client_proxy_selector.clone();
     let bi_resolver = resolver.clone();
+    let bi_connection_scope = connection_scope.clone();
 
-    let uni_connection = connection.clone();
-    let uni_client_proxy_selector = client_proxy_selector.clone();
-    let uni_resolver = resolver.clone();
-    let uni_udp_session_map = udp_session_map.clone();
-    let uni_cancel_token = cancel_token.clone();
+    let uni_context = TuicUniStreamContext {
+        connection: connection.clone(),
+        client_proxy_selector: client_proxy_selector.clone(),
+        resolver: resolver.clone(),
+        udp_session_map: udp_session_map.clone(),
+        udp_fragments: Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap(),
+        ))),
+        cancel_token: cancel_token.clone(),
+        connection_scope: connection_scope.clone(),
+    };
 
     let datagram_connection = connection.clone();
     let datagram_cancel_token = cancel_token.clone();
+    let datagram_connection_scope = connection_scope.clone();
 
     // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
     // This reduces task count and avoids spawning separate tasks for the main loops.
     let heartbeat_loop = run_heartbeat_loop(heartbeat_connection, heartbeat_cancel_token);
 
-    let bi_loop = run_bidirectional_loop(bi_connection, bi_client_proxy_selector, bi_resolver);
+    let bi_loop = run_bidirectional_loop(
+        bi_connection,
+        bi_client_proxy_selector,
+        bi_resolver,
+        bi_connection_scope,
+    );
 
     let uni_loop = run_unidirectional_loop(
-        uni_connection,
-        uni_client_proxy_selector,
-        uni_resolver,
-        uni_udp_session_map,
-        uni_cancel_token,
+        uni_context,
+        auth_result.pending_uni_tasks,
+        auth_result.pending_parsers,
     );
 
     let datagram_loop = run_datagram_loop(
@@ -142,6 +342,7 @@ async fn process_connection(
         resolver,
         udp_session_map,
         datagram_cancel_token,
+        datagram_connection_scope,
     );
 
     let result = tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop);
@@ -191,62 +392,123 @@ async fn run_heartbeat_loop(
 
 async fn auth_connection(
     connection: &quinn::Connection,
-    uuid: &'static [u8],
-    password: &'static str,
-) -> std::io::Result<()> {
-    let mut expected_token_bytes = [0u8; 32];
-    connection
-        .export_keying_material(
-            &mut expected_token_bytes,
-            uuid.as_ref(),
-            password.as_bytes(),
-        )
-        .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
-
+    users: &TuicServerUsers,
+) -> std::io::Result<TuicAuthenticationResult> {
     // Loop until we receive an AUTH command.
-    // Other commands (like DISSOCIATE) may arrive on uni streams before AUTH.
-    // We discard non-AUTH streams and wait for the next one.
+    // TUIC v5 requires task headers received before AUTH to be parsed and
+    // paused. This is important for resumed sessions, where task streams can
+    // race the AUTH stream. No task body is processed or forwarded here.
     // The outer timeout in process_connection ensures we don't wait forever.
+    let mut pending_uni_tasks = Vec::new();
+    let mut parsers: PreAuthParsers = FuturesUnordered::new();
+    let mut accepted_streams = 0usize;
     loop {
-        let mut recv_stream = connection.accept_uni().await?;
-        let mut stream_reader = StreamReader::new_with_buffer_size(80);
-        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-        if tuic_version != 5 {
-            return Err(std::io::Error::other(format!(
-                "invalid tuic version: {tuic_version}"
-            )));
+        tokio::select! {
+            Some(parsed) = parsers.next(), if !parsers.is_empty() => {
+                match parsed? {
+                    PreAuthUniStream::Task(task) => {
+                        push_pending_uni_task(&mut pending_uni_tasks, task)?;
+                        debug!(
+                            "Paused TUIC task before auth ({} pending)",
+                            pending_uni_tasks.len()
+                        );
+                    }
+                    PreAuthUniStream::Authenticate {
+                        specified_uuid,
+                        token,
+                    } => {
+                        let user = users.get(&specified_uuid).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!("incorrect uuid: {specified_uuid:?}"),
+                            )
+                        })?;
+                        let mut expected_token_bytes = [0u8; 32];
+                        connection
+                            .export_keying_material(
+                                &mut expected_token_bytes,
+                                specified_uuid.as_ref(),
+                                user.password.as_bytes(),
+                            )
+                            .map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "Failed to export keying material: {e:?}"
+                                ))
+                            })?;
+                        if token != expected_token_bytes {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "incorrect token",
+                            ));
+                        }
+                        return Ok(TuicAuthenticationResult {
+                            authenticated_user: user.authenticated_user.clone(),
+                            pending_uni_tasks,
+                            pending_parsers: parsers,
+                        });
+                    }
+                }
+            }
+            accepted = connection.accept_uni(),
+                if accepted_streams < MAX_PENDING_UNI_TASKS + 1 =>
+            {
+                accepted_streams += 1;
+                parsers.push(Box::pin(parse_pre_auth_uni_stream(accepted?)));
+            }
         }
-        let command_type = stream_reader.read_u8(&mut recv_stream).await?;
-
-        if command_type != COMMAND_TYPE_AUTHENTICATE {
-            // Not an AUTH command - discard this stream and wait for the next one.
-            debug!("Received command type {command_type} before auth, waiting for auth command");
-            continue;
-        }
-
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("incorrect uuid: {specified_uuid:?}"),
-            ));
-        }
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
-        if token_bytes != expected_token_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "incorrect token",
-            ));
-        }
-
-        return Ok(());
     }
+}
+
+async fn parse_pre_auth_uni_stream(
+    mut recv_stream: quinn::RecvStream,
+) -> std::io::Result<PreAuthUniStream> {
+    let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+    let command_type = read_uni_stream_command_type(&mut recv_stream, &mut stream_reader).await?;
+    if command_type == COMMAND_TYPE_AUTHENTICATE {
+        let specified_uuid: [u8; 16] = stream_reader
+            .read_slice(&mut recv_stream, 16)
+            .await?
+            .try_into()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid uuid length")
+            })?;
+        let token: [u8; 32] = stream_reader
+            .read_slice(&mut recv_stream, 32)
+            .await?
+            .try_into()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid token length")
+            })?;
+        return Ok(PreAuthUniStream::Authenticate {
+            specified_uuid,
+            token,
+        });
+    }
+
+    let header = read_uni_task_header(&mut recv_stream, &mut stream_reader, command_type).await?;
+    Ok(PreAuthUniStream::Task(PendingTuicUniTask {
+        recv_stream,
+        stream_reader,
+        header,
+    }))
+}
+
+fn push_pending_uni_task<T>(pending: &mut Vec<T>, task: T) -> std::io::Result<()> {
+    if pending.len() >= MAX_PENDING_UNI_TASKS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("too many TUIC tasks before authentication (maximum {MAX_PENDING_UNI_TASKS})"),
+        ));
+    }
+    pending.push(task);
+    Ok(())
 }
 
 async fn run_bidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -267,9 +529,16 @@ async fn run_bidirectional_loop(
         let conn = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        let connection_scope = connection_scope.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                connection_scope,
+                send_stream,
+                recv_stream,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -288,10 +557,59 @@ async fn run_bidirectional_loop(
     Ok(())
 }
 
-async fn read_address(
-    recv: &mut quinn::RecvStream,
+async fn read_uni_stream_command_type<T>(
+    recv_stream: &mut T,
     stream_reader: &mut StreamReader,
-) -> std::io::Result<Option<NetLocation>> {
+) -> std::io::Result<u8>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let tuic_version = stream_reader.read_u8(recv_stream).await?;
+    if tuic_version != 5 {
+        return Err(std::io::Error::other(format!(
+            "invalid tuic version: {tuic_version}"
+        )));
+    }
+    stream_reader.read_u8(recv_stream).await
+}
+
+async fn read_uni_task_header<T>(
+    recv_stream: &mut T,
+    stream_reader: &mut StreamReader,
+    command_type: u8,
+) -> std::io::Result<TuicUniTaskHeader>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    if command_type == COMMAND_TYPE_DISSOCIATE {
+        return Ok(TuicUniTaskHeader::Dissociate {
+            assoc_id: stream_reader.read_u16_be(recv_stream).await?,
+        });
+    }
+
+    if command_type != COMMAND_TYPE_PACKET {
+        return Err(std::io::Error::other(format!(
+            "invalid uni stream command type: {command_type}"
+        )));
+    }
+
+    Ok(TuicUniTaskHeader::Packet {
+        assoc_id: stream_reader.read_u16_be(recv_stream).await?,
+        packet_id: stream_reader.read_u16_be(recv_stream).await?,
+        frag_total: stream_reader.read_u8(recv_stream).await?,
+        frag_id: stream_reader.read_u8(recv_stream).await?,
+        payload_size: stream_reader.read_u16_be(recv_stream).await?,
+        remote_location: read_address(recv_stream, stream_reader).await?,
+    })
+}
+
+async fn read_address<T>(
+    recv: &mut T,
+    stream_reader: &mut StreamReader,
+) -> std::io::Result<Option<NetLocation>>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
     let address_type = stream_reader.read_u8(recv).await?;
     let address = match address_type {
         0xff => {
@@ -389,6 +707,7 @@ fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
@@ -412,7 +731,15 @@ async fn process_tcp_stream(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let mut server_stream: Box<dyn AsyncStream> =
+        connection_scope.wrap_stream(Box::new(QuicStream::from(send, recv)));
+    let mut initial_remote_data = stream_reader.unparsed_data_owned().map(Vec::from);
+    let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+        sniff_tcp_forward_protocol(&mut server_stream, &mut initial_remote_data).await?
+    } else {
+        None
+    };
+
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(
@@ -420,6 +747,7 @@ async fn process_tcp_stream(
             client_proxy_selector,
             resolver,
             remote_location.clone(),
+            sniffed_protocol,
         ),
     );
 
@@ -446,12 +774,21 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        write_all(&mut client_stream, unparsed_data).await?;
-        true
+    let unparsed_before_wrap_len = stream_reader.unparsed_data().len();
+    if unparsed_before_wrap_len > 0 {
+        connection_scope
+            .throttle_upload_bytes(unparsed_before_wrap_len)
+            .await;
+    }
+    let client_requires_flush = match initial_remote_data {
+        Some(data) if !data.is_empty() => {
+            write_all(&mut client_stream, &data).await?;
+            if unparsed_before_wrap_len > 0 {
+                connection_scope.record_upload_bytes(unparsed_before_wrap_len);
+            }
+            true
+        }
+        _ => false,
     };
     drop(stream_reader);
 
@@ -470,6 +807,49 @@ async fn process_tcp_stream(
 
     copy_result?;
     Ok(())
+}
+
+async fn sniff_tcp_forward_protocol(
+    server_stream: &mut Box<dyn AsyncStream>,
+    initial_remote_data: &mut Option<Vec<u8>>,
+) -> std::io::Result<Option<SniffedProtocol>> {
+    if let Some(protocol) = sniff_tcp_protocol(initial_remote_data.as_deref().unwrap_or_default()) {
+        return Ok(Some(protocol));
+    }
+
+    let started_at = std::time::Instant::now();
+    while initial_remote_data.as_ref().map_or(0, Vec::len) < PROTOCOL_SNIFF_MAX_BYTES {
+        let remaining_timeout = PROTOCOL_SNIFF_TIMEOUT
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        if remaining_timeout.is_zero() {
+            break;
+        }
+
+        let read_capacity = PROTOCOL_SNIFF_MAX_BYTES
+            .saturating_sub(initial_remote_data.as_ref().map_or(0, Vec::len))
+            .min(512);
+        let mut buf = vec![0; read_capacity];
+        match timeout(remaining_timeout, server_stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.truncate(n);
+                match initial_remote_data {
+                    Some(data) => data.extend_from_slice(&buf),
+                    None => *initial_remote_data = Some(buf),
+                }
+                if let Some(protocol) =
+                    sniff_tcp_protocol(initial_remote_data.as_deref().unwrap_or_default())
+                {
+                    return Ok(Some(protocol));
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => break,
+        }
+    }
+
+    Ok(None)
 }
 
 struct UdpSession {
@@ -492,17 +872,42 @@ struct FragmentedPacket {
     remote_location: Option<NetLocation>,
 }
 
+struct ReassembledPacket {
+    remote_location: NetLocation,
+    payload: Bytes,
+}
+
+struct PreparedUdpPacket<'a> {
+    remote_location: NetLocation,
+    payload: UdpPayload<'a>,
+}
+
+enum UdpPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl AsRef<[u8]> for UdpPayload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(payload) => payload,
+            Self::Owned(payload) => payload.as_ref(),
+        }
+    }
+}
+
 impl UdpSession {
     #[allow(clippy::too_many_arguments)]
     fn start_with_send_stream(
         assoc_id: u16,
-        send_stream: quinn::SendStream,
+        connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
         parent_cancel_token: &CancellationToken,
+        connection_scope: Arc<AuthenticatedConnectionScope>,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
@@ -519,10 +924,11 @@ impl UdpSession {
         tokio::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
-                send_stream,
+                connection,
                 client_socket,
                 override_local_write_location,
                 session_cancel_token,
+                connection_scope,
             )
             .await
             {
@@ -543,6 +949,7 @@ impl UdpSession {
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
         parent_cancel_token: &CancellationToken,
+        connection_scope: Arc<AuthenticatedConnectionScope>,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
@@ -563,6 +970,7 @@ impl UdpSession {
                 client_socket,
                 override_local_write_location,
                 session_cancel_token,
+                connection_scope,
             )
             .await
             {
@@ -577,6 +985,7 @@ impl UdpSession {
     async fn resolve_address(
         &self,
         location: &NetLocation,
+        payload: &[u8],
         client_proxy_selector: &Arc<ClientProxySelector>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<(SocketAddr, bool)> {
@@ -586,8 +995,13 @@ impl UdpSession {
                 if location == &self.last_location {
                     (self.last_socket_addr, false)
                 } else {
+                    let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+                        sniff_udp_protocol(payload)
+                    } else {
+                        None
+                    };
                     let action = client_proxy_selector
-                        .judge(location.clone().into(), resolver)
+                        .judge_with_protocol(location.clone().into(), resolver, sniffed_protocol)
                         .await?;
 
                     let updated_location = match action {
@@ -626,10 +1040,11 @@ impl UdpSession {
 
 async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
-    mut send_stream: quinn::SendStream,
+    connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     let original_address_bytes: Option<Bytes> =
         override_local_write_address.map(|a| serialize_address(&a).into());
@@ -668,39 +1083,67 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+        connection_scope.throttle_download_bytes(payload_len).await;
 
         let address_bytes = match original_address_bytes {
             Some(ref a) => a.clone(),
             None => serialize_socket_addr(&src_addr).into(),
         };
 
-        let address_bytes_len = address_bytes.len();
-
-        // assoc_id(2) + packet_id(2) + fragment total(1) + fragment id(1) + payload size (2) + address bytes
-        let header_len = 2 + 2 + 1 + 1 + 2 + address_bytes_len;
-
-        let start_offset = MAX_HEADER_LEN - header_len;
+        let start_offset = encode_udp_stream_packet_prefix(
+            &mut buf,
+            assoc_id,
+            packet_id,
+            payload_len,
+            &address_bytes,
+        )?;
         let end_offset = MAX_HEADER_LEN + payload_len;
 
-        buf[start_offset] = (assoc_id >> 8) as u8;
-        buf[start_offset + 1] = assoc_id as u8;
-        buf[start_offset + 2] = (packet_id >> 8) as u8;
-        buf[start_offset + 3] = packet_id as u8;
-        buf[start_offset + 4] = 1;
-        buf[start_offset + 5] = 0;
-        buf[start_offset + 6] = (payload_len >> 8) as u8;
-        buf[start_offset + 7] = payload_len as u8;
-        buf[start_offset + 8..start_offset + 8 + address_bytes_len].copy_from_slice(&address_bytes);
-
-        let mut i = start_offset;
-        while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
-            i += count;
-        }
+        let mut send_stream = connection.open_uni().await?;
+        send_stream
+            .write_all(&buf[start_offset..end_offset])
+            .await
+            .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
+        send_stream
+            .finish()
+            .map_err(|e| std::io::Error::other(format!("TUIC stream finish failed: {e}")))?;
+        connection_scope.record_download_bytes(payload_len);
     }
+}
+
+fn encode_udp_stream_packet_prefix(
+    buf: &mut [u8],
+    assoc_id: u16,
+    packet_id: u16,
+    payload_len: usize,
+    address_bytes: &[u8],
+) -> std::io::Result<usize> {
+    if payload_len > u16::MAX as usize {
+        return Err(std::io::Error::other(format!(
+            "TUIC UDP stream payload too large: {payload_len}"
+        )));
+    }
+
+    // version(1) + command(1) + assoc_id(2) + packet_id(2)
+    // + fragment total(1) + fragment id(1) + payload size(2) + address bytes
+    let header_len = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes.len();
+    if header_len > MAX_HEADER_LEN || buf.len() < MAX_HEADER_LEN {
+        return Err(std::io::Error::other(format!(
+            "TUIC UDP stream header too large: {header_len}"
+        )));
+    }
+
+    let start_offset = MAX_HEADER_LEN - header_len;
+    buf[start_offset] = 5;
+    buf[start_offset + 1] = COMMAND_TYPE_PACKET;
+    buf[start_offset + 2..start_offset + 4].copy_from_slice(&assoc_id.to_be_bytes());
+    buf[start_offset + 4..start_offset + 6].copy_from_slice(&packet_id.to_be_bytes());
+    buf[start_offset + 6] = 1;
+    buf[start_offset + 7] = 0;
+    buf[start_offset + 8..start_offset + 10].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    buf[start_offset + 10..start_offset + 10 + address_bytes.len()].copy_from_slice(address_bytes);
+
+    Ok(start_offset)
 }
 
 async fn run_udp_remote_to_local_datagram_loop(
@@ -709,6 +1152,7 @@ async fn run_udp_remote_to_local_datagram_loop(
     client_socket: Arc<UdpSocket>,
     override_local_write_location: Option<NetLocation>,
     cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     use bytes::BufMut;
 
@@ -753,6 +1197,7 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+        connection_scope.throttle_download_bytes(payload_len).await;
 
         let address_bytes: Bytes = match &original_address_bytes {
             Some(a) => a.clone(),
@@ -782,16 +1227,31 @@ async fn run_udp_remote_to_local_datagram_loop(
             connection
                 .send_datagram(datagram.freeze())
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
+            connection_scope.record_download_bytes(payload_len);
         } else {
             // Calculate header sizes for first fragment and subsequent fragments.
             let first_overhead = header_overhead; // full address included in the first fragment
             let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1; // 0xff marker instead of full address
+            if max_datagram_size <= first_overhead {
+                return Err(std::io::Error::other(format!(
+                    "max datagram size ({max_datagram_size}) is smaller than TUIC first-fragment header overhead ({first_overhead})"
+                )));
+            }
+            if max_datagram_size <= other_overhead {
+                return Err(std::io::Error::other(format!(
+                    "max datagram size ({max_datagram_size}) is smaller than TUIC continuation-fragment header overhead ({other_overhead})"
+                )));
+            }
             let first_capacity = max_datagram_size - first_overhead;
             let other_capacity = max_datagram_size - other_overhead;
 
             let remaining = payload_len.saturating_sub(first_capacity);
             let additional_fragments = remaining.div_ceil(other_capacity);
-            let fragment_count = 1 + additional_fragments;
+            let fragment_count = u8::try_from(1 + additional_fragments).map_err(|_| {
+                std::io::Error::other(format!(
+                    "TUIC UDP payload length {payload_len} requires too many fragments"
+                ))
+            })?;
 
             let mut offset = 0;
             for fragment_id in 0..fragment_count {
@@ -807,7 +1267,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                 datagram.extend_from_slice(&[5, COMMAND_TYPE_PACKET]);
                 datagram.extend_from_slice(&assoc_id.to_be_bytes());
                 datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_count as u8, fragment_id as u8]);
+                datagram.extend_from_slice(&[fragment_count, fragment_id]);
                 datagram.extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
                 if fragment_id == 0 {
                     datagram.extend_from_slice(&address_bytes);
@@ -822,19 +1282,20 @@ async fn run_udp_remote_to_local_datagram_loop(
                 })?;
                 offset += fragment_payload_len;
             }
+            connection_scope.record_download_bytes(payload_len);
         }
     }
 }
 async fn run_unidirectional_loop(
-    connection: quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    udp_session_map: UdpSessionMap,
-    cancel_token: CancellationToken,
+    uni_context: TuicUniStreamContext,
+    pending_uni_tasks: Vec<PendingTuicUniTask>,
+    mut pending_parsers: PreAuthParsers,
 ) -> std::io::Result<()> {
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
-    let cleanup_session_map = udp_session_map.clone();
-    let cleanup_cancel_token = cancel_token.clone();
+    let cleanup_session_map = uni_context.udp_session_map.clone();
+    let cleanup_cancel_token = uni_context.cancel_token.clone();
+    let connection = uni_context.connection.clone();
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
@@ -858,127 +1319,196 @@ async fn run_unidirectional_loop(
         }
     });
 
-    loop {
-        let recv_stream = match connection.accept_uni().await {
-            Ok(recv_stream) => recv_stream,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                break;
-            }
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to accept unidirectional stream: {e}"
-                )));
-            }
-        };
+    // Authentication and the per-user connection scope are established before
+    // this loop starts. Resume pre-auth tasks through the exact same processing
+    // path used for newly accepted streams.
+    for pending_task in pending_uni_tasks {
+        spawn_uni_task(uni_context.clone(), pending_task);
+    }
 
-        let connection = connection.clone();
-        let client_proxy_selector = client_proxy_selector.clone();
-        let resolver = resolver.clone();
-        let udp_session_map = udp_session_map.clone();
-        let cancel_token = cancel_token.clone();
-        tokio::spawn(async move {
-            // Per TUIC protocol, each uni stream carries exactly ONE command.
-            // The reference implementation (handle_stream.rs) handles one task per stream.
-            match process_uni_stream(
-                &connection,
-                client_proxy_selector,
-                resolver,
-                recv_stream,
-                udp_session_map,
-                cancel_token,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    // Per official TUIC reference (handle_stream.rs:70-78),
-                    // uni stream errors close the connection
-                    error!("Error processing uni stream, closing connection: {e}");
-                    connection.close(0u32.into(), b"");
+    loop {
+        tokio::select! {
+            Some(parsed) = pending_parsers.next(), if !pending_parsers.is_empty() => {
+                match parsed? {
+                    PreAuthUniStream::Task(task) => {
+                        spawn_uni_task(uni_context.clone(), task);
+                    }
+                    PreAuthUniStream::Authenticate { .. } => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "duplicate TUIC authentication stream",
+                        ));
+                    }
                 }
             }
-        });
+            accepted = connection.accept_uni() => {
+                let recv_stream = match accepted {
+                    Ok(recv_stream) => recv_stream,
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to accept unidirectional stream: {e}"
+                        )));
+                    }
+                };
+                spawn_new_uni_stream(uni_context.clone(), recv_stream);
+            }
+        }
     }
     Ok(())
 }
 
+fn spawn_new_uni_stream(context: TuicUniStreamContext, recv_stream: quinn::RecvStream) {
+    let connection = context.connection.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let pending_task = parse_uni_stream(recv_stream).await?;
+            process_pending_uni_task(context, pending_task).await
+        }
+        .await;
+        if let Err(e) = result {
+            error!("Error processing uni stream, closing connection: {e}");
+            connection.close(0u32.into(), b"");
+        }
+    });
+}
+
+fn spawn_uni_task(context: TuicUniStreamContext, pending_task: PendingTuicUniTask) {
+    let connection = context.connection.clone();
+    tokio::spawn(async move {
+        // Per TUIC protocol, each uni stream carries exactly ONE command.
+        // The reference implementation (handle_stream.rs) handles one task per stream.
+        if let Err(e) = process_pending_uni_task(context, pending_task).await {
+            // Per official TUIC reference (handle_stream.rs:70-78),
+            // uni stream errors close the connection.
+            error!("Error processing uni stream, closing connection: {e}");
+            connection.close(0u32.into(), b"");
+        }
+    });
+}
+
 /// Process a single uni stream command. Per TUIC protocol, each uni stream
 /// carries exactly one command (PACKET or DISSOCIATE on server side).
-async fn process_uni_stream(
-    connection: &quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
+async fn parse_uni_stream(
     mut recv_stream: quinn::RecvStream,
-    udp_session_map: UdpSessionMap,
-    cancel_token: CancellationToken,
+) -> std::io::Result<PendingTuicUniTask> {
+    let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+    let command_type = read_uni_stream_command_type(&mut recv_stream, &mut stream_reader).await?;
+    let header = read_uni_task_header(&mut recv_stream, &mut stream_reader, command_type).await?;
+    Ok(PendingTuicUniTask {
+        recv_stream,
+        stream_reader,
+        header,
+    })
+}
+
+async fn process_pending_uni_task(
+    context: TuicUniStreamContext,
+    pending_task: PendingTuicUniTask,
 ) -> std::io::Result<()> {
-    let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
+    let PendingTuicUniTask {
+        mut recv_stream,
+        mut stream_reader,
+        header,
+    } = pending_task;
 
-    let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-    if tuic_version != 5 {
-        return Err(std::io::Error::other(format!(
-            "invalid tuic version: {tuic_version}"
-        )));
-    }
-    let command_type = stream_reader.read_u8(&mut recv_stream).await?;
-
-    if command_type == COMMAND_TYPE_DISSOCIATE {
-        let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
-        // Remove and cancel the session's background task.
-        // Per official TUIC Rust reference (handle_task.rs:154-165).
-        if let Some((_, session)) = udp_session_map.remove(&assoc_id) {
-            session.cancel_token.cancel();
+    let (assoc_id, packet_id, frag_total, frag_id, payload_size, remote_location) = match header {
+        TuicUniTaskHeader::Dissociate { assoc_id } => {
+            // Remove and cancel the session's background task.
+            // Per official TUIC Rust reference (handle_task.rs:154-165).
+            if let Some((_, session)) = context.udp_session_map.remove(&assoc_id) {
+                session.cancel_token.cancel();
+            }
+            let mut fragments = context.udp_fragments.lock().await;
+            remove_udp_fragments_for_assoc(&mut fragments, assoc_id);
+            // Session not found is normal - it may have already timed out or been closed.
+            return Ok(());
         }
-        // Session not found is normal - it may have already timed out or been closed
+        TuicUniTaskHeader::Packet {
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            payload_size,
+            remote_location,
+        } => (
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            payload_size,
+            remote_location,
+        ),
+    };
+
+    let payload_fragment =
+        read_uni_task_payload(&mut recv_stream, &mut stream_reader, payload_size as usize).await?;
+
+    let prepared = {
+        let mut fragments = context.udp_fragments.lock().await;
+        prepare_udp_packet(
+            &mut fragments,
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            remote_location,
+            &payload_fragment,
+        )?
+    };
+    let Some(prepared) = prepared else {
         return Ok(());
-    }
-
-    if command_type != COMMAND_TYPE_PACKET {
-        return Err(std::io::Error::other(format!(
-            "invalid uni stream command type: {command_type}"
-        )));
-    }
-
-    // PACKET command - read the packet data
-    let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let packet_id = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let frag_total = stream_reader.read_u8(&mut recv_stream).await?;
-    let frag_id = stream_reader.read_u8(&mut recv_stream).await?;
-    let payload_size = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let remote_location = read_address(&mut recv_stream, &mut stream_reader).await?;
-
-    let payload_fragment = stream_reader
-        .read_slice(&mut recv_stream, payload_size as usize)
-        .await?;
-
-    // For uni stream packets, we need per-connection fragment reassembly.
-    // Since each stream is one packet, fragments come on separate streams.
-    // We use the connection-level udp_session_map for this.
-    // Note: Fragment reassembly for uni streams is handled at the session level.
-    // For simplicity, we only support non-fragmented packets on uni streams for now,
-    // or let process_udp_packet handle it with a temporary fragment cache.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
-
-    process_udp_packet(
-        connection,
-        &client_proxy_selector,
-        &resolver,
-        &udp_session_map,
-        &mut fragments,
-        assoc_id,
-        packet_id,
-        frag_total,
-        frag_id,
+    };
+    let PreparedUdpPacket {
         remote_location,
-        payload_fragment,
+        payload,
+    } = prepared;
+
+    forward_udp_packet(
+        &context.connection,
+        &context.client_proxy_selector,
+        &context.resolver,
+        &context.udp_session_map,
+        assoc_id,
+        remote_location,
+        payload.as_ref(),
         true,
-        &cancel_token,
+        &context.cancel_token,
+        &context.connection_scope,
     )
     .await
+}
+
+async fn read_uni_task_payload<T>(
+    recv_stream: &mut T,
+    stream_reader: &mut StreamReader,
+    payload_size: usize,
+) -> std::io::Result<Vec<u8>>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let buffered = stream_reader.unparsed_data();
+    if buffered.len() > payload_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "TUIC unidirectional task contains {} trailing bytes after a {payload_size}-byte payload",
+                buffered.len() - payload_size
+            ),
+        ));
+    }
+
+    let mut payload = Vec::with_capacity(payload_size);
+    payload.extend_from_slice(buffered);
+    let buffered_len = buffered.len();
+    stream_reader.consume(buffered_len);
+    if payload.len() < payload_size {
+        let old_len = payload.len();
+        payload.resize(payload_size, 0);
+        recv_stream.read_exact(&mut payload[old_len..]).await?;
+    }
+    Ok(payload)
 }
 
 // TODO: fix too many arguments warning
@@ -989,7 +1519,7 @@ async fn process_udp_packet(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    fragments: &mut LruCache<u16, FragmentedPacket>,
+    fragments: &mut UdpFragmentMap,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -998,7 +1528,49 @@ async fn process_udp_packet(
     payload_fragment: &[u8],
     is_uni_stream: bool,
     cancel_token: &CancellationToken,
+    connection_scope: &Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
+    let prepared = prepare_udp_packet(
+        fragments,
+        assoc_id,
+        packet_id,
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    )?;
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    let PreparedUdpPacket {
+        remote_location,
+        payload,
+    } = prepared;
+
+    forward_udp_packet(
+        connection,
+        client_proxy_selector,
+        resolver,
+        udp_session_map,
+        assoc_id,
+        remote_location,
+        payload.as_ref(),
+        is_uni_stream,
+        cancel_token,
+        connection_scope,
+    )
+    .await
+}
+
+fn prepare_udp_packet<'a>(
+    fragments: &mut UdpFragmentMap,
+    assoc_id: u16,
+    packet_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    remote_location: Option<NetLocation>,
+    payload_fragment: &'a [u8],
+) -> std::io::Result<Option<PreparedUdpPacket<'a>>> {
     if frag_total == 0 {
         return Err(std::io::Error::other(
             "Ignoring packet with empty fragment total",
@@ -1013,22 +1585,61 @@ async fn process_udp_packet(
         )));
     }
 
+    if frag_total == 1 {
+        let remote_location = remote_location.ok_or_else(|| {
+            std::io::Error::other("Ignoring packet with single fragment and no address")
+        })?;
+        return Ok(Some(PreparedUdpPacket {
+            remote_location,
+            payload: UdpPayload::Borrowed(payload_fragment),
+        }));
+    }
+
+    let Some(reassembled) = reassemble_udp_fragment(
+        fragments,
+        assoc_id,
+        packet_id,
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(PreparedUdpPacket {
+        remote_location: reassembled.remote_location,
+        payload: UdpPayload::Owned(reassembled.payload),
+    }))
+}
+
+// TODO: fix too many arguments warning
+#[allow(clippy::too_many_arguments)]
+#[inline]
+async fn forward_udp_packet(
+    connection: &quinn::Connection,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    udp_session_map: &UdpSessionMap,
+    assoc_id: u16,
+    remote_location: NetLocation,
+    payload: &[u8],
+    is_uni_stream: bool,
+    cancel_token: &CancellationToken,
+    connection_scope: &Arc<AuthenticatedConnectionScope>,
+) -> std::io::Result<()> {
     let session = {
         match udp_session_map.get(&assoc_id) {
             Some(s) => s,
             None => {
-                // TODO: it's possible that a new session starts with a fragmented packet, and we
-                // receive this initial packet out of order so there's no address.
-                if remote_location.is_none() {
-                    return Err(std::io::Error::other(
-                        "Ignoring packet with unknown session and empty address",
-                    ));
-                }
-
-                let remote_location = remote_location.clone().unwrap();
-
+                let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+                    sniff_udp_protocol(payload)
+                } else {
+                    None
+                };
                 let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), resolver)
+                    .judge_with_protocol(remote_location.clone().into(), resolver, sniffed_protocol)
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -1071,29 +1682,28 @@ async fn process_udp_packet(
                 let client_socket = crate::socket_util::new_udp_socket(true, None)?;
 
                 let session = if is_uni_stream {
-                    // TODO: should we only have a single send stream?
-                    let send_stream = connection.open_uni().await?;
-
                     UdpSession::start_with_send_stream(
                         assoc_id,
-                        send_stream,
+                        connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
+                        remote_location.clone(),
                         resolved_address,
                         override_local_write_location,
                         override_remote_write_address,
                         cancel_token,
+                        connection_scope.clone(),
                     )
                 } else {
                     UdpSession::start_with_datagram(
                         assoc_id,
                         connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
+                        remote_location.clone(),
                         resolved_address,
                         override_local_write_location,
                         override_remote_write_address,
                         cancel_token,
+                        connection_scope.clone(),
                     )
                 };
 
@@ -1110,142 +1720,168 @@ async fn process_udp_packet(
         }
     };
 
-    if frag_total == 1 {
-        if remote_location.is_none() {
-            return Err(std::io::Error::other(
-                "Ignoring packet with single fragment and no address",
-            ));
-        }
-        let remote_location = remote_location.as_ref().unwrap();
+    let (socket_addr, is_updated) = session
+        .resolve_address(&remote_location, payload, client_proxy_selector, resolver)
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "Failed to resolve remote location {remote_location}: {e}"
+            ))
+        })?;
 
-        let (socket_addr, is_updated) = session
-            .resolve_address(remote_location, client_proxy_selector, resolver)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
-
-        if let Err(e) = session
-            .send_socket
-            .send_to(payload_fragment, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
-
+    connection_scope.throttle_upload_bytes(payload.len()).await;
+    if let Err(e) = session.send_socket.send_to(payload, socket_addr).await {
+        error!("Failed to forward UDP payload for session {assoc_id}: {e}");
         drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
-        }
+        udp_session_map.remove(&assoc_id);
+        return Ok(());
     } else {
-        let is_new = !fragments.contains(&packet_id);
+        connection_scope.record_upload_bytes(payload.len());
+    }
 
-        if is_new {
-            // Insert new fragmented packet entry
-            fragments.put(
-                packet_id,
-                FragmentedPacket {
-                    fragment_count: frag_total,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; frag_total as usize],
-                    remote_location: remote_location.clone(),
-                },
-            );
-        }
-
-        let packet = match fragments.get_mut(&packet_id) {
-            Some(p) => p,
-            None => {
-                // This shouldn't happen since we just inserted it
-                return Err(std::io::Error::other("Fragment cache error"));
-            }
-        };
-
-        if is_new && frag_id == 0 && packet.remote_location.is_none() {
-            if remote_location.is_none() {
-                fragments.pop(&packet_id);
-                return Err(std::io::Error::other(format!(
-                    "Ignoring packet with empty first fragment address for session {assoc_id}"
-                )));
-            }
-            packet.remote_location = remote_location.clone();
-        }
-
-        if packet.fragment_count != frag_total {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Mismatched fragment count for session {assoc_id} packet {packet_id}"
-            )));
-        }
-        if packet.received[frag_id as usize].is_some() {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Duplicate fragment for session {assoc_id} packet {packet_id}"
-            )));
-        }
-
-        packet.fragment_received += 1;
-        packet.packet_len += payload_fragment.len();
-        packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-        if packet.fragment_received != packet.fragment_count {
-            return Ok(());
-        }
-
-        // All fragments received - remove from cache and process
-        let FragmentedPacket {
-            remote_location,
-            received,
-            packet_len,
-            ..
-        } = fragments.pop(&packet_id).unwrap();
-
-        let remote_location = remote_location.unwrap();
-
-        let (socket_addr, is_updated) = session
-            .resolve_address(&remote_location, client_proxy_selector, resolver)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
-
-        let mut complete_payload = Vec::with_capacity(packet_len);
-        for frag in received.iter() {
-            complete_payload.extend_from_slice(frag.as_ref().unwrap());
-        }
-
-        if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
-
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
+    drop(session);
+    if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+        session.last_activity = std::time::Instant::now();
+        if is_updated {
+            session.update_last_location(remote_location, socket_addr);
         }
     }
 
     Ok(())
+}
+
+fn reassemble_udp_fragment(
+    fragments: &mut UdpFragmentMap,
+    assoc_id: u16,
+    packet_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    remote_location: Option<NetLocation>,
+    payload_fragment: &[u8],
+) -> std::io::Result<Option<ReassembledPacket>> {
+    let key = UdpFragmentKey {
+        assoc_id,
+        packet_id,
+    };
+    let is_new = !fragments.contains(&key);
+
+    if is_new {
+        fragments.put(
+            key,
+            FragmentedPacket {
+                fragment_count: frag_total,
+                fragment_received: 0,
+                packet_len: 0,
+                received: vec![None; frag_total as usize],
+                remote_location: None,
+            },
+        );
+    }
+
+    let fragment_error = {
+        let packet = fragments
+            .get(&key)
+            .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+        if packet.fragment_count != frag_total {
+            Some(std::io::Error::other(format!(
+                "Mismatched fragment count for session {assoc_id} packet {packet_id}"
+            )))
+        } else if packet.received[frag_id as usize].is_some() {
+            Some(std::io::Error::other(format!(
+                "Duplicate fragment for session {assoc_id} packet {packet_id}"
+            )))
+        } else if frag_id == 0 && remote_location.is_none() {
+            Some(std::io::Error::other(format!(
+                "Ignoring packet with empty first fragment address for session {assoc_id}"
+            )))
+        } else if packet
+            .packet_len
+            .checked_add(payload_fragment.len())
+            .is_none_or(|len| len > MAX_REASSEMBLED_UDP_PACKET_SIZE)
+        {
+            Some(std::io::Error::other(format!(
+                "Reassembled UDP packet exceeds {MAX_REASSEMBLED_UDP_PACKET_SIZE} bytes for session {assoc_id} packet {packet_id}"
+            )))
+        } else {
+            None
+        }
+    };
+
+    if let Some(err) = fragment_error {
+        fragments.pop(&key);
+        return Err(err);
+    }
+
+    let cached_bytes = fragments
+        .iter()
+        .map(|(_, packet)| packet.packet_len)
+        .sum::<usize>();
+    if cached_bytes
+        .checked_add(payload_fragment.len())
+        .is_none_or(|len| len > MAX_FRAGMENT_CACHE_BYTES)
+    {
+        fragments.pop(&key);
+        return Err(std::io::Error::other(format!(
+            "TUIC UDP fragment cache exceeds {MAX_FRAGMENT_CACHE_BYTES} bytes"
+        )));
+    }
+
+    let is_complete = {
+        let packet = fragments
+            .get_mut(&key)
+            .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+        if frag_id == 0 {
+            packet.remote_location = remote_location;
+        }
+        packet.fragment_received += 1;
+        packet.packet_len += payload_fragment.len();
+        packet.received[frag_id as usize] = Some(Bytes::copy_from_slice(payload_fragment));
+        packet.fragment_received == packet.fragment_count
+    };
+
+    if !is_complete {
+        return Ok(None);
+    }
+
+    let FragmentedPacket {
+        remote_location,
+        received,
+        packet_len,
+        ..
+    } = fragments
+        .pop(&key)
+        .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+
+    let remote_location = remote_location.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "Missing first fragment address for session {assoc_id} packet {packet_id}"
+        ))
+    })?;
+
+    let mut complete_payload = BytesMut::with_capacity(packet_len);
+    for fragment in received {
+        let fragment = fragment.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "Missing fragment for session {assoc_id} packet {packet_id}"
+            ))
+        })?;
+        complete_payload.extend_from_slice(&fragment);
+    }
+
+    Ok(Some(ReassembledPacket {
+        remote_location,
+        payload: complete_payload.freeze(),
+    }))
+}
+
+fn remove_udp_fragments_for_assoc(fragments: &mut UdpFragmentMap, assoc_id: u16) {
+    let keys: Vec<UdpFragmentKey> = fragments
+        .iter()
+        .filter_map(|(key, _)| (key.assoc_id == assoc_id).then_some(*key))
+        .collect();
+    for key in keys {
+        fragments.pop(&key);
+    }
 }
 
 async fn run_datagram_loop(
@@ -1254,9 +1890,10 @@ async fn run_datagram_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     // Use LRU cache for fragment reassembly to prevent unbounded memory growth.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
+    let mut fragments: UdpFragmentMap =
         LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
     let mut last_cleanup = std::time::Instant::now();
 
@@ -1366,6 +2003,12 @@ async fn run_datagram_loop(
             }
         };
 
+        if data_len < offset + payload_size {
+            return Err(std::io::Error::other(
+                "decode UDP message: truncated payload",
+            ));
+        }
+
         let payload_fragment = &data[offset..offset + payload_size];
 
         if let Err(e) = process_udp_packet(
@@ -1382,6 +2025,7 @@ async fn run_datagram_loop(
             payload_fragment,
             false,
             &cancel_token,
+            &connection_scope,
         )
         .await
         {
@@ -1394,69 +2038,79 @@ async fn run_datagram_loop(
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    uuid: &'static [u8],
-    password: &'static str,
+    users: TuicServerUsers,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
+    congestion_control: Option<String>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
+    let congestion_control = parse_tuic_congestion_control(congestion_control.as_deref())?;
+    let mut endpoints = Vec::with_capacity(num_endpoints);
     for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+
+        let transport = Arc::get_mut(&mut server_config.transport)
+            .ok_or_else(|| std::io::Error::other("failed to configure TUIC transport"))?;
+        apply_tuic_congestion_control(transport, congestion_control);
+        transport
+            .max_concurrent_bidi_streams(4096_u32.into())
+            .max_concurrent_uni_streams(4096_u32.into())
+            .max_idle_timeout(Some(Duration::from_secs(60).try_into().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid TUIC idle timeout: {e}"),
+                )
+            })?))
+            .keep_alive_interval(Some(Duration::from_secs(15)))
+            .send_window(16 * 1024 * 1024)
+            .receive_window((20u32 * 1024 * 1024).into())
+            .stream_receive_window((8u32 * 1024 * 1024).into())
+            // MTU settings per official TUIC reference
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            // Enable MTU discovery for larger packets on capable networks
+            .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+            // Enable GSO (Generic Segmentation Offload) for better throughput
+            .enable_segmentation_offload(true)
+            // Lower initial RTT estimate for faster initial window growth
+            .initial_rtt(Duration::from_millis(100));
+
+        // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
+        // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+        let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            true,
+            Some(8_625_000),
+        )?;
+
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket2_socket.into(),
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        endpoints.push(endpoint);
+    }
+
+    let mut join_handles = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let users = users.clone();
 
         let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                .max_concurrent_uni_streams(4096_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(15)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
-            )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket2_socket.into(),
-                Arc::new(quinn::TokioRuntime),
-            )
-            .unwrap();
-
             while let Some(conn) = endpoint.accept().await {
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
+                let users = users.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        uuid,
-                        password,
+                        users,
                         conn,
                         zero_rtt_handshake,
                     )
@@ -1471,4 +2125,464 @@ pub async fn start_tuic_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::{AsyncPing, AsyncStream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+    fn fragment_cache() -> UdpFragmentMap {
+        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+    }
+
+    struct TestStream {
+        read: Vec<u8>,
+        read_offset: usize,
+    }
+
+    impl TestStream {
+        fn new(read: Vec<u8>) -> Self {
+            Self {
+                read,
+                read_offset: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let remaining = self.read.len().saturating_sub(self.read_offset);
+            if remaining == 0 || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let n = remaining.min(buf.remaining());
+            let start = self.read_offset;
+            let end = start + n;
+            buf.put_slice(&self.read[start..end]);
+            self.read_offset = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn test_location(last_octet: u8) -> NetLocation {
+        NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 0, 2, last_octet)), 443)
+    }
+
+    #[tokio::test]
+    async fn parses_tuic_pre_auth_packet_header_without_consuming_payload() {
+        let payload = b"pre-auth-payload";
+        let mut frame = vec![
+            5,
+            COMMAND_TYPE_PACKET,
+            0x12,
+            0x34, // assoc_id
+            0xab,
+            0xcd, // packet_id
+            1,
+            0, // fragment total/id
+            0,
+            payload.len() as u8,
+            0x01, // IPv4
+            192,
+            0,
+            2,
+            42,
+            0x01,
+            0xbb, // port 443
+        ];
+        frame.extend_from_slice(payload);
+        let mut stream = TestStream::new(frame);
+        let mut reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+
+        let command = read_uni_stream_command_type(&mut stream, &mut reader)
+            .await
+            .unwrap();
+        let header = read_uni_task_header(&mut stream, &mut reader, command)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            header,
+            TuicUniTaskHeader::Packet {
+                assoc_id: 0x1234,
+                packet_id: 0xabcd,
+                frag_total: 1,
+                frag_id: 0,
+                payload_size: payload.len() as u16,
+                remote_location: Some(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::new(192, 0, 2, 42)),
+                    443,
+                )),
+            }
+        );
+        assert_eq!(reader.unparsed_data(), payload);
+    }
+
+    #[tokio::test]
+    async fn reads_large_uni_task_payload_only_after_header_parsing() {
+        let payload = vec![0x5a; 1024];
+        let mut frame = vec![
+            5,
+            COMMAND_TYPE_PACKET,
+            0x12,
+            0x34,
+            0xab,
+            0xcd,
+            1,
+            0,
+            (payload.len() >> 8) as u8,
+            payload.len() as u8,
+            0x01,
+            192,
+            0,
+            2,
+            42,
+            0x01,
+            0xbb,
+        ];
+        frame.extend_from_slice(&payload);
+        let mut stream = TestStream::new(frame);
+        let mut reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+
+        let command = read_uni_stream_command_type(&mut stream, &mut reader)
+            .await
+            .unwrap();
+        let header = read_uni_task_header(&mut stream, &mut reader, command)
+            .await
+            .unwrap();
+        let payload_size = match header {
+            TuicUniTaskHeader::Packet { payload_size, .. } => payload_size as usize,
+            _ => panic!("expected packet task"),
+        };
+
+        assert!(reader.unparsed_data().len() < payload.len());
+        let received = read_uni_task_payload(&mut stream, &mut reader, payload_size)
+            .await
+            .unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn parses_tuic_pre_auth_dissociate_header() {
+        let mut stream = TestStream::new(vec![
+            5,
+            COMMAND_TYPE_DISSOCIATE,
+            0xca,
+            0xfe, // assoc_id
+        ]);
+        let mut reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+
+        let command = read_uni_stream_command_type(&mut stream, &mut reader)
+            .await
+            .unwrap();
+        let header = read_uni_task_header(&mut stream, &mut reader, command)
+            .await
+            .unwrap();
+
+        assert_eq!(header, TuicUniTaskHeader::Dissociate { assoc_id: 0xcafe });
+    }
+
+    #[test]
+    fn preserves_pre_auth_task_order_and_enforces_bound() {
+        let mut pending = Vec::new();
+        for task_id in 0..MAX_PENDING_UNI_TASKS {
+            push_pending_uni_task(&mut pending, task_id).unwrap();
+        }
+
+        assert_eq!(pending, (0..MAX_PENDING_UNI_TASKS).collect::<Vec<usize>>());
+        let err = push_pending_uni_task(&mut pending, MAX_PENDING_UNI_TASKS).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too many TUIC tasks"));
+        assert_eq!(pending.len(), MAX_PENDING_UNI_TASKS);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_pre_auth_uni_task_header() {
+        let mut stream = TestStream::new(vec![5, COMMAND_TYPE_CONNECT]);
+        let mut reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN);
+
+        let command = read_uni_stream_command_type(&mut stream, &mut reader)
+            .await
+            .unwrap();
+        let err = read_uni_task_header(&mut stream, &mut reader, command)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid uni stream command type"));
+    }
+
+    #[test]
+    fn parses_tuic_congestion_control_aliases() {
+        assert_eq!(
+            parse_tuic_congestion_control(None).unwrap(),
+            TuicCongestionControl::Cubic
+        );
+        assert_eq!(
+            parse_tuic_congestion_control(Some("cubic")).unwrap(),
+            TuicCongestionControl::Cubic
+        );
+        assert_eq!(
+            parse_tuic_congestion_control(Some("new_reno")).unwrap(),
+            TuicCongestionControl::NewReno
+        );
+        assert_eq!(
+            parse_tuic_congestion_control(Some("newreno")).unwrap(),
+            TuicCongestionControl::NewReno
+        );
+        assert_eq!(
+            parse_tuic_congestion_control(Some("reno")).unwrap(),
+            TuicCongestionControl::NewReno
+        );
+        assert_eq!(
+            parse_tuic_congestion_control(Some("bbr")).unwrap(),
+            TuicCongestionControl::Bbr
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tuic_congestion_control() {
+        let err = parse_tuic_congestion_control(Some("invalid-cc")).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unsupported tuic congestion_control `invalid-cc`")
+        );
+    }
+
+    #[tokio::test]
+    async fn tuic_tcp_protocol_sniff_preserves_bytes_read_from_stream() {
+        let payload = b"GET /payload.bin HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let mut stream: Box<dyn AsyncStream> = Box::new(TestStream::new(payload.clone()));
+        let mut initial_remote_data = None;
+
+        let protocol = sniff_tcp_forward_protocol(&mut stream, &mut initial_remote_data)
+            .await
+            .unwrap();
+
+        assert_eq!(protocol, Some(SniffedProtocol::Http));
+        assert_eq!(initial_remote_data.unwrap(), payload);
+
+        let mut rest = [0; 1];
+        assert_eq!(stream.read(&mut rest).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn reassembles_tuic_fragments_independently_per_assoc_id() {
+        let mut fragments = fragment_cache();
+        let first_location = test_location(1);
+        let second_location = test_location(2);
+
+        assert!(
+            reassemble_udp_fragment(
+                &mut fragments,
+                10,
+                7,
+                2,
+                0,
+                Some(first_location.clone()),
+                b"he",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            reassemble_udp_fragment(
+                &mut fragments,
+                11,
+                7,
+                2,
+                0,
+                Some(second_location.clone()),
+                b"wo",
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let first = reassemble_udp_fragment(&mut fragments, 10, 7, 2, 1, None, b"llo")
+            .unwrap()
+            .unwrap();
+        let second = reassemble_udp_fragment(&mut fragments, 11, 7, 2, 1, None, b"rld")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.remote_location, first_location);
+        assert_eq!(first.payload.as_ref(), b"hello");
+        assert_eq!(second.remote_location, second_location);
+        assert_eq!(second.payload.as_ref(), b"world");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn reassembles_tuic_fragments_when_first_fragment_arrives_last() {
+        let mut fragments = fragment_cache();
+        let location = test_location(3);
+
+        assert!(
+            reassemble_udp_fragment(&mut fragments, 20, 9, 2, 1, None, b"tail")
+                .unwrap()
+                .is_none()
+        );
+        let packet = reassemble_udp_fragment(
+            &mut fragments,
+            20,
+            9,
+            2,
+            0,
+            Some(location.clone()),
+            b"head-",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.remote_location, location);
+        assert_eq!(packet.payload.as_ref(), b"head-tail");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn bounds_tuic_fragmented_udp_packet_and_connection_cache_bytes() {
+        let mut fragments = fragment_cache();
+        let location = test_location(4);
+        let half = vec![0u8; 32 * 1024];
+        assert!(
+            reassemble_udp_fragment(&mut fragments, 40, 1, 2, 0, Some(location.clone()), &half,)
+                .unwrap()
+                .is_none()
+        );
+        let error = match reassemble_udp_fragment(&mut fragments, 40, 1, 2, 1, None, &half) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized TUIC UDP packet must be rejected"),
+        };
+        assert!(error.to_string().contains("exceeds 65535 bytes"));
+
+        let mut fragments = fragment_cache();
+        let maximum_fragment = vec![0u8; MAX_REASSEMBLED_UDP_PACKET_SIZE];
+        for packet_id in 0..64 {
+            assert!(
+                reassemble_udp_fragment(
+                    &mut fragments,
+                    41,
+                    packet_id,
+                    2,
+                    0,
+                    Some(location.clone()),
+                    &maximum_fragment,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let error = match reassemble_udp_fragment(
+            &mut fragments,
+            41,
+            64,
+            2,
+            0,
+            Some(location),
+            &maximum_fragment,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("over-budget TUIC fragment cache must be rejected"),
+        };
+        assert!(error.to_string().contains("fragment cache exceeds"));
+    }
+
+    #[test]
+    fn prepares_tuic_fragmented_packet_before_session_exists() {
+        let mut fragments = fragment_cache();
+        let location = test_location(4);
+
+        assert!(
+            prepare_udp_packet(&mut fragments, 30, 5, 2, 1, None, b"tail")
+                .unwrap()
+                .is_none()
+        );
+        let packet = prepare_udp_packet(
+            &mut fragments,
+            30,
+            5,
+            2,
+            0,
+            Some(location.clone()),
+            b"head-",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.remote_location, location);
+        assert_eq!(packet.payload.as_ref(), b"head-tail");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn encodes_tuic_udp_stream_packet_with_version_and_command() {
+        let address_bytes = serialize_socket_addr(&SocketAddr::from(([127, 0, 0, 1], 5353)));
+        let payload = b"dns-query";
+        let mut buf = allocate_vec(MAX_HEADER_LEN + payload.len());
+        buf[MAX_HEADER_LEN..].copy_from_slice(payload);
+
+        let start_offset = encode_udp_stream_packet_prefix(
+            &mut buf,
+            0x1234,
+            0xabcd,
+            payload.len(),
+            &address_bytes,
+        )
+        .unwrap();
+        let frame = &buf[start_offset..MAX_HEADER_LEN + payload.len()];
+
+        assert_eq!(&frame[0..2], &[5, COMMAND_TYPE_PACKET]);
+        assert_eq!(&frame[2..4], &0x1234u16.to_be_bytes());
+        assert_eq!(&frame[4..6], &0xabcdu16.to_be_bytes());
+        assert_eq!(frame[6], 1);
+        assert_eq!(frame[7], 0);
+        assert_eq!(&frame[8..10], &(payload.len() as u16).to_be_bytes());
+        assert_eq!(
+            &frame[10..10 + address_bytes.len()],
+            address_bytes.as_slice()
+        );
+        assert_eq!(&frame[10 + address_bytes.len()..], payload);
+    }
 }

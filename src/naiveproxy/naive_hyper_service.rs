@@ -5,8 +5,10 @@
 
 use std::convert::Infallible;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
@@ -14,27 +16,28 @@ use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::debug;
-use rand::RngExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation};
-use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::crypto::CryptoTlsStream;
+use crate::h2mux::PrependStream;
+use crate::protocol_sniff::sniff_tcp_protocol;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_handler::TcpServerSetupResult;
-use crate::tcp::tcp_server::run_udp_copy;
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
+use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
 use crate::tls_server_handler::NaiveConfig;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
 
 use tokio::io::AsyncReadExt;
 
 use super::naive_padding_stream::{
-    NaivePaddingStream, PaddingDirection, PaddingType, generate_padding_header,
-    parse_padding_type_request,
+    NaivePaddingStream, PaddingDirection, PaddingType, PaddingTypeRequest,
+    add_server_padding_response_headers, negotiate_server_padding,
 };
 use super::user_lookup::UserLookup;
 
@@ -99,14 +102,18 @@ unsafe impl Sync for HyperUpgradedStream {}
 impl AsyncStream for HyperUpgradedStream {}
 
 /// Service configuration for hyper NaiveProxy handler
-struct NaiveServiceConfig {
-    users: Arc<UserLookup>,
-    fallback_path: Option<PathBuf>,
-    resolver: Arc<dyn Resolver>,
-    proxy_selector: Arc<ClientProxySelector>,
-    udp_enabled: bool,
-    padding_enabled: bool,
+pub(super) struct NaiveServiceConfig {
+    pub(super) users: Arc<UserLookup>,
+    pub(super) fallback_path: Option<PathBuf>,
+    pub(super) resolver: Arc<dyn Resolver>,
+    pub(super) proxy_selector: Arc<ClientProxySelector>,
+    pub(super) peer_addr: Option<SocketAddr>,
+    pub(super) udp_enabled: bool,
+    pub(super) padding_enabled: bool,
 }
+
+const PROTOCOL_SNIFF_MAX_BYTES: usize = 2048;
+const PROTOCOL_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
     Empty::<Bytes>::new()
@@ -128,6 +135,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     effective_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     use_h2: bool,
+    peer_addr: Option<SocketAddr>,
 ) -> io::Result<TcpServerSetupResult> {
     let io = TokioIo::new(tls_stream);
 
@@ -136,6 +144,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         fallback_path: naive_cfg.fallback_path.clone(),
         resolver,
         proxy_selector: effective_selector,
+        peer_addr,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
     });
@@ -243,19 +252,11 @@ async fn naive_service(
         }
     }
 
-    // Return 400 for anything that might reveal proxy support
     let has_padding = req.headers().get("padding").is_some();
-    if !has_padding && config.padding_enabled {
-        debug!("NaiveProxy: missing padding header, returning 400");
-        return Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(empty_body())
-            .unwrap());
-    }
 
-    let username = match req.headers().get("proxy-authorization") {
+    let validated_user = match req.headers().get("proxy-authorization") {
         Some(auth) => match auth.to_str().ok().and_then(|s| config.users.validate(s)) {
-            Some(user) => user.to_string(),
+            Some(user) => user,
             None => {
                 debug!("NaiveProxy: invalid credentials, returning 400");
                 return Ok(Response::builder()
@@ -272,6 +273,8 @@ async fn naive_service(
                 .unwrap());
         }
     };
+    let username = validated_user.name.to_string();
+    let authenticated_user = validated_user.authenticated_user.cloned();
 
     let destination = match parse_connect_destination(&req) {
         Some(dest) => dest,
@@ -286,24 +289,21 @@ async fn naive_service(
 
     debug!("[{}] NaiveProxy CONNECT to {}", username, destination);
 
-    let padding_type = if config.padding_enabled && has_padding {
-        if let Some(types) = req.headers().get("padding-type-request") {
-            let types_str = types.to_str().unwrap_or("1");
-            parse_padding_type_request(types_str)
-                .into_iter()
-                .find(|&t| t == PaddingType::Variant1)
-                .unwrap_or(PaddingType::Variant1)
-        } else {
-            PaddingType::Variant1
-        }
-    } else {
-        PaddingType::None
+    let padding_type_request = match req.headers().get("padding-type-request") {
+        Some(types) => match types.to_str() {
+            Ok(types) => PaddingTypeRequest::Value(types),
+            Err(_) => PaddingTypeRequest::Malformed,
+        },
+        None => PaddingTypeRequest::Absent,
     };
+    let padding_type =
+        negotiate_server_padding(config.padding_enabled, has_padding, padding_type_request);
 
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
+    let peer_addr = config.peer_addr;
     let udp_enabled = config.udp_enabled;
 
     tokio::spawn(async move {
@@ -311,31 +311,24 @@ async fn naive_service(
             Ok(upgraded) => {
                 let io = HyperUpgradedStream(TokioIo::new(upgraded));
 
-                if padding_type != PaddingType::None {
-                    let stream =
-                        NaivePaddingStream::new(io, PaddingDirection::Server, padding_type);
-                    if let Err(e) = handle_naive_stream(
-                        stream,
-                        destination,
-                        resolver,
-                        proxy_selector,
-                        udp_enabled,
-                        &username,
-                    )
-                    .await
-                    {
-                        debug!("NaiveProxy tunnel error: {}", e);
-                    }
-                } else if let Err(e) = handle_naive_stream(
-                    io,
-                    destination,
+                let stream_context = NaiveStreamContext {
                     resolver,
                     proxy_selector,
                     udp_enabled,
-                    &username,
-                )
-                .await
-                {
+                    user_name: username,
+                    authenticated_user,
+                    peer_addr,
+                };
+
+                let result = if padding_type != PaddingType::None {
+                    let stream =
+                        NaivePaddingStream::new(io, PaddingDirection::Server, padding_type);
+                    handle_naive_stream(stream, destination, stream_context).await
+                } else {
+                    handle_naive_stream(io, destination, stream_context).await
+                };
+
+                if let Err(e) = result {
                     debug!("NaiveProxy tunnel error: {}", e);
                 }
             }
@@ -345,14 +338,10 @@ async fn naive_service(
         }
     });
 
-    let mut response = Response::builder().status(StatusCode::OK);
-
-    if padding_type != PaddingType::None {
-        let padding_len = rand::rng().random_range(30..=62);
-        response = response.header("padding", generate_padding_header(padding_len));
-        response = response.header("padding-type-reply", (padding_type as u8).to_string());
-    }
-
+    let response = add_server_padding_response_headers(
+        Response::builder().status(StatusCode::OK),
+        padding_type,
+    );
     Ok(response.body(empty_body()).unwrap())
 }
 
@@ -362,7 +351,7 @@ fn parse_connect_destination(req: &Request<Incoming>) -> Option<NetLocation> {
 }
 
 /// Parse authority string (host:port) into NetLocation
-fn parse_authority(authority: &str) -> io::Result<NetLocation> {
+pub(super) fn parse_authority(authority: &str) -> io::Result<NetLocation> {
     // Handle IPv6: [::1]:443
     if authority.starts_with('[') {
         let end_bracket = authority
@@ -469,15 +458,30 @@ async fn serve_fallback(
 /// Handle a single NaiveProxy stream after setup
 ///
 /// This handles both TCP and UDP-over-TCP (UoT) connections.
-async fn handle_naive_stream<S: AsyncStream + 'static>(
+pub(super) struct NaiveStreamContext {
+    pub resolver: Arc<dyn Resolver>,
+    pub proxy_selector: Arc<ClientProxySelector>,
+    pub udp_enabled: bool,
+    pub user_name: String,
+    pub authenticated_user: Option<AuthenticatedUser>,
+    pub peer_addr: Option<SocketAddr>,
+}
+
+pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
     mut stream: S,
     remote_location: NetLocation,
-    resolver: Arc<dyn Resolver>,
-    proxy_selector: Arc<ClientProxySelector>,
-    udp_enabled: bool,
-    user_name: &str,
+    context: NaiveStreamContext,
 ) -> io::Result<()> {
     use crate::client_proxy_selector::ConnectDecision;
+
+    let NaiveStreamContext {
+        resolver,
+        proxy_selector,
+        udp_enabled,
+        user_name,
+        authenticated_user,
+        peer_addr,
+    } = context;
 
     if let Address::Hostname(host) = remote_location.address() {
         if host == UOT_V1_MAGIC_ADDRESS {
@@ -489,10 +493,12 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             }
 
             debug!("NaiveProxy stream (user: {}): UoT V1 mode", user_name);
+            let scope = AuthenticatedConnectionScope::start(&authenticated_user, peer_addr)?;
             let uot_stream = UotV1ServerStream::new_uot(stream);
+            let server_stream = scope.wrap_targeted_message_stream(Box::new(uot_stream));
 
             return run_udp_routing(
-                ServerStream::Targeted(Box::new(uot_stream)),
+                ServerStream::Targeted(server_stream),
                 proxy_selector,
                 resolver,
                 false,
@@ -506,6 +512,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                 ));
             }
 
+            let scope = AuthenticatedConnectionScope::start(&authenticated_user, peer_addr)?;
             // UoT V2 header: destination uses SOCKS5 address format
             let is_connect = stream.read_u8().await?;
             let destination = read_location_direct(&mut stream).await?;
@@ -517,6 +524,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
 
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
+                let server_stream = scope.wrap_message_stream(Box::new(uot_v2_stream));
 
                 let action = proxy_selector
                     .judge(destination.clone().into(), &resolver)
@@ -531,13 +539,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                             .connect_udp_bidirectional(&resolver, remote_location)
                             .await?;
 
-                        return run_udp_copy(
-                            Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
-                            client_stream,
-                            false,
-                            false,
-                        )
-                        .await;
+                        return run_udp_copy(server_stream, client_stream, false, false).await;
                     }
                     ConnectDecision::Block => {
                         return Err(io::Error::new(
@@ -549,9 +551,10 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             } else {
                 // V2 non-connect mode (same as V1)
                 let uot_stream = UotV1ServerStream::new_uot(stream);
+                let server_stream = scope.wrap_targeted_message_stream(Box::new(uot_stream));
 
                 return run_udp_routing(
-                    ServerStream::Targeted(Box::new(uot_stream)),
+                    ServerStream::Targeted(server_stream),
                     proxy_selector,
                     resolver,
                     false,
@@ -561,13 +564,20 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         }
     }
 
+    let scope = AuthenticatedConnectionScope::start(&authenticated_user, peer_addr)?;
+    let mut stream = scope.wrap_stream_upload_metered_only(Box::new(stream));
+
     debug!(
         "NaiveProxy stream (user: {}): TCP -> {}",
         user_name, remote_location
     );
 
+    let (sniffed_protocol, sniffed_stream) =
+        sniff_naive_tcp_protocol(stream, &proxy_selector).await?;
+    stream = sniffed_stream;
+
     let action = proxy_selector
-        .judge(remote_location.clone().into(), &resolver)
+        .judge_with_protocol(remote_location.clone().into(), &resolver, sniffed_protocol)
         .await?;
 
     let mut client_stream: Box<dyn AsyncStream> = match action {
@@ -583,6 +593,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             return Ok(());
         }
     };
+    client_stream = scope.wrap_download_read_metered_stream(client_stream);
 
     // Use larger buffers for better throughput (default 8KB is too small)
     const COPY_BUF_SIZE: usize = 256 * 1024;
@@ -608,5 +619,56 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             debug!("NaiveProxy stream (user: {}): error: {}", user_name, e);
             Err(e)
         }
+    }
+}
+
+async fn sniff_naive_tcp_protocol(
+    mut stream: Box<dyn AsyncStream>,
+    proxy_selector: &ClientProxySelector,
+) -> io::Result<(
+    Option<crate::client_proxy_selector::SniffedProtocol>,
+    Box<dyn AsyncStream>,
+)> {
+    if !proxy_selector.requires_protocol_sniff() {
+        return Ok((None, stream));
+    }
+
+    let started_at = Instant::now();
+    let mut initial = Vec::new();
+    while initial.len() < PROTOCOL_SNIFF_MAX_BYTES {
+        if let Some(protocol) = sniff_tcp_protocol(&initial) {
+            return Ok((Some(protocol), prepend_initial_data(stream, initial)));
+        }
+
+        let remaining_timeout = PROTOCOL_SNIFF_TIMEOUT
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        if remaining_timeout.is_zero() {
+            break;
+        }
+
+        let read_capacity = PROTOCOL_SNIFF_MAX_BYTES
+            .saturating_sub(initial.len())
+            .min(512);
+        let mut buf = vec![0; read_capacity];
+        match tokio::time::timeout(remaining_timeout, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                initial.extend_from_slice(&buf[..n]);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => break,
+        }
+    }
+
+    let protocol = sniff_tcp_protocol(&initial);
+    Ok((protocol, prepend_initial_data(stream, initial)))
+}
+
+fn prepend_initial_data(stream: Box<dyn AsyncStream>, initial: Vec<u8>) -> Box<dyn AsyncStream> {
+    if initial.is_empty() {
+        stream
+    } else {
+        Box::new(PrependStream::new(stream, Some(initial.into_boxed_slice())))
     }
 }

@@ -1,51 +1,232 @@
 use lru::LruCache;
-use std::collections::hash_map::Entry;
+use std::collections::{HashMap, hash_map::Entry};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-/// Maximum number of fragmented packets to track per session.
+/// Maximum number of fragmented packets to track per connection.
 /// Old entries are automatically evicted when this limit is reached.
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
+const MAX_REASSEMBLED_UDP_PACKET_SIZE: usize = u16::MAX as usize;
+const MAX_FRAGMENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Keep unauthenticated HTTP/3 connections useful for camouflage without
+/// allowing a peer to create an unbounded number of response streams.
+const MAX_MASQUERADE_REQUESTS_PER_CONNECTION: usize = 32;
+const MAX_MASQUERADE_BODY_BYTES: usize = 64 * 1024;
+const MAX_MASQUERADE_CONTENT_TYPE_BYTES: usize = 256;
+
 /// HTTP/3 error code for normal closure.
 /// Per official hysteria reference: https://github.com/apernet/hysteria/blob/master/core/server/server.go#L20
 const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
 
+const PROTOCOL_SNIFF_MAX_BYTES: usize = 2048;
+const PROTOCOL_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
+const HYSTERIA_MIBPS_TO_BPS: u64 = 125_000;
+const HYSTERIA2_OBFS_MAX_QUIC_UDP_PAYLOAD: u16 = 1444;
+
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, SniffedProtocol};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::hysteria2_obfs::Hysteria2Obfs;
+use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::tcp_handler::AuthenticatedUser;
+use crate::tcp::tcp_server::{
+    AuthenticatedConnectionScope, DirectionalSpeedLimiters, setup_client_tcp_stream,
+};
 use crate::util::allocate_vec;
 
-async fn process_connection(
+#[derive(Clone, Debug)]
+pub struct Hysteria2ServerUser {
+    pub password: String,
+    pub authenticated_user: Option<AuthenticatedUser>,
+}
+
+impl Hysteria2ServerUser {
+    pub fn new(password: String, authenticated_user: Option<AuthenticatedUser>) -> Self {
+        Self {
+            password,
+            authenticated_user,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Hysteria2ServerUsers {
+    users_by_password: Arc<HashMap<String, Hysteria2ServerUser>>,
+}
+
+impl Hysteria2ServerUsers {
+    pub fn new(users: Vec<Hysteria2ServerUser>) -> std::io::Result<Self> {
+        if users.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hysteria2 server requires at least one user",
+            ));
+        }
+
+        let mut users_by_password = HashMap::with_capacity(users.len());
+        for user in users {
+            if user.password.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "hysteria2 user password must not be empty",
+                ));
+            }
+            if users_by_password
+                .insert(user.password.clone(), user)
+                .is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "duplicate hysteria2 user password",
+                ));
+            }
+        }
+
+        Ok(Self {
+            users_by_password: Arc::new(users_by_password),
+        })
+    }
+
+    fn get(&self, password: &str) -> Option<&Hysteria2ServerUser> {
+        self.users_by_password.get(password)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Hysteria2Masquerade {
+    status: http::StatusCode,
+    content_type: http::HeaderValue,
+    body: Bytes,
+}
+
+impl Hysteria2Masquerade {
+    pub fn try_new(
+        status_code: u16,
+        content_type: impl AsRef<str>,
+        body: impl Into<Bytes>,
+    ) -> std::io::Result<Self> {
+        let status = http::StatusCode::from_u16(status_code).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid hysteria2 masquerade status code {status_code}: {e}"),
+            )
+        })?;
+        if status.is_informational() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hysteria2 masquerade status must be a final HTTP status",
+            ));
+        }
+        if matches!(
+            status,
+            http::StatusCode::NO_CONTENT
+                | http::StatusCode::RESET_CONTENT
+                | http::StatusCode::NOT_MODIFIED
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hysteria2 masquerade status must permit a response body",
+            ));
+        }
+
+        let content_type = content_type.as_ref();
+        if content_type.is_empty() || content_type.len() > MAX_MASQUERADE_CONTENT_TYPE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "hysteria2 masquerade content type must contain 1..={MAX_MASQUERADE_CONTENT_TYPE_BYTES} bytes"
+                ),
+            ));
+        }
+        let content_type = content_type.parse::<http::HeaderValue>().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid hysteria2 masquerade content type: {e}"),
+            )
+        })?;
+
+        let body = body.into();
+        if body.len() > MAX_MASQUERADE_BODY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("hysteria2 masquerade body exceeds {MAX_MASQUERADE_BODY_BYTES} bytes"),
+            ));
+        }
+
+        Ok(Self {
+            status,
+            content_type,
+            body,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Hysteria2StartConfig {
+    pub bind_address: SocketAddr,
+    pub quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    pub users: Hysteria2ServerUsers,
+    pub client_proxy_selector: Arc<ClientProxySelector>,
+    pub resolver: Arc<dyn Resolver>,
+    pub num_endpoints: usize,
+    pub udp_enabled: bool,
+    pub up_mbps: u64,
+    pub down_mbps: u64,
+    pub ignore_client_bandwidth: bool,
+    pub obfs: Option<Hysteria2Obfs>,
+    pub masquerade: Option<Hysteria2Masquerade>,
+}
+
+#[derive(Clone)]
+struct Hysteria2ConnectionContext {
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    password: &'static str,
-    conn: quinn::Incoming,
+    users: Hysteria2ServerUsers,
     udp_enabled: bool,
+    down_mbps: u64,
+    node_speed_limiters: DirectionalSpeedLimiters,
+    ignore_client_bandwidth: bool,
+    masquerade: Option<Hysteria2Masquerade>,
+}
+
+async fn process_connection(
+    conn: quinn::Incoming,
+    context: Hysteria2ConnectionContext,
 ) -> std::io::Result<()> {
+    let Hysteria2ConnectionContext {
+        client_proxy_selector,
+        resolver,
+        users,
+        udp_enabled,
+        down_mbps,
+        node_speed_limiters,
+        ignore_client_bandwidth,
+        masquerade,
+    } = context;
+
     let connection = conn.await?;
 
     // Create a cancellation token for the entire connection lifecycle.
@@ -65,32 +246,62 @@ async fn process_connection(
             .await
             .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
 
-    // Per sing-box reference, authentication timeout is 3 seconds
-    match timeout(
-        AUTH_TIMEOUT,
-        auth_connection(&mut h3_conn, password, udp_enabled),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
-            return Err(e);
+    // Without camouflage, preserve the reference three-second authentication
+    // timeout and close behavior. With camouflage, the authentication window
+    // still expires after three seconds, while ordinary HTTP/3 requests may
+    // continue until the QUIC idle timeout or the per-connection request cap.
+    let authenticated_user = if let Some(masquerade) = masquerade.as_ref() {
+        auth_or_masquerade_connection(
+            &mut h3_conn,
+            &users,
+            udp_enabled,
+            down_mbps,
+            ignore_client_bandwidth,
+            masquerade,
+        )
+        .await?
+    } else {
+        match timeout(
+            AUTH_TIMEOUT,
+            auth_connection(
+                &mut h3_conn,
+                &users,
+                udp_enabled,
+                down_mbps,
+                ignore_client_bandwidth,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(user)) => user,
+            Ok(Err(e)) => {
+                connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                error!("Authentication timeout");
+                connection.close(CLOSE_ERR_CODE_OK.into(), b"auth timeout");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authentication timeout",
+                ));
+            }
         }
-        Err(_elapsed) => {
-            error!("Authentication timeout");
-            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth timeout");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "authentication timeout",
-            ));
-        }
-    }
+    };
+
+    let connection_scope = Arc::new(
+        AuthenticatedConnectionScope::start_with_directional_speed_limiters(
+            &authenticated_user,
+            Some(connection.remote_address()),
+            node_speed_limiters,
+        )?,
+    );
 
     let udp_connection = connection.clone();
     let udp_client_proxy_selector = client_proxy_selector.clone();
     let udp_resolver = resolver.clone();
     let udp_cancel_token = cancel_token.clone();
+    let udp_connection_scope = connection_scope.clone();
 
     let uni_connection = connection.clone();
 
@@ -103,6 +314,7 @@ async fn process_connection(
                 udp_client_proxy_selector,
                 udp_resolver,
                 udp_cancel_token,
+                udp_connection_scope,
             )
             .await
         } else {
@@ -130,7 +342,12 @@ async fn process_connection(
     };
 
     let tcp_connection = connection.clone();
-    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver);
+    let tcp_loop = run_tcp_loop(
+        tcp_connection,
+        client_proxy_selector,
+        resolver,
+        connection_scope,
+    );
 
     let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
 
@@ -148,7 +365,15 @@ async fn process_connection(
     }
 }
 
-fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
+struct Hysteria2Auth {
+    authenticated_user: Option<AuthenticatedUser>,
+    client_rx_bps: u64,
+}
+
+fn validate_auth_request<T>(
+    req: &http::Request<T>,
+    users: &Hysteria2ServerUsers,
+) -> std::io::Result<Hysteria2Auth> {
     if req.uri() != "https://hysteria/auth" {
         return Err(std::io::Error::other(format!(
             "unexpected uri: {}",
@@ -172,13 +397,20 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     let auth_str = auth_value
         .to_str()
         .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
-    if auth_str != password {
-        return Err(std::io::Error::other(format!(
-            "incorrect auth password: {auth_str}"
-        )));
-    }
+    let Some(user) = users.get(auth_str) else {
+        return Err(std::io::Error::other("incorrect auth password"));
+    };
 
-    Ok(())
+    let client_rx_bps = headers
+        .get("hysteria-cc-rx")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    Ok(Hysteria2Auth {
+        authenticated_user: user.authenticated_user.clone(),
+        client_rx_bps,
+    })
 }
 
 fn generate_ascii_string() -> String {
@@ -192,9 +424,12 @@ fn generate_ascii_string() -> String {
 
 async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
-    password: &str,
+    users: &Hysteria2ServerUsers,
     udp_enabled: bool,
-) -> std::io::Result<()> {
+    down_mbps: u64,
+    ignore_client_bandwidth: bool,
+) -> std::io::Result<Option<AuthenticatedUser>> {
+    let receive_bps = down_mbps.saturating_mul(HYSTERIA_MIBPS_TO_BPS);
     loop {
         match h3_conn
             .accept()
@@ -205,12 +440,38 @@ async fn auth_connection(
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
                 })?;
-                match validate_auth_request(req, password) {
-                    Ok(()) => {
+                match validate_auth_request(&req, users) {
+                    Ok(auth) => {
+                        if receive_bps > 0 && ignore_client_bandwidth && auth.client_rx_bps == 0 {
+                            error!(
+                                "Rejecting Hysteria2 auth because client did not advertise RX bandwidth while server bandwidth detection is disabled"
+                            );
+                            let resp = http::Response::builder()
+                                .status(http::status::StatusCode::NOT_FOUND)
+                                .body(())
+                                .unwrap();
+                            stream.send_response(resp).await.map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "failed to send bandwidth reject response: {e}"
+                                ))
+                            })?;
+                            stream.finish().await.map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "failed to finish bandwidth reject stream: {e}"
+                                ))
+                            })?;
+                            continue;
+                        }
+
+                        let cc_rx = if receive_bps == 0 && ignore_client_bandwidth {
+                            "auto".to_string()
+                        } else {
+                            receive_bps.to_string()
+                        };
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::from_u16(233).unwrap())
                             .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-                            .header("Hysteria-CC-RX", "0")
+                            .header("Hysteria-CC-RX", cc_rx)
                             .header("Hysteria-Padding", generate_ascii_string())
                             .body(())
                             .unwrap();
@@ -223,7 +484,7 @@ async fn auth_connection(
                             std::io::Error::other(format!("failed to finish auth stream: {e}"))
                         })?;
 
-                        return Ok(());
+                        return Ok(auth.authenticated_user);
                     }
                     Err(e) => {
                         error!("Received non-hysteria2 auth http3 request: {e}");
@@ -251,8 +512,123 @@ async fn auth_connection(
     }
 }
 
+fn hysteria2_auth_window_open(elapsed: Duration) -> bool {
+    elapsed < AUTH_TIMEOUT
+}
+
+fn hysteria2_masquerade_sends_body(method: &http::Method) -> bool {
+    method != http::Method::HEAD
+}
+
+async fn auth_or_masquerade_connection(
+    h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
+    users: &Hysteria2ServerUsers,
+    udp_enabled: bool,
+    down_mbps: u64,
+    ignore_client_bandwidth: bool,
+    masquerade: &Hysteria2Masquerade,
+) -> std::io::Result<Option<AuthenticatedUser>> {
+    let receive_bps = down_mbps.saturating_mul(HYSTERIA_MIBPS_TO_BPS);
+    let auth_started = Instant::now();
+
+    for _ in 0..MAX_MASQUERADE_REQUESTS_PER_CONNECTION {
+        let Some(resolver) = h3_conn
+            .accept()
+            .await
+            .map_err(|e| std::io::Error::other(format!("H3 accept failed: {e}")))?
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no streams",
+            ));
+        };
+        let (req, mut stream) = resolver
+            .resolve_request()
+            .await
+            .map_err(|err| std::io::Error::other(format!("Failed to resolve request: {err}")))?;
+
+        let send_body = hysteria2_masquerade_sends_body(req.method());
+        if hysteria2_auth_window_open(auth_started.elapsed()) {
+            match validate_auth_request(&req, users) {
+                Ok(auth)
+                    if !(receive_bps > 0 && ignore_client_bandwidth && auth.client_rx_bps == 0) =>
+                {
+                    let cc_rx = if receive_bps == 0 && ignore_client_bandwidth {
+                        "auto".to_string()
+                    } else {
+                        receive_bps.to_string()
+                    };
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::from_u16(233).unwrap())
+                        .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
+                        .header("Hysteria-CC-RX", cc_rx)
+                        .header("Hysteria-Padding", generate_ascii_string())
+                        .body(())
+                        .unwrap();
+                    stream.send_response(response).await.map_err(|e| {
+                        std::io::Error::other(format!("failed to send auth response: {e}"))
+                    })?;
+                    stream.finish().await.map_err(|e| {
+                        std::io::Error::other(format!("failed to finish auth stream: {e}"))
+                    })?;
+                    return Ok(auth.authenticated_user);
+                }
+                Ok(_) => {
+                    debug!(
+                        "Hysteria2 auth request did not satisfy server bandwidth requirements; serving masquerade"
+                    );
+                }
+                Err(e) => {
+                    debug!("Serving Hysteria2 masquerade for unauthenticated H3 request: {e}");
+                }
+            }
+        } else {
+            debug!("Serving Hysteria2 masquerade after authentication window expired");
+        }
+
+        send_hysteria2_masquerade_response(&mut stream, masquerade, send_body).await?;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "hysteria2 masquerade request limit exceeded ({MAX_MASQUERADE_REQUESTS_PER_CONNECTION})"
+        ),
+    ))
+}
+
+async fn send_hysteria2_masquerade_response(
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    masquerade: &Hysteria2Masquerade,
+    send_body: bool,
+) -> std::io::Result<()> {
+    // Do not spend connection-level flow-control budget reading an arbitrary
+    // request body from an unauthenticated peer.
+    stream.stop_sending(h3::error::Code::H3_NO_ERROR);
+
+    let response = http::Response::builder()
+        .status(masquerade.status)
+        .header(http::header::CONTENT_TYPE, masquerade.content_type.clone())
+        .header(http::header::CONTENT_LENGTH, masquerade.body.len())
+        .body(())
+        .unwrap();
+    stream.send_response(response).await.map_err(|e| {
+        std::io::Error::other(format!("failed to send hysteria2 masquerade response: {e}"))
+    })?;
+    if send_body && !masquerade.body.is_empty() {
+        stream
+            .send_data(masquerade.body.clone())
+            .await
+            .map_err(|e| {
+                std::io::Error::other(format!("failed to send hysteria2 masquerade body: {e}"))
+            })?;
+    }
+    stream.finish().await.map_err(|e| {
+        std::io::Error::other(format!("failed to finish hysteria2 masquerade stream: {e}"))
+    })
+}
+
 struct UdpSession {
-    fragments: LruCache<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
@@ -268,7 +644,20 @@ struct FragmentedPacket {
     fragment_received: u8,
     packet_len: usize,
     received: Vec<Option<Bytes>>,
+    remote_location: Option<NetLocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UdpFragmentKey {
+    session_id: u32,
+    packet_id: u16,
+}
+
+type UdpFragmentMap = LruCache<UdpFragmentKey, FragmentedPacket>;
+
+struct PreparedHysteria2UdpPacket {
     remote_location: NetLocation,
+    payload: Bytes,
 }
 
 impl UdpSession {
@@ -283,12 +672,12 @@ impl UdpSession {
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
         parent_cancel_token: &CancellationToken,
+        connection_scope: Arc<AuthenticatedConnectionScope>,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
         let session = UdpSession {
-            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
@@ -304,6 +693,7 @@ impl UdpSession {
                 client_socket,
                 override_local_write_location,
                 session_cancel_token,
+                connection_scope,
             )
             .await
             {
@@ -321,6 +711,7 @@ async fn run_udp_remote_to_local_loop(
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
@@ -385,16 +776,18 @@ async fn run_udp_remote_to_local_loop(
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
-        assert!(
-            max_datagram_size > header_overhead,
-            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-        );
+        if max_datagram_size <= header_overhead {
+            return Err(std::io::Error::other(format!(
+                "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
+            )));
+        }
 
+        connection_scope.throttle_download_bytes(payload_len).await;
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 0
+            // fragment id = 0, fragment count = 1
             datagram.extend_from_slice(&[0, 1]);
             datagram.extend_from_slice(&address_len_bytes);
             datagram.extend_from_slice(&address_bytes);
@@ -403,9 +796,15 @@ async fn run_udp_remote_to_local_loop(
             connection
                 .send_datagram(datagram.freeze())
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
+            connection_scope.record_download_bytes(payload_len);
         } else {
             let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = payload_len.div_ceil(available_payload) as u8;
+            let fragment_count = payload_len.div_ceil(available_payload);
+            let fragment_count = u8::try_from(fragment_count).map_err(|_| {
+                std::io::Error::other(format!(
+                    "UDP payload length {payload_len} requires too many fragments"
+                ))
+            })?;
             for fragment_id in 0..fragment_count {
                 let start = (fragment_id as usize) * available_payload;
                 let end = std::cmp::min(start + available_payload, payload_len);
@@ -423,7 +822,176 @@ async fn run_udp_remote_to_local_loop(
                     ))
                 })?;
             }
+            connection_scope.record_download_bytes(payload_len);
         }
+    }
+}
+
+fn new_udp_fragment_map() -> UdpFragmentMap {
+    LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+}
+
+fn prepare_hysteria2_udp_packet(
+    fragments: &mut UdpFragmentMap,
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    remote_location: NetLocation,
+    payload_fragment: Bytes,
+) -> std::io::Result<Option<PreparedHysteria2UdpPacket>> {
+    if fragment_count == 0 {
+        return Err(std::io::Error::other(format!(
+            "Ignoring packet with empty fragment total for session {session_id}"
+        )));
+    }
+    if fragment_id >= fragment_count {
+        return Err(std::io::Error::other(format!(
+            "Invalid fragment id {fragment_id} >= total {fragment_count} for session {session_id}"
+        )));
+    }
+    if fragment_count == 1 {
+        return Ok(Some(PreparedHysteria2UdpPacket {
+            remote_location,
+            payload: payload_fragment,
+        }));
+    }
+
+    reassemble_hysteria2_udp_fragment(
+        fragments,
+        session_id,
+        packet_id,
+        fragment_id,
+        fragment_count,
+        remote_location,
+        payload_fragment,
+    )
+}
+
+fn reassemble_hysteria2_udp_fragment(
+    fragments: &mut UdpFragmentMap,
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    remote_location: NetLocation,
+    payload_fragment: Bytes,
+) -> std::io::Result<Option<PreparedHysteria2UdpPacket>> {
+    let key = UdpFragmentKey {
+        session_id,
+        packet_id,
+    };
+    let needs_new_entry = fragments
+        .get(&key)
+        .is_none_or(|packet| packet.fragment_count != fragment_count);
+
+    if needs_new_entry {
+        fragments.put(
+            key,
+            FragmentedPacket {
+                fragment_count,
+                fragment_received: 0,
+                packet_len: 0,
+                received: vec![None; fragment_count as usize],
+                remote_location: None,
+            },
+        );
+    }
+
+    let fragment_error = {
+        let packet = fragments
+            .get(&key)
+            .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+        if packet.received[fragment_id as usize].is_some() {
+            return Ok(None);
+        }
+        if packet
+            .packet_len
+            .checked_add(payload_fragment.len())
+            .is_none_or(|len| len > MAX_REASSEMBLED_UDP_PACKET_SIZE)
+        {
+            Some(std::io::Error::other(format!(
+                "Reassembled UDP packet exceeds {MAX_REASSEMBLED_UDP_PACKET_SIZE} bytes for session {session_id} packet {packet_id}"
+            )))
+        } else {
+            None
+        }
+    };
+    if let Some(err) = fragment_error {
+        fragments.pop(&key);
+        return Err(err);
+    }
+
+    let cached_bytes = fragments
+        .iter()
+        .map(|(_, packet)| packet.packet_len)
+        .sum::<usize>();
+    if cached_bytes
+        .checked_add(payload_fragment.len())
+        .is_none_or(|len| len > MAX_FRAGMENT_CACHE_BYTES)
+    {
+        fragments.pop(&key);
+        return Err(std::io::Error::other(format!(
+            "Hysteria2 UDP fragment cache exceeds {MAX_FRAGMENT_CACHE_BYTES} bytes"
+        )));
+    }
+
+    let is_complete = {
+        let packet = fragments
+            .get_mut(&key)
+            .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+
+        if fragment_id == 0 {
+            packet.remote_location = Some(remote_location);
+        }
+        packet.fragment_received += 1;
+        packet.packet_len += payload_fragment.len();
+        packet.received[fragment_id as usize] = Some(payload_fragment);
+        packet.fragment_received == packet.fragment_count
+    };
+
+    if !is_complete {
+        return Ok(None);
+    }
+
+    let FragmentedPacket {
+        remote_location,
+        received,
+        packet_len,
+        ..
+    } = fragments
+        .pop(&key)
+        .ok_or_else(|| std::io::Error::other("Fragment cache error"))?;
+
+    let remote_location = remote_location.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "Missing first fragment address for session {session_id} packet {packet_id}"
+        ))
+    })?;
+
+    let mut complete_payload = BytesMut::with_capacity(packet_len);
+    for fragment in received {
+        let fragment = fragment.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "Missing fragment for session {session_id} packet {packet_id}"
+            ))
+        })?;
+        complete_payload.extend_from_slice(&fragment);
+    }
+
+    Ok(Some(PreparedHysteria2UdpPacket {
+        remote_location,
+        payload: complete_payload.freeze(),
+    }))
+}
+
+fn remove_hysteria2_fragments_for_session(fragments: &mut UdpFragmentMap, session_id: u32) {
+    let keys: Vec<UdpFragmentKey> = fragments
+        .iter()
+        .filter_map(|(key, _)| (key.session_id == session_id).then_some(*key))
+        .collect();
+    for key in keys {
+        fragments.pop(&key);
     }
 }
 
@@ -432,9 +1000,11 @@ async fn run_udp_local_to_remote_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     cancel_token: CancellationToken,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
+    let mut fragments = new_udp_fragment_map();
     let mut last_cleanup = std::time::Instant::now();
 
     // Match reference implementation defaults for UDP session management
@@ -444,16 +1014,21 @@ async fn run_udp_local_to_remote_loop(
     loop {
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
+            let mut expired_session_ids = Vec::new();
             sessions.retain(|session_id, session| {
                 if session.last_activity.elapsed() > IDLE_TIMEOUT {
                     // Cancel the session's background task before removing
                     session.cancel_token.cancel();
                     debug!("Removing inactive UDP session {session_id}");
+                    expired_session_ids.push(*session_id);
                     false
                 } else {
                     true
                 }
             });
+            for session_id in expired_session_ids {
+                remove_hysteria2_fragments_for_session(&mut fragments, session_id);
+            }
             last_cleanup = now;
         }
 
@@ -489,6 +1064,10 @@ async fn run_udp_local_to_remote_loop(
             };
             let mut next_index = 9;
             if num_bytes > 1 {
+                if data.len() < 9 + (num_bytes - 1) {
+                    debug!("Ignoring datagram with truncated address length varint");
+                    continue;
+                }
                 let remaining = &data[9..9 + (num_bytes - 1)];
                 for byte in remaining {
                     value <<= 8;
@@ -532,11 +1111,40 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        let PreparedHysteria2UdpPacket {
+            remote_location,
+            payload: complete_payload,
+        } = match prepare_hysteria2_udp_packet(
+            &mut fragments,
+            session_id,
+            packet_id,
+            fragment_id,
+            fragment_count,
+            remote_location,
+            payload_fragment,
+        ) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => continue,
+            Err(e) => {
+                debug!("{e}");
+                continue;
+            }
+        };
+
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
+                let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+                    sniff_udp_protocol(&complete_payload)
+                } else {
+                    None
+                };
                 let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), &resolver)
+                    .judge_with_protocol(
+                        remote_location.clone().into(),
+                        &resolver,
+                        sniffed_protocol,
+                    )
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -604,72 +1212,11 @@ async fn run_udp_local_to_remote_loop(
                     override_local_write_location,
                     override_remote_write_address,
                     &cancel_token,
+                    connection_scope.clone(),
                 );
                 entry.insert(session)
             }
             Entry::Occupied(ref mut entry) => entry.get_mut(),
-        };
-
-        let (complete_payload, remote_location) = if fragment_count == 0 {
-            error!("Ignoring empty UDP fragment for session {session_id}");
-            continue;
-        } else if fragment_count == 1 {
-            (payload_fragment, remote_location)
-        } else {
-            let is_new = !session.fragments.contains(&packet_id);
-
-            if is_new {
-                session.fragments.put(
-                    packet_id,
-                    FragmentedPacket {
-                        fragment_count,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; fragment_count as usize],
-                        remote_location: remote_location.clone(),
-                    },
-                );
-            }
-
-            let entry = match session.fragments.get_mut(&packet_id) {
-                Some(e) => e,
-                None => {
-                    // This shouldn't happen since we just inserted it
-                    error!("Fragment cache error for session {session_id}");
-                    continue;
-                }
-            };
-
-            if entry.fragment_count != fragment_count {
-                session.fragments.pop(&packet_id);
-                error!("Mismatched fragment count for session {session_id} packet {packet_id}");
-                continue;
-            }
-            if entry.received[fragment_id as usize].is_some() {
-                session.fragments.pop(&packet_id);
-                error!("Duplicate fragment for session {session_id} packet {packet_id}");
-                continue;
-            }
-            entry.fragment_received += 1;
-            entry.packet_len += payload_fragment.len();
-            entry.received[fragment_id as usize] = Some(payload_fragment);
-
-            if entry.fragment_received != entry.fragment_count {
-                continue;
-            }
-
-            // All fragments received - remove from cache and process
-            let FragmentedPacket {
-                remote_location: initial_location,
-                received,
-                packet_len,
-                ..
-            } = session.fragments.pop(&packet_id).unwrap();
-            let mut complete_payload = BytesMut::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-            (complete_payload.freeze(), initial_location)
         };
 
         let socket_addr = match session.override_remote_write_address {
@@ -683,7 +1230,15 @@ async fn run_udp_local_to_remote_loop(
                         remote_location.clone()
                     );
                     let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), &resolver)
+                        .judge_with_protocol(
+                            remote_location.clone().into(),
+                            &resolver,
+                            if client_proxy_selector.requires_protocol_sniff() {
+                                sniff_udp_protocol(&complete_payload)
+                            } else {
+                                None
+                            },
+                        )
                         .await;
                     let updated_location = match action {
                         Ok(ConnectDecision::Allow {
@@ -719,6 +1274,9 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        connection_scope
+            .throttle_upload_bytes(complete_payload.len())
+            .await;
         if let Err(e) = session
             .send_socket
             .send_to(&complete_payload, socket_addr)
@@ -726,6 +1284,9 @@ async fn run_udp_local_to_remote_loop(
         {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
             sessions.remove(&session_id);
+        } else {
+            connection_scope.record_upload_bytes(complete_payload.len());
+            session.last_activity = std::time::Instant::now();
         }
     }
 }
@@ -734,6 +1295,7 @@ async fn run_tcp_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -753,9 +1315,16 @@ async fn run_tcp_loop(
 
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        let connection_scope = connection_scope.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                connection_scope,
+                send_stream,
+                recv_stream,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -822,22 +1391,60 @@ async fn handle_tcp_header(
         response_bytes
     };
 
-    let len = response_bytes.len();
-    let mut i = 0;
-    while i < len {
-        let count = send
-            .write(&response_bytes[i..len])
-            .await
-            .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
-        i += count;
-    }
+    send.write_all(&response_bytes)
+        .await
+        .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
 
     Ok((remote_location, stream_reader))
+}
+
+async fn sniff_tcp_forward_protocol(
+    server_stream: &mut Box<dyn AsyncStream>,
+    initial_remote_data: &mut Option<Vec<u8>>,
+) -> std::io::Result<Option<SniffedProtocol>> {
+    if let Some(protocol) = sniff_tcp_protocol(initial_remote_data.as_deref().unwrap_or_default()) {
+        return Ok(Some(protocol));
+    }
+
+    let started_at = std::time::Instant::now();
+    while initial_remote_data.as_ref().map_or(0, Vec::len) < PROTOCOL_SNIFF_MAX_BYTES {
+        let remaining_timeout = PROTOCOL_SNIFF_TIMEOUT
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        if remaining_timeout.is_zero() {
+            break;
+        }
+
+        let read_capacity = PROTOCOL_SNIFF_MAX_BYTES
+            .saturating_sub(initial_remote_data.as_ref().map_or(0, Vec::len))
+            .min(512);
+        let mut buf = vec![0; read_capacity];
+        match timeout(remaining_timeout, server_stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.truncate(n);
+                match initial_remote_data {
+                    Some(data) => data.extend_from_slice(&buf),
+                    None => *initial_remote_data = Some(buf),
+                }
+                if let Some(protocol) =
+                    sniff_tcp_protocol(initial_remote_data.as_deref().unwrap_or_default())
+                {
+                    return Ok(Some(protocol));
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => break,
+        }
+    }
+
+    Ok(None)
 }
 
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    connection_scope: Arc<AuthenticatedConnectionScope>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
@@ -849,7 +1456,16 @@ async fn process_tcp_stream(
         }
     };
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let unparsed_before_wrap_len = stream_reader.unparsed_data().len();
+    let mut initial_remote_data = stream_reader.unparsed_data_owned().map(Vec::from);
+    let mut server_stream: Box<dyn AsyncStream> =
+        connection_scope.wrap_stream(Box::new(QuicStream::from(send, recv)));
+
+    let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+        sniff_tcp_forward_protocol(&mut server_stream, &mut initial_remote_data).await?
+    } else {
+        None
+    };
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
@@ -858,6 +1474,7 @@ async fn process_tcp_stream(
             client_proxy_selector,
             resolver,
             remote_location.clone(),
+            sniffed_protocol,
         ),
     );
 
@@ -884,20 +1501,23 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        let len = unparsed_data.len();
-        let mut i = 0;
-        while i < len {
-            let count = client_stream
-                .write(&unparsed_data[i..len])
+    if unparsed_before_wrap_len > 0 {
+        connection_scope
+            .throttle_upload_bytes(unparsed_before_wrap_len)
+            .await;
+    }
+    let client_requires_flush = match initial_remote_data {
+        Some(data) if !data.is_empty() => {
+            client_stream
+                .write_all(&data)
                 .await
                 .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
-            i += count;
+            if unparsed_before_wrap_len > 0 {
+                connection_scope.record_upload_bytes(unparsed_before_wrap_len);
+            }
+            true
         }
-        true
+        _ => false,
     };
     drop(stream_reader);
 
@@ -972,76 +1592,115 @@ async fn read_varint(
 }
 
 pub async fn start_hysteria2_server(
-    bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    hysteria2_password: &'static str,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    num_endpoints: usize,
-    udp_enabled: bool,
+    config: Hysteria2StartConfig,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
+    let Hysteria2StartConfig {
+        bind_address,
+        quic_server_config,
+        users,
+        client_proxy_selector,
+        resolver,
+        num_endpoints,
+        udp_enabled,
+        up_mbps,
+        down_mbps,
+        ignore_client_bandwidth,
+        obfs,
+        masquerade,
+    } = config;
+
+    let mut endpoints = Vec::with_capacity(num_endpoints);
+    let node_speed_limiters = hysteria2_node_speed_limiters(up_mbps, down_mbps);
     for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
-        let resolver = resolver.clone();
-        let client_proxy_selector = client_proxy_selector.clone();
+        let obfs_enabled = obfs.is_some();
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        let mut mtu_discovery_config = quinn::MtuDiscoveryConfig::default();
+        if obfs_enabled {
+            mtu_discovery_config.upper_bound(HYSTERIA2_OBFS_MAX_QUIC_UDP_PAYLOAD);
+        }
 
-        let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+        let idle_timeout = Duration::from_secs(30)
+            .try_into()
+            .map_err(|e| std::io::Error::other(format!("invalid hysteria2 idle timeout: {e}")))?;
+        let transport = Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
+            std::io::Error::other("failed to get mutable hysteria2 QUIC transport config")
+        })?;
 
-            // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                // required for HTTP/3 QPACK updates
-                .max_concurrent_uni_streams(1024_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(10)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
+        // Values estimated from the reference Hysteria2 server config.
+        transport
+            .max_concurrent_bidi_streams(4096_u32.into())
+            // Required for HTTP/3 QPACK updates.
+            .max_concurrent_uni_streams(1024_u32.into())
+            .max_idle_timeout(Some(idle_timeout))
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .send_window(16 * 1024 * 1024)
+            .receive_window((20u32 * 1024 * 1024).into())
+            .stream_receive_window((8u32 * 1024 * 1024).into())
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            .mtu_discovery_config(Some(mtu_discovery_config))
+            .enable_segmentation_offload(!obfs_enabled)
+            .initial_rtt(Duration::from_millis(100));
 
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
+        // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead).
+        let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            true,
+            Some(8_625_000),
+        )?;
+
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        if obfs_enabled {
+            endpoint_config
+                .max_udp_payload_size(HYSTERIA2_OBFS_MAX_QUIC_UDP_PAYLOAD)
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "invalid hysteria2 obfs endpoint payload size: {e}"
+                    ))
+                })?;
+        }
+
+        let endpoint = if let Some(obfs) = &obfs {
+            let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+            let socket = runtime.wrap_udp_socket(socket2_socket.into())?;
+            let socket = obfs.wrap_socket(socket);
+            quinn::Endpoint::new_with_abstract_socket(
+                endpoint_config,
+                Some(server_config),
+                socket,
+                runtime,
             )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
+        } else {
+            quinn::Endpoint::new(
+                endpoint_config,
                 Some(server_config),
                 socket2_socket.into(),
                 Arc::new(quinn::TokioRuntime),
             )
-            .unwrap();
+        }
+        .map_err(|e| std::io::Error::other(format!("failed to create hysteria2 endpoint: {e}")))?;
+        endpoints.push(endpoint);
+    }
 
+    let mut join_handles = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let connection_context = Hysteria2ConnectionContext {
+            client_proxy_selector: client_proxy_selector.clone(),
+            resolver: resolver.clone(),
+            users: users.clone(),
+            udp_enabled,
+            down_mbps,
+            node_speed_limiters: node_speed_limiters.clone(),
+            ignore_client_bandwidth,
+            masquerade: masquerade.clone(),
+        };
+        let join_handle = tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
-                let cloned_selector = client_proxy_selector.clone();
-                let cloned_resolver = resolver.clone();
+                let context = connection_context.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(
-                        cloned_selector,
-                        cloned_resolver,
-                        hysteria2_password,
-                        conn,
-                        udp_enabled,
-                    )
-                    .await
-                    {
+                    if let Err(e) = process_connection(conn, context).await {
                         error!("Connection ended with error: {e}");
                     }
                 });
@@ -1051,4 +1710,374 @@ pub async fn start_hysteria2_server(
     }
 
     Ok(join_handles)
+}
+
+fn hysteria2_node_speed_limiters(up_mbps: u64, down_mbps: u64) -> DirectionalSpeedLimiters {
+    DirectionalSpeedLimiters::from_mbps(Some(down_mbps), Some(up_mbps))
+}
+
+#[cfg(test)]
+#[path = "hysteria2_masquerade_network_tests.rs"]
+mod masquerade_network_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::Address;
+    use std::net::Ipv4Addr;
+
+    fn test_users() -> Hysteria2ServerUsers {
+        Hysteria2ServerUsers::new(vec![Hysteria2ServerUser::new(
+            "user-password".to_string(),
+            None,
+        )])
+        .unwrap()
+    }
+
+    #[test]
+    fn builds_bounded_hysteria2_static_masquerade() {
+        let masquerade =
+            Hysteria2Masquerade::try_new(200, "text/plain", Bytes::from_static(b"not a proxy"))
+                .unwrap();
+
+        assert_eq!(masquerade.status, http::StatusCode::OK);
+        assert_eq!(masquerade.content_type, "text/plain");
+        assert_eq!(masquerade.body, Bytes::from_static(b"not a proxy"));
+        assert!(!hysteria2_masquerade_sends_body(&http::Method::HEAD));
+        assert!(hysteria2_masquerade_sends_body(&http::Method::GET));
+    }
+
+    #[test]
+    fn rejects_hysteria2_masquerade_statuses_that_forbid_a_body() {
+        for status in [204, 205, 304] {
+            let error = Hysteria2Masquerade::try_new(status, "text/plain", "body").unwrap_err();
+            assert!(error.to_string().contains("must permit a response body"));
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_hysteria2_static_masquerade() {
+        let error = Hysteria2Masquerade::try_new(
+            404,
+            "text/plain",
+            Bytes::from(vec![0; MAX_MASQUERADE_BODY_BYTES + 1]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("body exceeds"));
+    }
+
+    #[test]
+    fn masquerade_keeps_h3_alive_but_does_not_extend_authentication_window() {
+        assert!(hysteria2_auth_window_open(
+            AUTH_TIMEOUT - Duration::from_nanos(1)
+        ));
+        assert!(!hysteria2_auth_window_open(AUTH_TIMEOUT));
+        assert!(!hysteria2_auth_window_open(
+            AUTH_TIMEOUT + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn validate_auth_request_reads_client_rx_bandwidth() {
+        let users = test_users();
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://hysteria/auth")
+            .header("hysteria-auth", "user-password")
+            .header("hysteria-cc-rx", "456000")
+            .body(())
+            .unwrap();
+
+        let auth = validate_auth_request(&req, &users).unwrap();
+
+        assert!(auth.authenticated_user.is_none());
+        assert_eq!(auth.client_rx_bps, 456_000);
+    }
+
+    #[test]
+    fn validate_auth_request_defaults_missing_client_rx_bandwidth_to_zero() {
+        let users = test_users();
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://hysteria/auth")
+            .header("hysteria-auth", "user-password")
+            .body(())
+            .unwrap();
+
+        let auth = validate_auth_request(&req, &users).unwrap();
+
+        assert_eq!(auth.client_rx_bps, 0);
+    }
+
+    #[test]
+    fn node_speed_limiters_share_v2board_hysteria2_bandwidth_across_connections() {
+        let limiters = hysteria2_node_speed_limiters(10, 20);
+        let cloned = limiters.clone();
+
+        assert_eq!(limiters.upload_rate_bytes_per_sec(), Some(2_500_000));
+        assert_eq!(limiters.download_rate_bytes_per_sec(), Some(1_250_000));
+        assert!(limiters.shares_buckets_with(&cloned));
+    }
+
+    fn fragment_cache() -> UdpFragmentMap {
+        new_udp_fragment_map()
+    }
+
+    fn test_location(last_octet: u8) -> NetLocation {
+        NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 0, 2, last_octet)), 443)
+    }
+
+    #[test]
+    fn reassembles_hysteria2_fragments_independently_per_session_id() {
+        let mut fragments = fragment_cache();
+        let first_location = test_location(1);
+        let second_location = test_location(2);
+
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                10,
+                7,
+                0,
+                2,
+                first_location.clone(),
+                Bytes::from_static(b"he"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                11,
+                7,
+                0,
+                2,
+                second_location.clone(),
+                Bytes::from_static(b"wo"),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let first = prepare_hysteria2_udp_packet(
+            &mut fragments,
+            10,
+            7,
+            1,
+            2,
+            first_location.clone(),
+            Bytes::from_static(b"llo"),
+        )
+        .unwrap()
+        .unwrap();
+        let second = prepare_hysteria2_udp_packet(
+            &mut fragments,
+            11,
+            7,
+            1,
+            2,
+            second_location.clone(),
+            Bytes::from_static(b"rld"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first.remote_location, first_location);
+        assert_eq!(first.payload.as_ref(), b"hello");
+        assert_eq!(second.remote_location, second_location);
+        assert_eq!(second.payload.as_ref(), b"world");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn reassembles_hysteria2_fragments_when_first_fragment_arrives_last() {
+        let mut fragments = fragment_cache();
+        let first_fragment_location = test_location(3);
+        let later_fragment_location = test_location(4);
+
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                20,
+                9,
+                1,
+                2,
+                later_fragment_location,
+                Bytes::from_static(b"tail"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let packet = prepare_hysteria2_udp_packet(
+            &mut fragments,
+            20,
+            9,
+            0,
+            2,
+            first_fragment_location.clone(),
+            Bytes::from_static(b"head-"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.remote_location, first_fragment_location);
+        assert_eq!(packet.payload.as_ref(), b"head-tail");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn bounds_hysteria2_fragmented_udp_packet_and_connection_cache_bytes() {
+        let mut fragments = fragment_cache();
+        let location = test_location(4);
+        let half = Bytes::from(vec![0u8; 32 * 1024]);
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                40,
+                1,
+                0,
+                2,
+                location.clone(),
+                half.clone(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let error =
+            match prepare_hysteria2_udp_packet(&mut fragments, 40, 1, 1, 2, location.clone(), half)
+            {
+                Err(error) => error,
+                Ok(_) => panic!("oversized Hysteria2 UDP packet must be rejected"),
+            };
+        assert!(error.to_string().contains("exceeds 65535 bytes"));
+
+        let mut fragments = fragment_cache();
+        let maximum_fragment = Bytes::from(vec![0u8; MAX_REASSEMBLED_UDP_PACKET_SIZE]);
+        for packet_id in 0..64 {
+            assert!(
+                prepare_hysteria2_udp_packet(
+                    &mut fragments,
+                    41,
+                    packet_id,
+                    0,
+                    2,
+                    location.clone(),
+                    maximum_fragment.clone(),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let error = match prepare_hysteria2_udp_packet(
+            &mut fragments,
+            41,
+            64,
+            0,
+            2,
+            location,
+            maximum_fragment,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("over-budget Hysteria2 fragment cache must be rejected"),
+        };
+        assert!(error.to_string().contains("fragment cache exceeds"));
+    }
+
+    #[test]
+    fn keeps_hysteria2_partial_packet_after_duplicate_fragment() {
+        let mut fragments = fragment_cache();
+        let location = test_location(5);
+
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                30,
+                5,
+                0,
+                2,
+                location.clone(),
+                Bytes::from_static(b"head-"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                30,
+                5,
+                0,
+                2,
+                location.clone(),
+                Bytes::from_static(b"duplicate-"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let packet = prepare_hysteria2_udp_packet(
+            &mut fragments,
+            30,
+            5,
+            1,
+            2,
+            location.clone(),
+            Bytes::from_static(b"tail"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.remote_location, location);
+        assert_eq!(packet.payload.as_ref(), b"head-tail");
+        assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn resets_hysteria2_partial_packet_when_fragment_count_changes() {
+        let mut fragments = fragment_cache();
+        let location = test_location(6);
+
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                40,
+                8,
+                0,
+                3,
+                location.clone(),
+                Bytes::from_static(b"stale-"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            prepare_hysteria2_udp_packet(
+                &mut fragments,
+                40,
+                8,
+                0,
+                2,
+                location.clone(),
+                Bytes::from_static(b"fresh-"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let packet = prepare_hysteria2_udp_packet(
+            &mut fragments,
+            40,
+            8,
+            1,
+            2,
+            location.clone(),
+            Bytes::from_static(b"packet"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.remote_location, location);
+        assert_eq!(packet.payload.as_ref(), b"fresh-packet");
+        assert_eq!(fragments.len(), 0);
+    }
 }

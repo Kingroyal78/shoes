@@ -8,21 +8,30 @@
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::address::NetLocation;
 use crate::anytls::anytls_padding::PaddingFactory;
-use crate::anytls::anytls_server_session::AnyTlsSession;
+use crate::anytls::anytls_server_session::{AnyTlsServerSessionContext, AnyTlsSession};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    AuthenticatedUser, ServerUser, TcpServerHandler, TcpServerSetupResult,
+};
 use crate::util::write_all;
 use aws_lc_rs::digest::{SHA256, digest};
+
+#[derive(Clone, Debug)]
+struct AnyTlsAuthenticatedUser {
+    name: String,
+    authenticated_user: Option<AuthenticatedUser>,
+}
 
 /// AnyTLS server handler implementing TcpServerHandler
 ///
@@ -31,8 +40,8 @@ use aws_lc_rs::digest::{SHA256, digest};
 /// and runs the session which handles all streams internally.
 #[derive(Debug)]
 pub struct AnyTlsServerHandler {
-    /// Authenticated users (password_hash -> user name)
-    users: HashMap<[u8; 32], String>,
+    /// Authenticated users (password_hash -> user metadata)
+    users: HashMap<[u8; 32], AnyTlsAuthenticatedUser>,
     /// 8-byte prefixes of all user password hashes for quick fallback.
     /// If incoming data doesn't match any prefix, we can fallback immediately
     /// without waiting for the full 32-byte hash.
@@ -67,11 +76,61 @@ impl AnyTlsServerHandler {
         udp_enabled: bool,
         fallback: Option<NetLocation>,
     ) -> Self {
+        let users = users
+            .into_iter()
+            .map(|(name, password)| (name, password, None))
+            .collect();
+        Self::from_users(
+            users,
+            padding,
+            resolver,
+            proxy_provider,
+            udp_enabled,
+            fallback,
+        )
+    }
+
+    pub fn new_authenticated(
+        users: Vec<ServerUser>,
+        padding: Arc<PaddingFactory>,
+        resolver: Arc<dyn Resolver>,
+        proxy_provider: Arc<ClientProxySelector>,
+        udp_enabled: bool,
+        fallback: Option<NetLocation>,
+    ) -> Self {
+        let users = users
+            .into_iter()
+            .map(|user| {
+                (
+                    user.authenticated_user.user_key.clone(),
+                    user.credential,
+                    Some(user.authenticated_user),
+                )
+            })
+            .collect();
+        Self::from_users(
+            users,
+            padding,
+            resolver,
+            proxy_provider,
+            udp_enabled,
+            fallback,
+        )
+    }
+
+    fn from_users(
+        users: Vec<(String, String, Option<AuthenticatedUser>)>,
+        padding: Arc<PaddingFactory>,
+        resolver: Arc<dyn Resolver>,
+        proxy_provider: Arc<ClientProxySelector>,
+        udp_enabled: bool,
+        fallback: Option<NetLocation>,
+    ) -> Self {
         // Build hash -> name map and collect prefixes
         let mut user_map = HashMap::with_capacity(users.len());
         let mut hash_prefixes = HashSet::with_capacity(users.len());
 
-        for (name, password) in users {
+        for (name, password, authenticated_user) in users {
             let hash_result = digest(&SHA256, password.as_bytes());
             let mut password_hash = [0u8; 32];
             password_hash.copy_from_slice(hash_result.as_ref());
@@ -80,7 +139,13 @@ impl AnyTlsServerHandler {
             let prefix: [u8; 8] = password_hash[..8].try_into().unwrap();
             hash_prefixes.insert(prefix);
 
-            user_map.insert(password_hash, name);
+            user_map.insert(
+                password_hash,
+                AnyTlsAuthenticatedUser {
+                    name,
+                    authenticated_user,
+                },
+            );
         }
 
         Self {
@@ -99,7 +164,26 @@ impl AnyTlsServerHandler {
 impl TcpServerHandler for AnyTlsServerHandler {
     async fn setup_server_stream(
         &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_anytls_server_stream(server_stream, None).await
+    }
+
+    async fn setup_server_stream_with_peer_addr(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<SocketAddr>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_anytls_server_stream(server_stream, peer_addr)
+            .await
+    }
+}
+
+impl AnyTlsServerHandler {
+    async fn setup_anytls_server_stream(
+        &self,
         mut server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         // Use StreamReader to peek at auth header without consuming
         let mut reader = StreamReader::new();
@@ -128,12 +212,12 @@ impl TcpServerHandler for AnyTlsServerHandler {
         // Prefix matches - now read the full 32-byte hash
         let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
 
-        let user_name = match self.users.get(auth_data) {
-            Some(name) => {
-                log::debug!("AnyTLS user authenticated: {}", name);
+        let user = match self.users.get(auth_data) {
+            Some(user) => {
+                log::debug!("AnyTLS user authenticated: {}", user.name);
                 // Auth succeeded - consume the header bytes
                 reader.consume(32);
-                name.clone()
+                user.clone()
             }
             None => {
                 log::debug!("AnyTLS authentication failed: unknown password");
@@ -163,12 +247,16 @@ impl TcpServerHandler for AnyTlsServerHandler {
         // Create session with all dependencies for internal stream handling
         let session = AnyTlsSession::new_server_with_initial_data(
             server_stream,
-            Arc::clone(&self.padding),
-            Arc::clone(&self.resolver),
-            Arc::clone(&self.proxy_provider),
-            self.udp_enabled,
-            user_name,
-            initial_data,
+            AnyTlsServerSessionContext {
+                padding: Arc::clone(&self.padding),
+                resolver: Arc::clone(&self.resolver),
+                proxy_provider: Arc::clone(&self.proxy_provider),
+                udp_enabled: self.udp_enabled,
+                user_name: user.name,
+                authenticated_user: user.authenticated_user,
+                peer_addr,
+                initial_data,
+            },
         );
 
         // Run the session in a background task
@@ -180,9 +268,7 @@ impl TcpServerHandler for AnyTlsServerHandler {
 
         Ok(TcpServerSetupResult::AlreadyHandled)
     }
-}
 
-impl AnyTlsServerHandler {
     /// Forward the connection to a fallback destination when authentication fails.
     ///
     /// This makes the server indistinguishable from a legitimate server by transparently
@@ -313,7 +399,7 @@ mod tests {
 
         // Verify full hash lookup returns correct name
         let hash1_slice: &[u8] = &hash1[..];
-        assert!(user_map.get(hash1_slice).is_some());
+        assert!(user_map.contains_key(hash1_slice));
         assert_eq!(user_map.get(hash1_slice).unwrap(), "alice");
 
         let hash2_slice: &[u8] = &hash2[..];

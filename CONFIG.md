@@ -1,865 +1,195 @@
-# Configuration Reference
+# V2Board Backend Configuration
 
-shoes uses YAML configuration files. Multiple configuration types can be combined in a single file or split across multiple files.
+`shoes` uses one YAML file. Unknown fields are rejected.
 
-## Table of Contents
-- [Configuration Structure](#configuration-structure)
-- [Server Config](#server-config)
-- [Server Protocols](#server-protocols)
-- [TUN Config](#tun-config)
-- [Client Config](#client-config)
-- [Client Protocols](#client-protocols)
-- [Rules System](#rules-system)
-- [Named Groups](#named-groups)
-- [Named PEMs](#named-pems)
-- [Advanced Features](#advanced-features)
-- [Command Line](#command-line)
+The sample below shows the full production shape. Remove or comment the top-level `tls` block unless those certificate files exist; `shoes validate` checks that configured TLS paths are readable.
 
-## Configuration Structure
-
-A configuration file is a YAML array containing one or more configuration entries. Each entry can be:
-
-- **Server Config** - Defines a proxy server instance
-- **TUN Config** - Defines a TUN/VPN device for transparent proxying
-- **Client Config Group** - Defines reusable upstream proxy configurations
-- **Rule Config Group** - Defines reusable routing rules
-- **Named PEM** - Defines reusable certificate/key data
+This reference documents only the V2Board node-server configuration used in production. Generic local-YAML clients, outbound proxy chains, TUN, utility SOCKS/HTTP listeners, and client-side protocol options are outside this backend's acceptance boundary; legacy examples for those code paths are not production configuration guidance.
 
 ```yaml
-# Server configs have 'address' or 'path'
-- address: "0.0.0.0:8080"
-  protocol: ...
+v2board:
+  api_host: "http://127.0.0.1"
+  api_key: "replace-with-v2board-server-token"
+  api_timeout_secs: 30
+  error_body_limit_bytes: 4096
+  user_list_body_limit_bytes: 10485760
+  nodes:
+    - tag: "vless-1"
+      node_id: 1
+      node_type: "vless"
+      listen: "0.0.0.0"
+      # Optional per-node API and timing overrides.
+      # api_host: "https://panel.example.com"
+      # api_key: "per-node-server-token"
+      # pull_interval_secs: 30
+      # push_interval_secs: 30
+      # tls:
+      #   cert_file: "/etc/shoes/tls/fullchain.pem"
+      #   key_file: "/etc/shoes/tls/privkey.pem"
+      # Trojan only; must use a different port from the node listener.
+      # trojan_fallback: "127.0.0.1:8443"
+      # Hysteria2 only; optional static HTTP/3 masquerade, not a reverse proxy.
+      # hysteria2_masquerade:
+      #   status_code: 404
+      #   content_type: "text/html; charset=utf-8"
+      #   body: "<html><body>Not Found</body></html>"
 
-# TUN configs have 'device_name' or 'device_fd'
-- device_name: "tun0"
-  address: "10.0.0.1"
-  ...
+runtime:
+  data_dir: "/var/lib/shoes"
+  pull_interval_secs: 60
+  push_interval_secs: 60
+  node_report_min_traffic: 0
+  device_online_min_traffic: 0
+  max_legacy_shadowsocks_users: 10000
+  tcp_fast_open: false
 
-# Client config groups have 'client_group'
-- client_group: my-upstream
-  client_proxy: ...
+tls:
+  cert_file: "/etc/shoes/tls/fullchain.pem"
+  key_file: "/etc/shoes/tls/privkey.pem"
 
-# Rule config groups have 'rule_group'
-- rule_group: my-rules
-  rules: ...
-
-# Named PEMs have 'pem'
-- pem: my-cert
-  path: /path/to/cert.pem
+log:
+  level: "info"
 ```
 
-## Server Config
+## `v2board`
+
+- `api_host`: V2Board panel base URL.
+- `api_key`: V2Board `server_token`.
+- `api_timeout_secs`: HTTP timeout.
+- `error_body_limit_bytes`: max error body logged from panel failures.
+- `user_list_body_limit_bytes`: max user list response size.
+- `route_rule_sets`: optional local files for V2Board `geosite:`/`geoip:` route matchers. `geosite` files are plain text with one domain matcher per line: bare keyword, `keyword:`, `domain:`, `full:`, or `regexp:`. `geoip` files are plain text with one IP/CIDR matcher per line. Blank lines and lines starting with `#` are ignored.
+- `nodes`: list of V2Board nodes managed by this process.
+
+Each node:
+
+- `tag`: unique runtime name.
+- `node_id`: V2Board server ID.
+- `node_type`: `shadowsocks`, `vmess`, `vless`, `trojan`, `anytls`, `tuic`, `hysteria`, `naiveproxy`, or `v2node`. The aliases `ss`, `v2ray`, `hysteria2`, and `naive` are accepted and normalized to `shadowsocks`, `vmess`, `hysteria`, and `naiveproxy`.
+- `v2node` uses `/api/v2/server/config` for node settings and V1 UniProxy for users, traffic, and alive reporting. The runtime protocol is taken from the panel `protocol` field.
+- Other V2Board models such as `mieru`, `mtproxy`, `trusttunnel`, and `wireguard` are not production-supported by this backend yet and are rejected during config parsing or sync.
+- `listen`: local listen IP, default `0.0.0.0`.
+- `api_host`, `api_key`: optional per-node override.
+- `pull_interval_secs`, `push_interval_secs`: optional per-node override.
+- `tls`: optional per-node TLS certificate files. This overrides top-level `tls`.
+- `trojan_fallback`: optional `host:port` direct decoy destination for Trojan
+  nodes. It must use a different port from the node listener. Malformed or
+  unauthenticated TLS-decoded bytes are replayed there without creating a
+  V2Board authenticated-user scope.
+- `hysteria2_masquerade`: optional static HTTP/3 response for Hysteria2 ordinary
+  and failed-auth requests. It accepts `status_code`, `content_type`, and
+  `body`; `status_code` defaults to `404`, `content_type` defaults to
+  `text/html; charset=utf-8`, and `body` is required. Informational and
+  body-forbidden statuses are rejected, the content type is limited to 256
+  bytes, and the body is limited to 64 KiB. It does not proxy requests to
+  another server.
+
+## `runtime`
+
+- `data_dir`: stores `traffic-pending.json` plus owner-only
+  `v2board-lkg-<node-type>-<node-id>.json` last-known-good snapshots.
+  Snapshots are atomically replaced with mode `0600` on Unix and include
+  credentials, so this directory must be private to the shoes service account.
+  A validated snapshot is restored before the first panel request, allowing
+  listeners to return after restart while V2Board is temporarily unavailable.
+  Connection teardown synchronously persists newly recorded pending traffic
+  for restart replay. Traffic accepted by V2Board `/push` is persisted as
+  consumed before `/alive` is attempted, so an `/alive` failure does not replay
+  already accepted traffic after restart.
+- `pull_interval_secs`: local fallback config/user pull interval. V2Board `base_config.pull_interval` takes precedence after a node sync unless the node has `pull_interval_secs`.
+- `push_interval_secs`: local fallback traffic/alive push interval. V2Board `base_config.push_interval` takes precedence after a node sync unless the node has `push_interval_secs`.
+- `node_report_min_traffic`: local fallback for the minimum bytes before a user traffic record is pushed. V2Board `base_config.node_report_min_traffic` takes precedence after a node sync.
+- `device_online_min_traffic`: local fallback for the minimum bytes in a push cycle before alive IPs are reported. V2Board `base_config.device_online_min_traffic` takes precedence after a node sync.
+- `max_legacy_shadowsocks_users`: startup guard for legacy Shadowsocks multi-user authentication, which is O(n).
+- `tcp_fast_open`: must remain `false`. It is reserved for future support and currently fails validation if enabled, so the runtime never silently starts without applying it.
+
+## `tls`
+
+- `cert_file`: PEM certificate chain used by TLS-enabled V2Board nodes.
+- `key_file`: PEM private key used by TLS-enabled V2Board nodes.
+- Node-level `v2board.nodes[].tls` overrides the global TLS files.
+- Panel `tls_settings.cert_file` and `tls_settings.key_file` are also accepted when present.
+
+## `log`
+
+- `level`: `error`, `warn`, `info`, `debug`, `trace`, or `off`.
+- `file`: optional log file path. `-l/--log-file` can add more destinations.
+
+## Protocol Notes
+
+`shoes validate` checks the local YAML shape and readable TLS files. Panel-driven protocol compatibility is checked during `sync-once` or `run`, after the V2Board node config and users have been fetched.
+
+All support statements below describe inbound/server behavior. They do not claim that the corresponding outbound/client implementation is complete.
+
+Supported V2Board transports are:
+
+- TCP, including V2Ray TCP HTTP header obfuscation for non-TLS VMess/VLESS nodes.
+- V2Ray HTTP transport for VMess/VLESS nodes. Plain nodes use HTTP/1.1; TLS and VLESS Reality nodes use HTTP/2 and automatically advertise ALPN `h2`. `host`, `Host`, `path`, `method`, and response `headers` are honored.
+- XHTTP/splitHTTP transport for VMess/VLESS nodes. `network=xhttp` and `network=splithttp` are accepted. `path`, `host`/`Host`, and `mode` are honored; `mode` accepts `auto`, `packet-up`, `stream-up`, and `stream-one`. Server-relevant `extra` fields are honored for `noGRPCHeader`, `noSSEHeader`, `scMaxEachPostBytes`, `scMaxBufferedPosts`, `sessionIDPlacement`, `sessionIDKey`, `seqPlacement`, `seqKey`, `uplinkDataPlacement`, and `uplinkDataKey`. TLS and Reality XHTTP use HTTP/2 with ALPN `h2`. XHTTP over HTTP/3, xmux, client padding obfuscation, and `downloadSettings` are not server behavior switches in this runtime.
+- WebSocket with strict server-side proxy framing. `path`, `headers`, `maxEarlyData`, and `earlyDataHeaderName` are honored. If V2Board omits early-data settings, shoes defaults to the sing-box subscription behavior: `maxEarlyData=2048` and `earlyDataHeaderName=Sec-WebSocket-Protocol`. The frame layer enforces client masking, RSV/opcode and canonical-length rules, fragmentation/control interleaving, streaming text UTF-8 validation, Ping/Pong payload behavior, and passive/active Close handshakes. Protocol errors use Close 1002 and invalid UTF-8 uses 1007. An external RFC 6455 conformance/fuzz run remains pending.
+- HTTPUpgrade. `path`, `host`, and custom `headers` are honored. The handler expects a plain HTTP upgrade request with `Connection: upgrade` and `Upgrade: websocket`; real WebSocket handshakes with `Sec-WebSocket-Key` are rejected.
+- gRPC over h2, single-stream mode only. `serviceName` and `authority` are honored. `multiMode` is rejected.
+- TUIC over QUIC/UDP. V2Board V1 TUIC and V2Node `protocol=tuic` are accepted only as QUIC listeners with TLS and ALPN `h3`. Authenticated native-datagram operation is covered. Pre-authentication unidirectional task headers are paused with bounded parser state and no payload-sized allocation; a small payload prefix may remain as bounded parser lookahead, but nothing is forwarded before successful authentication. A real Quinn session-ticket test proves an accepted 0-RTT Packet is withheld before AUTH, delivered afterward, and not delivered after invalid AUTH.
+- Hysteria2 over QUIC/UDP. V2Board V1 Hysteria nodes require `version=2`; V2Node requires `protocol=hysteria2`. Salamander and Gecko obfs are supported when `obfs_password` is present. An optional local static HTTP/3 masquerade can serve ordinary and failed-auth requests; reverse-proxy masquerade is not implemented. Hysteria1 is rejected.
+- NaiveProxy over TCP/TLS HTTP/2 and QUIC/TLS HTTP/3. V2Board V1 `network=tcp` runs H2, V1 `enable_quic=1` starts the V2Board-compatible TCP+H3 dual-stack listener, and compatible V2Node `protocol=naive network=udp` payloads run pure H3. TCP ALPN is `h2`/`http/1.1`; H3 ALPN is `h3`. Padding is negotiated only when the client offers it; a missing header selects a normal unpadded CONNECT tunnel.
+- `network_settings.acceptProxyProtocol=true` enables HAProxy PROXY protocol v1/v2 parsing before TLS, Reality, WebSocket, HTTPUpgrade, gRPC, or proxy authentication on TCP listeners. When enabled, every inbound connection must start with a valid PROXY header. The header source IP is used for V2Board `device_limit` and alive accounting. Only enable this listener behind a trusted load balancer or reverse proxy because clients that can connect directly can forge the source IP. TUIC and Hysteria2 reject this setting because their listeners are UDP/QUIC.
+
+TLS is supported for VMess, VLESS, Trojan, AnyTLS, TUIC, Hysteria2, and NaiveProxy. Trojan, AnyTLS, TUIC, Hysteria2, and NaiveProxy are treated as TLS even when the panel payload omits a `tls` field. TLS certificates can come from top-level `tls`, per-node `v2board.nodes[].tls`, or panel `tls_settings.cert_file`/`key_file` when UniProxy exposes those fields. VMess, Trojan, V2Board V1 AnyTLS, V2Board V1 TUIC, V2Board V1 Hysteria2, and V2Board V1 NaiveProxy UniProxy payloads currently omit TLS certificate/ECH settings, so use local certificate files for those node types. Automatic certificate modes and TLS ECH are not implemented; use file/local certificate mode.
+
+Trojan valid-user TCP/UDP proxying is supported. Because the current UniProxy
+Trojan response does not expose a decoy destination, configure the optional
+local `v2board.nodes[].trojan_fallback`. Malformed or unauthenticated traffic
+after TLS is forwarded there with all already-read bytes preserved and without
+creating V2Board traffic/alive state. Without this explicit setting, invalid
+traffic remains fail-closed. The fallback bypasses V2Board outbound routing and
+connects directly, and its port must differ from the Trojan listener port.
+
+Reality inbound is supported for V2Board VLESS nodes when the panel provides `tls: reality` or `tls: 2`. Required production inputs are `private_key`, at least one hex `short_id`/`short_ids` value, and either `dest` or `server_name`/`server_port`. The `dest`/`server_name` target must be a hostname that resolves to a reachable TLS 1.3 handshake server. `reality_config.MaxTimeDiff` is honored when present, accepting millisecond numbers or Go-style duration strings such as `60s` and `1m30s`; otherwise the runtime uses the existing 60000 ms default. `xver`, ECH settings, and automatic certificate issuance modes are rejected. `public_key`, `fingerprint`, `server_names`, and Reality certificate file fields may be present in panel settings but are not used by the inbound builder. V2Board Trojan nodes do not expose Reality settings through UniProxy, so Trojan runs as TLS only in this backend.
+
+VLESS Vision `xtls-rprx-vision` is supported only with plain TCP transport wrapped by TLS or Reality. VLESS ML-KEM encryption modes and non-empty `encryption_settings` are rejected.
+
+Shadowsocks legacy AEAD supports V2Board Admin ciphers `aes-128-gcm`,
+`aes-192-gcm`, `aes-256-gcm`, and `chacha20-ietf-poly1305`. It supports
+multiple users by probing the first encrypted length chunk; this is O(n), so
+`max_legacy_shadowsocks_users` is enforced at startup. Duplicate legacy user
+credentials are rejected. Shadowsocks requires plain TCP transport; V2Node
+Shadowsocks with `network=ws`, `grpc`, `http`, `httpupgrade`, or `xhttp` is
+rejected.
 
-```yaml
-# Bind to IP address and port
-address: "0.0.0.0:8080"        # IPv4
-address: "[::]:8080"           # IPv6
-address: "0.0.0.0:443-445"     # Port range
+For a V1 Shadowsocks node, shoes also fetches the strict schema-v1
+`/UniProxy/plugin-config` manifest. `plugin: null` exposes raw Shadowsocks.
+An active profile starts the loopback raw upstream and the public plugin edge
+as one runtime generation. Supported in-process server adapters are
+simple-obfs HTTP/TLS, v2ray-plugin WebSocket/WSS/HTTPUpgrade/Mux.Cool, GOST
+WebSocket/WSS/smux, ShadowTLS v1/v2/v3, Restls, and Kcptun. TLS-enabled
+v2ray/GOST adapters use the node or global local certificate files; plugin
+secrets never belong in local YAML. See
+`docs/v2board-shadowsocks-plugin-runtime.md`.
 
-# OR bind to Unix socket (TCP only)
-path: "/tmp/shoes.sock"
+Shadowsocks 2022 multi-user is supported for `2022-blake3-aes-128-gcm` and `2022-blake3-aes-256-gcm`. The UniProxy config response must include a base64 `server_key`; official V2Board derives it from the node `created_at` value and does not require a local shoes setting. Per-user PSKs come from `link_secret`/`secret` when present; otherwise the runtime derives the same UUID-prefix fallback used by V2Board subscription builders. Duplicate 2022 user PSKs are rejected at sync time. `2022-blake3-chacha20-poly1305` is rejected for V2Board multi-user.
 
-# Protocol configuration (required)
-protocol: ServerProxyConfig
+AnyTLS is supported for V2Board V1 UniProxy `v2_server_anytls` as TLS/raw TCP, and for V2Node AnyTLS as plain TCP with TLS or Reality. User passwords are the V2Board user UUIDs, matching V2Board subscription builders. Panel `padding_scheme` is honored. V2Node AnyTLS with WS/gRPC/HTTP/HTTPUpgrade/XHTTP transport is rejected because this runtime does not implement AnyTLS over V2Ray transports. Because the V1 AnyTLS table does not expose certificate, transport, or Reality settings, certificates must be supplied by local `tls` config.
 
-# Transport layer (default: tcp)
-transport: tcp | quic
+TUIC is supported for V2Board V1 UniProxy `v2_server_tuic` and V2Node `protocol=tuic`. The runtime uses the V2Board user UUID as both TUIC UUID and password, matching V2Board subscription behavior. TUIC always listens on QUIC/UDP with TLS and ALPN `h3`; V2Board V1 TUIC nodes must provide certificates through top-level or per-node local `tls`, while V2Node TUIC can also use panel `tls_settings.cert_file`/`key_file` when present. With `zero_rtt_handshake`, non-AUTH unidirectional task headers received before authentication are kept with bounded parser state and no payload-sized allocation; a small payload prefix may remain as bounded parser lookahead, but nothing is forwarded before authentication. Tasks resume in the authenticated connection scope. A real Quinn session-ticket test verifies accepted 0-RTT Packet delivery across this boundary with a wire encoder independent from the server parser. Incomplete UDP fragments are limited to a 65,535-byte logical packet and a 4 MiB per-connection cache. `congestion_control` accepts `cubic`, `new_reno`/`newreno`/`reno`, and `bbr`; unknown values fail sync. The current local V2Board node config APIs omit `udp_relay_mode` even though subscription builders use it; authenticated native datagram operation is covered. `disable_sni`/`insecure` are client-side settings with no server-side effect. `network_settings.acceptProxyProtocol=true` is rejected for TUIC.
 
-# TCP settings (only when transport: tcp)
-tcp_settings:
-  no_delay: true               # Default: true
+Hysteria2 is supported for V2Board V1 UniProxy `v2_server_hysteria` only when `version=2`, and for V2Node `protocol=hysteria2`. The runtime uses the V2Board user UUID as the Hysteria2 password, matching V2Board subscription behavior. Hysteria2 always listens on QUIC/UDP with TLS and ALPN `h3`; V2Board V1 Hysteria2 nodes must provide certificates through top-level or per-node local `tls`, while V2Node Hysteria2 can also use panel `tls_settings.cert_file`/`key_file` when present. Panel `up_mbps` limits server-to-client/user download traffic, and `down_mbps` limits client-to-server/user upload traffic; both use V2Board Mbps units and are shared across concurrent connections for the same local node. Hysteria2 `obfs=salamander` and `obfs=gecko` are supported for V1 Hysteria2 and V2Node Hysteria2 when `obfs_password` is present. Incomplete UDP fragments are limited to a 65,535-byte logical packet and a 4 MiB per-connection cache. Optional local `v2board.nodes[].hysteria2_masquerade` supplies a bounded static status/content-type/body response for ordinary and failed-auth H3 requests and can continue serving bounded requests for the connection lifetime; HEAD sends headers without a body, and body-forbidden response statuses are rejected. It is not a reverse proxy. Without that setting, the existing empty-404 authentication-window behavior remains. Hysteria1, unknown Hysteria2 obfs types, Reality, and PROXY protocol are rejected.
 
-# QUIC settings (required when transport: quic)
-quic_settings:
-  cert: string                 # TLS certificate (path or named PEM)
-  key: string                  # TLS private key (path or named PEM)
-  alpn_protocols: [string]     # Optional ALPN protocols
-  client_ca_certs: [string]    # Optional client CA certificates
-  client_fingerprints: [string] # Optional client certificate fingerprints
-  num_endpoints: int           # Optional, 0 = auto (based on thread count)
+NaiveProxy is supported for V2Board V1 UniProxy `v2_server_naiveproxy` and compatible V2Node `protocol=naive` payloads. The runtime uses V2Board `/user` `username` and `password` when present, falling back to `user-<id>` and the user UUID to match the UniProxy payload. It listens behind TLS with HTTP/2 CONNECT or HTTP/3 CONNECT and applies V2Board speed limits, device limits, alive, route, and traffic accounting to authenticated streams. Padding is opt-in: no `padding` request header produces a normal unpadded tunnel and no padding response header, while a supported offered type enables Naive framing. Both padded and unpadded H2/H3 downloads pass the real V2Board Docker policy suite. V1 `quic_congestion_control` and V2Node `congestion_control` are honored for H3; accepted values are `cubic`, `reno`, `new_reno`, `bbr`, `bbr_standard`, `bbr2`, and `bbr2_variant`. QUIC congestion settings on TCP-only nodes, custom ALPN values outside the selected transport, Reality, and PROXY protocol on QUIC are rejected.
 
-# Routing rules (default: allow-all-direct)
-rules: string | [RuleConfig]
-```
+V2Board `v2node` is supported as a V2 config source for currently supported runtime protocols: VMess, VLESS, Shadowsocks, Trojan, AnyTLS, TUIC, Hysteria2, and NaiveProxy. This includes Reality when V2Board exposes `tls=2` through the V2 config payload. Users, traffic, alive, and device-limit behavior still use the V1 UniProxy endpoints with `node_type=v2node`.
 
-## Server Protocols
+Per-user `speed_limit` and `device_limit` come from the V2Board user API, not from the local YAML. `speed_limit` is the panel's effective value, including V2Board dynamic speed-limit rules after they are reflected by `/UniProxy/user`; it is interpreted as Mbps and enforced with a shared per-node/per-user token bucket with a short burst. `device_limit` counts currently connected distinct source IPs for that node/user and checks the V2Board `/alivelist` aggregate count cached for the same local node before admitting a new distinct local IP; `0` or missing means unlimited. V2Board does not expose `device_limit_mode` or per-user alive IP detail to UniProxy nodes, so cross-node admission follows the aggregate alive count returned by the panel. Nodes configured in the same process keep separate cached `/alivelist` views.
 
-### HTTP
-```yaml
-protocol:
-  type: http
-  username: string?            # Optional authentication
-  password: string?
-```
+V2Board `route_id` rules are honored for `block`, `block_ip`, `block_port`, and `protocol`. Domain `block` supports keyword matchers, `domain:` suffix matchers, `full:` exact hostname matchers, `regexp:` hostname regex matchers, and configured `geosite:` local rule sets. `block_ip` supports IP/CIDR and configured `geoip:` local rule sets. `block_port` supports ports and inclusive ranges written as `start-end` or `start:end`. `protocol` supports TCP `http`, `tls`, `bittorrent`, and `ssh` first-payload sniffing, plus UDP `quic` first-datagram sniffing. `geosite:`/`geoip:` labels must be mapped under `v2board.route_rule_sets`; missing files or invalid entries fail sync. `dns`, `route`, `route_ip`, and `default_out` are rejected during sync because they require Xray outbound/DNS models that this backend does not expose.
 
-### SOCKS5
-```yaml
-protocol:
-  type: socks                  # Aliases: socks5
-  username: string?
-  password: string?
-  udp_enabled: true            # Default: true (enables UDP ASSOCIATE)
-```
+V2Node `encryption_settings` is accepted only when empty (`{}`, `[]`, or
+blank). Non-empty values are rejected for VMess, VLESS, Trojan, AnyTLS, TUIC,
+Hysteria2, NaiveProxy, and Shadowsocks until each protocol's semantics are
+implemented. V2Board Shadowsocks sing-mux/h2mux is enabled only by an
+authoritative `multiplex.enabled=true` plugin manifest. Every logical stream
+inherits the authenticated user and original peer address and passes through
+the normal device, speed, routing, and traffic-accounting path. Padding is
+strictly negotiated. TCP Brutal is rejected until its server scheduler is
+implemented.
 
-### Mixed (HTTP + SOCKS5)
-```yaml
-protocol:
-  type: mixed                  # Aliases: http+socks, socks+http
-  username: string?
-  password: string?
-  udp_enabled: true            # Default: true (enables UDP ASSOCIATE for SOCKS5)
-```
-
-Auto-detects HTTP or SOCKS5 protocol from the first byte of the connection.
-
-### Shadowsocks
-```yaml
-protocol:
-  type: shadowsocks            # Aliases: ss
-  cipher: string               # See supported ciphers below
-  password: string
-
-# Supported ciphers:
-# - aes-128-gcm
-# - aes-256-gcm
-# - chacha20-ietf-poly1305
-# - 2022-blake3-aes-128-gcm
-# - 2022-blake3-aes-256-gcm
-# - 2022-blake3-chacha20-ietf-poly1305
-```
-
-### VMess
-```yaml
-protocol:
-  type: vmess
-  cipher: string               # aes-128-gcm, chacha20-poly1305, none
-  user_id: string              # UUID
-  udp_enabled: true            # Default: true (enables XUDP)
-```
-
-**Note:** VMess AEAD mode is always enabled. The legacy `force_aead` field is deprecated and non-AEAD mode is no longer supported.
-
-### VLESS
-```yaml
-protocol:
-  type: vless
-  user_id: string              # UUID
-  udp_enabled: true            # Default: true (enables XUDP)
-  fallback: string?            # Optional fallback destination for failed auth (e.g., "127.0.0.1:80")
-```
-
-### Trojan
-```yaml
-protocol:
-  type: trojan
-  password: string
-  shadowsocks:                 # Optional encryption layer
-    cipher: string
-    password: string
-```
-
-### Snell v3
-```yaml
-protocol:
-  type: snell
-  cipher: string               # aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
-  password: string
-  udp_enabled: true            # Default: true
-  udp_num_sockets: 1           # Default: 1, sockets per UDP session
-```
-
-### TLS Server
-```yaml
-protocol:
-  type: tls
-
-  # Standard TLS targets (by SNI)
-  tls_targets:                 # Aliases: sni_targets, targets
-    "example.com":
-      cert: string             # Certificate (path or named PEM)
-      key: string              # Private key (path or named PEM)
-      alpn_protocols: [string] # Optional ALPN
-      client_ca_certs: [string] # Optional client CA certs
-      client_fingerprints: [string] # Optional client cert fingerprints
-      vision: false            # Enable Vision (requires VLESS inner protocol)
-      protocol: ServerProxyConfig
-      override_rules: [RuleConfig] # Optional rule override
-
-  # Default TLS target (for unmatched/no SNI)
-  default_tls_target:          # Aliases: default_target
-    cert: string
-    key: string
-    # ... same fields as tls_targets
-
-  # Reality targets (by SNI)
-  reality_targets:
-    "www.cloudflare.com":
-      private_key: string      # X25519 private key (base64url)
-      short_ids: [string]      # Valid client IDs (hex, 0-16 chars)
-      dest: string             # Fallback destination (e.g., "example.com:443")
-      dest_client_chain: ClientChain?  # Optional proxy chain for reaching dest
-      max_time_diff: 60000     # Max timestamp diff in ms (default: 60000)
-      min_client_version: [1, 8, 0]  # Optional [major, minor, patch]
-      max_client_version: [2, 0, 0]  # Optional [major, minor, patch]
-      cipher_suites: [string]  # Optional TLS 1.3 cipher suites (see below)
-      vision: false            # Enable Vision (requires VLESS inner protocol)
-      protocol: ServerProxyConfig
-      override_rules: [RuleConfig]
-
-  # ShadowTLS v3 targets (by SNI)
-  shadowtls_targets:
-    "example.com":
-      password: string
-      handshake:
-        # Local handshake (with own certificate):
-        cert: string
-        key: string
-        alpn_protocols: [string]
-        client_ca_certs: [string]
-        client_fingerprints: [string]
-        # OR Remote handshake (proxy to real server):
-        address: string        # e.g., "google.com:443"
-        client_proxies: [ClientConfig] # Optional proxies for handshake
-      protocol: ServerProxyConfig
-      override_rules: [RuleConfig]
-
-  # Buffer size for TLS (optional, min 16384)
-  tls_buffer_size: int
-```
-
-### WebSocket
-```yaml
-protocol:
-  type: websocket              # Aliases: ws
-  targets:
-    - matching_path: string?   # Optional path filter (e.g., "/ws")
-      matching_headers:        # Optional header filters
-        X-Custom-Header: "value"
-      protocol: ServerProxyConfig
-      ping_type: ping-frame    # disabled | ping-frame | empty-frame
-      override_rules: [RuleConfig]
-```
-
-### Port Forward
-```yaml
-protocol:
-  type: forward                # Aliases: port_forward, portforward
-  targets: string | [string]   # Target address(es)
-```
-
-### Hysteria2
-```yaml
-protocol:
-  type: hysteria2
-  password: string
-  udp_enabled: true            # Default: true
-```
-
-### TUIC v5
-```yaml
-protocol:
-  type: tuic                   # Aliases: tuicv5
-  uuid: string                 # UUID
-  password: string
-  zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
-```
-
-### AnyTLS
-```yaml
-protocol:
-  type: anytls
-  users:                       # One or more users
-    - name: string?            # Optional display name
-      password: string         # User password
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  padding_scheme: [string]?    # Optional custom padding (e.g., ["stop=8", "0=30-30"])
-  fallback: string?            # Optional fallback destination for failed auth
-```
-
-AnyTLS is a TLS-based multiplexing proxy protocol with traffic obfuscation. Should be used within TLS or Reality.
-
-### NaiveProxy
-```yaml
-protocol:
-  type: naiveproxy             # Aliases: naive
-  users:                       # One or more users
-    - name: string?            # Optional display name
-      username: string         # Basic Auth username
-      password: string         # Basic Auth password
-  padding: true                # Default: true (enables padding protocol)
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  fallback: string?            # Optional path to serve static files for probe resistance
-```
-
-NaiveProxy implements HTTP/2 CONNECT with padding for censorship resistance. Should be used within TLS with `alpn_protocols: ["h2"]`.
-
-## TUN Config
-
-TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing shoes to act as a transparent VPN.
-
-```yaml
-# Linux: Create TUN device by name
-device_name: string            # Device name (e.g., "tun0")
-address: string                # Device IP address (e.g., "10.0.0.1")
-netmask: string?               # Netmask (e.g., "255.255.255.0")
-destination: string?           # Gateway/destination (Linux only)
-
-# iOS/Android: Use existing file descriptor
-device_fd: int                 # FD from VpnService (Android) or NEPacketTunnelProvider (iOS)
-
-# Common settings
-mtu: 1500                      # Default: 1500 (Linux), 9000 (Android), 4064 (iOS)
-tcp_enabled: true              # Default: true
-udp_enabled: true              # Default: true
-icmp_enabled: true             # Default: true
-
-# Routing rules
-rules: [RuleConfig]
-```
-
-**Platform notes:**
-- **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
-- **Android**: Use `device_fd` from `VpnService.Builder.establish()`. Routes configured via VpnService.
-- **iOS**: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`.
-
-**Example (Linux):**
-```yaml
-- device_name: "tun0"
-  address: "10.0.0.1"
-  netmask: "255.255.255.0"
-  mtu: 1500
-  tcp_enabled: true
-  udp_enabled: true
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "proxy.example.com:443"
-        protocol:
-          type: tls
-          protocol:
-            type: vless
-            user_id: "uuid"
-```
-
-## Client Config
-
-Used in rules to specify upstream proxies.
-
-```yaml
-address: string                # Proxy server address (e.g., "proxy.example.com:1080")
-protocol: ClientProxyConfig
-transport: tcp | quic          # Default: tcp
-bind_interface: string         # Optional, Linux/Android/Fuchsia only
-
-tcp_settings:
-  no_delay: true
-
-quic_settings:
-  verify: true                 # Default: true
-  server_fingerprints: [string]
-  sni_hostname: string
-  alpn_protocols: [string]
-  cert: string                 # Client certificate for mTLS
-  key: string                  # Client key for mTLS
-```
-
-## Client Protocols
-
-### Direct
-```yaml
-protocol:
-  type: direct
-```
-
-### HTTP
-```yaml
-protocol:
-  type: http
-  username: string?
-  password: string?
-```
-
-### SOCKS5
-```yaml
-protocol:
-  type: socks
-  username: string?
-  password: string?
-```
-
-### Shadowsocks
-```yaml
-protocol:
-  type: shadowsocks
-  cipher: string
-  password: string
-```
-
-### Snell
-```yaml
-protocol:
-  type: snell
-  cipher: string
-  password: string
-```
-
-### VMess
-```yaml
-protocol:
-  type: vmess
-  cipher: string
-  user_id: string
-  h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
-    padding: false
-```
-
-**Note:** VMess AEAD mode is always enabled. The legacy `aead` field is deprecated.
-
-### VLESS
-```yaml
-protocol:
-  type: vless
-  user_id: string
-  h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
-    padding: false
-```
-
-### Trojan
-```yaml
-protocol:
-  type: trojan
-  password: string
-  shadowsocks:                 # Optional
-    cipher: string
-    password: string
-  h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
-    padding: false
-```
-
-### H2MUX Multiplexing
-
-H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reducing connection overhead. Compatible with sing-box. Available for VMess, VLESS, and Trojan client protocols.
-
-```yaml
-h2mux:
-  max_connections: 4           # Maximum connections to maintain (default: 4)
-  min_streams: 4               # Min streams before opening new connection (default: 4)
-  max_streams: 0               # Max streams per connection, 0 = unlimited (default: 0)
-  padding: false               # Enable padding for traffic obfuscation (default: false)
-```
-
-**Server support:** H2MUX is auto-detected on servers. No configuration needed.
-
-### TLS Client
-```yaml
-protocol:
-  type: tls
-  verify: true                 # Default: true
-  server_fingerprints: [string]
-  sni_hostname: string
-  alpn_protocols: [string]
-  tls_buffer_size: int
-  cert: string                 # Client certificate for mTLS
-  key: string                  # Client key for mTLS
-  vision: false                # Enable Vision (requires VLESS inner protocol)
-  protocol: ClientProxyConfig
-```
-
-### Reality Client
-```yaml
-protocol:
-  type: reality
-  public_key: string           # Server's X25519 public key (base64url)
-  short_id: string             # Your client ID (hex, 0-16 chars)
-  sni_hostname: string         # SNI to send (must match server's reality_targets key)
-  cipher_suites: [string]      # Optional TLS 1.3 cipher suites (see below)
-  vision: false                # Enable Vision (requires VLESS inner protocol)
-  protocol: ClientProxyConfig  # Inner protocol (typically VLESS)
-```
-
-**Reality cipher suites:** Valid values are `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. If not specified, all three are offered/supported.
-
-### ShadowTLS Client
-```yaml
-protocol:
-  type: shadowtls
-  password: string
-  sni_hostname: string?        # Optional SNI override
-  protocol: ClientProxyConfig
-```
-
-### WebSocket Client
-```yaml
-protocol:
-  type: websocket
-  matching_path: string?
-  matching_headers:
-    header_name: string
-  ping_type: ping-frame        # disabled | ping-frame | empty-frame
-  protocol: ClientProxyConfig
-```
-
-### Port Forward (No-op)
-```yaml
-protocol:
-  type: portforward            # Aliases: noop
-```
-
-Passes through the raw connection without protocol wrapping. Useful for testing or transparent proxying.
-
-### AnyTLS Client
-```yaml
-protocol:
-  type: anytls
-  password: string             # User password
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  padding_scheme: [string]?    # Optional custom padding scheme
-```
-
-### NaiveProxy Client
-```yaml
-protocol:
-  type: naiveproxy             # Aliases: naive
-  username: string             # Basic Auth username
-  password: string             # Basic Auth password
-  padding: true                # Default: true (enables padding protocol)
-```
-
-## Rules System
-
-Rules determine how incoming connections are routed.
-
-### Rule Config
-```yaml
-rules:
-  - masks: string | [string]   # IP/CIDR or hostname masks
-    action: allow | block
-    # For action: allow
-    override_address: string?  # Optional address override
-    client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
-```
-
-### Client Chains
-
-Client chains define how traffic is routed through upstream proxies. Each chain is a sequence of "hops" - proxies that traffic passes through in order.
-
-```yaml
-# Single proxy (simplest form)
-client_chain: my-proxy-group           # Reference a named group
-client_chain:                          # Or inline config
-  address: "proxy.example.com:1080"
-  protocol:
-    type: socks
-
-# Multi-hop chain (traffic goes: client -> hop1 -> hop2 -> target)
-client_chain:
-  chain:
-    - first-proxy-group
-    - second-proxy-group
-
-# Multiple chains (round-robin selection)
-client_chains:
-  - us-proxy-group                     # Chain 1: single hop
-  - chain: [proxy1, proxy2]            # Chain 2: multi-hop
-
-# Load balancing at a hop (pool)
-client_chain:
-  chain:
-    - pool: [us-proxies, eu-proxies]   # Round-robin between pool members
-    - final-proxy
-```
-
-**Migration note:** The `client_proxy` / `client_proxies` fields still work but are deprecated. Please migrate to `client_chain` / `client_chains`.
-
-### Mask Syntax
-```yaml
-# IP/CIDR masks
-masks: "0.0.0.0/0"             # All IPv4
-masks: "::/0"                  # All IPv6
-masks: "192.168.0.0/16"        # Subnet
-masks: "10.0.0.1:80"           # Specific IP and port
-
-# Hostname masks
-masks: "*.google.com"          # Wildcard subdomain
-masks: "example.com"           # Exact match
-
-# Multiple masks
-masks:
-  - "192.168.0.0/16"
-  - "10.0.0.0/8"
-  - "*.internal.com"
-```
-
-### Built-in Rule Groups
-- `allow-all-direct` - Allow all connections, direct routing
-- `block-all` - Block all connections
-
-### Example Rules
-```yaml
-rules:
-  # Direct connection for local networks
-  - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
-    action: allow
-    client_chain:
-      protocol:
-        type: direct
-
-  # Block specific domains
-  - masks: ["*.ads.example.com", "tracking.example.com"]
-    action: block
-
-  # Route through upstream proxy
-  - masks: "0.0.0.0/0"
-    action: allow
-    client_chain:
-      address: "proxy.example.com:1080"
-      protocol:
-        type: socks
-```
-
-## Named Groups
-
-### Client Proxy Group
-```yaml
-- client_group: my-upstream
-  client_proxies:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "proxy2.example.com:1080"
-      protocol:
-        type: socks
-
-# Reference in rules
-- address: "0.0.0.0:8080"
-  protocol:
-    type: http
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain: my-upstream  # Reference by name
-```
-
-### Rule Group
-```yaml
-- rule_group: standard-rules
-  rules:
-    - masks: ["192.168.0.0/16"]
-      action: allow
-      client_chain:
-        protocol:
-          type: direct
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain: my-upstream
-
-# Reference in server config
-- address: "0.0.0.0:8080"
-  protocol:
-    type: http
-  rules: standard-rules        # Reference by name
-```
-
-## Named PEMs
-
-Define certificates once and reference throughout configuration.
-
-```yaml
-# From file
-- pem: my-cert
-  path: /path/to/certificate.pem
-
-# Inline data
-- pem: my-key
-  data: |
-    -----BEGIN PRIVATE KEY-----
-    ...
-    -----END PRIVATE KEY-----
-
-# Reference in config
-- address: "0.0.0.0:443"
-  protocol:
-    type: tls
-    tls_targets:
-      "example.com":
-        cert: my-cert          # Reference by name
-        key: my-key
-        protocol:
-          type: http
-```
-
-## Advanced Features
-
-### Vision (XTLS-Vision)
-
-Vision optimizes TLS-in-TLS scenarios by detecting inner TLS traffic and switching to direct mode for zero-copy performance.
-
-**Requirements:**
-- Inner protocol MUST be VLESS
-- Works with both TLS and Reality
-
-```yaml
-# TLS + Vision
-protocol:
-  type: tls
-  tls_targets:
-    "example.com":
-      cert: cert.pem
-      key: key.pem
-      vision: true
-      alpn_protocols: ["http/1.1"]
-      protocol:
-        type: vless
-        user_id: "uuid"
-
-# Reality + Vision
-protocol:
-  type: tls
-  reality_targets:
-    "www.google.com":
-      private_key: "..."
-      short_ids: ["..."]
-      dest: "www.google.com:443"
-      vision: true
-      protocol:
-        type: vless
-        user_id: "uuid"
-```
-
-### XUDP Multiplexing
-
-Automatically enabled for VMess and VLESS when `udp_enabled: true`. Multiplexes UDP traffic over a single connection.
-
-### Proxy Chaining
-
-**Protocol nesting** (wrap one protocol in another):
-
-```yaml
-client_chain:
-  address: "proxy.example.com:443"
-  protocol:
-    type: tls
-    protocol:
-      type: vmess
-      cipher: aes-128-gcm
-      user_id: "uuid"
-```
-
-**Multi-hop chains** (route through multiple proxies sequentially):
-
-```yaml
-client_chain:
-  chain:
-    - address: "proxy1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "proxy2.example.com:443"
-      protocol:
-        type: tls
-        protocol:
-          type: vless
-          user_id: "uuid"
-```
-
-### Hot Reloading
-
-Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
-
-### mTLS (Mutual TLS)
-
-Require client certificates for authentication:
-
-```yaml
-# Server side
-protocol:
-  type: tls
-  tls_targets:
-    "example.com":
-      cert: server.crt
-      key: server.key
-      client_ca_certs: [ca.crt]  # Required CA
-      client_fingerprints: ["sha256:..."]  # Optional specific certs
-      protocol: ...
-
-# Client side
-client_chain:
-  address: "example.com:443"
-  protocol:
-    type: tls
-    cert: client.crt
-    key: client.key
-    protocol: ...
-```
-
-## Command Line
-
-```bash
-shoes [OPTIONS] <config.yaml> [config.yaml...]
-
-OPTIONS:
-  -t, --threads NUM    Worker threads (default: CPU count)
-  -d, --dry-run        Parse config and exit
-  --no-reload          Disable hot-reloading
-
-COMMANDS:
-  generate-reality-keypair                       Generate Reality X25519 keypair
-  generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
-```
-
-## Tips
-
-### Generate Keys
-
-**Reality keypair:**
-```bash
-shoes generate-reality-keypair
-```
-
-**Shadowsocks 2022 password:**
-```bash
-shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
-```
-
-**UUID:**
-```bash
-uuidgen
-```
-
-**TLS certificate fingerprint:**
-```bash
-openssl x509 -in cert.pem -noout -fingerprint -sha256
-```
-
-### Security Best Practices
-
-- Use strong, random passwords
-- Keep private keys secure
-- Use `127.0.0.1` instead of `0.0.0.0` for local-only access
-- Use firewall rules to restrict access
-- Enable client certificate authentication for sensitive services
-- Use Vision with Reality for maximum privacy
-
-### Performance Tips
-
-- Enable `vision: true` for TLS-in-TLS scenarios
-- Use `tcp_settings.no_delay: true` for low latency
-- Set `quic_settings.num_endpoints` to match worker threads
-- Use QUIC transport for high-latency or lossy networks
-
-### Common Issues
-
-- **"Address already in use"**: Change port or stop conflicting service
-- **"Permission denied"**: Ports < 1024 require root/admin
-- **Reality connection fails**: Verify keys match, UUID matches, SNI matches server's reality_targets key
-- **Vision not working**: Ensure inner protocol is VLESS
-- **Config validation fails**: Run with `--dry-run` for detailed errors
+Unsupported panel fields fail during sync and the previous runtime is kept if one exists. Initial startup refuses to run if every configured node fails its first sync. Policy changes, user-state changes, and speed-limit changes apply to new connections after the next successful sync; already established connections are not force-disconnected.

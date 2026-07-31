@@ -243,6 +243,10 @@ impl AsyncWrite for AnyTlsStream {
             )));
         }
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // Use poll_reserve for backpressure - this will return Pending if channel is full
         match self.data_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
@@ -360,6 +364,7 @@ impl AsyncStream for AnyTlsStream {}
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn test_stream_write() {
@@ -376,6 +381,29 @@ mod tests {
         let (stream_id, data) = data_rx.recv().await.unwrap();
         assert_eq!(stream_id, 1);
         assert_eq!(data.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn zero_length_write_is_noop_not_fin() {
+        let (data_tx, mut data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let session_closed = Arc::new(AtomicBool::new(false));
+
+        let mut stream = AnyTlsStream::new(7, incoming_rx, data_tx, session_closed);
+
+        let n = stream.write(&[]).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(
+            timeout(Duration::from_millis(50), data_rx.recv())
+                .await
+                .is_err(),
+            "zero-length write must not enqueue FIN"
+        );
+
+        stream.write_all(b"after-empty").await.unwrap();
+        let (stream_id, data) = data_rx.recv().await.unwrap();
+        assert_eq!(stream_id, 7);
+        assert_eq!(data.as_ref(), b"after-empty");
     }
 
     #[tokio::test]

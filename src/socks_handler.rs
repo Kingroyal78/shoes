@@ -1,3 +1,4 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -158,6 +159,7 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     write_all(&mut server_stream, &[VER_SOCKS5, supported_method]).await?;
+    server_stream.flush().await?;
 
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
@@ -208,6 +210,7 @@ pub async fn setup_socks_server_stream_inner(
         }
 
         write_all(&mut server_stream, &[VER_AUTH, RESULT_SUCCESS]).await?;
+        server_stream.flush().await?;
     }
 
     let connection_request = stream_reader.read_slice(&mut server_stream, 3).await?;
@@ -224,6 +227,7 @@ pub async fn setup_socks_server_stream_inner(
             None => {
                 let response = build_error_response(REPLY_COMMAND_NOT_SUPPORTED);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "UDP ASSOCIATE not enabled",
@@ -298,6 +302,7 @@ pub async fn setup_socks_server_stream_inner(
                 stream: Box::new(uot_stream),
                 need_initial_flush: false,
                 proxy_selector: proxy_selector.clone(),
+                authenticated_user: None,
             });
         } else if host == UOT_V2_MAGIC_ADDRESS {
             if udp_bind_ip.is_none() {
@@ -330,6 +335,7 @@ pub async fn setup_socks_server_stream_inner(
                     stream: Box::new(uot_v2_stream),
                     need_initial_flush: false,
                     proxy_selector: proxy_selector.clone(),
+                    authenticated_user: None,
                 });
             } else {
                 // V2 Non-connect mode: Same as V1 (multi-destination)
@@ -348,6 +354,7 @@ pub async fn setup_socks_server_stream_inner(
                     stream: Box::new(uot_stream),
                     need_initial_flush: false,
                     proxy_selector: proxy_selector.clone(),
+                    authenticated_user: None,
                 });
             }
         }
@@ -360,6 +367,7 @@ pub async fn setup_socks_server_stream_inner(
         connection_success_response: Some(connection_success_response.to_vec().into_boxed_slice()),
         initial_remote_data: stream_reader.unparsed_data_owned(),
         proxy_selector: proxy_selector.clone(),
+        authenticated_user: None,
     })
 }
 
@@ -393,6 +401,7 @@ async fn handle_udp_associate(
                 log::error!("Failed to bind UDP socket: {}", e);
                 let response = build_error_response(REPLY_GENERAL_FAILURE);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(e);
             }
         };
@@ -543,7 +552,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(remote_location.location());
+        let location_bytes = try_write_location_to_vec(remote_location.location())?;
         write_all(&mut client_stream, &location_bytes).await?;
         client_stream.flush().await?;
 
@@ -750,7 +759,7 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
     }
 }
 
-pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+pub fn try_write_location_to_vec(location: &NetLocation) -> io::Result<Vec<u8>> {
     let (address, port) = location.components();
     let mut vec = match address {
         Address::Ipv4(v4addr) => {
@@ -767,6 +776,15 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
         }
         Address::Hostname(domain_name) => {
             let domain_name_bytes = domain_name.as_bytes();
+            if domain_name_bytes.len() > u8::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "SOCKS domain name is too long: {} bytes",
+                        domain_name_bytes.len()
+                    ),
+                ));
+            }
             let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
             vec.push(ADDR_TYPE_DOMAIN_NAME);
             vec.push(domain_name_bytes.len() as u8);
@@ -777,5 +795,30 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
 
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
-    vec
+    Ok(vec)
+}
+
+pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+    try_write_location_to_vec(location).expect("SOCKS address must fit in protocol encoding")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_write_location_rejects_domain_over_255_bytes() {
+        let location = NetLocation::new(Address::Hostname("a".repeat(256)), 443);
+        let err = try_write_location_to_vec(&location).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn try_write_location_accepts_255_byte_domain() {
+        let location = NetLocation::new(Address::Hostname("a".repeat(255)), 443);
+        let encoded = try_write_location_to_vec(&location).unwrap();
+        assert_eq!(encoded[0], ADDR_TYPE_DOMAIN_NAME);
+        assert_eq!(encoded[1], 255);
+        assert_eq!(encoded.len(), 1 + 1 + 255 + 2);
+    }
 }

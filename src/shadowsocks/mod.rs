@@ -4,6 +4,7 @@ mod default_key;
 mod salt_checker;
 mod shadowsocks_cipher;
 mod shadowsocks_key;
+pub(crate) mod shadowsocks_obfs;
 mod shadowsocks_stream;
 mod shadowsocks_stream_type;
 mod shadowsocks_tcp_handler;

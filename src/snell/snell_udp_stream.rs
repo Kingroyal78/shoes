@@ -1,4 +1,5 @@
 use futures::ready;
+use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,6 +13,59 @@ use crate::async_stream::{
     AsyncWriteTargetedMessage,
 };
 use crate::util::allocate_vec;
+
+fn snell_udp_packet_too_large_error(
+    payload_len: usize,
+    header_len: usize,
+    max_payload_size: usize,
+) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "Snell UDP packet length {} exceeds max encrypted message payload length {}",
+            payload_len.saturating_add(header_len),
+            max_payload_size
+        ),
+    )
+}
+
+fn validate_snell_udp_write_len(
+    payload_len: usize,
+    header_len: usize,
+    max_payload_size: usize,
+    write_buf_len: usize,
+) -> std::io::Result<()> {
+    let packet_len = payload_len.checked_add(header_len).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "Snell UDP packet length overflows usize",
+        )
+    })?;
+    if packet_len > max_payload_size {
+        return Err(snell_udp_packet_too_large_error(
+            payload_len,
+            header_len,
+            max_payload_size,
+        ));
+    }
+    if packet_len > write_buf_len {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Snell UDP packet length {packet_len} exceeds write buffer {write_buf_len}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snell_udp_read_capacity(payload_len: usize, remaining: usize) -> std::io::Result<()> {
+    if payload_len > remaining {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Snell UDP payload length {payload_len} exceeds read buffer {remaining}"),
+        ));
+    }
+    Ok(())
+}
 
 pub struct SnellUdpStream {
     stream: Box<dyn AsyncMessageStream>,
@@ -124,6 +178,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
             )
         };
 
+        validate_snell_udp_read_capacity(len - data_offset, buf.remaining())?;
         buf.put_slice(&this.read_buf[data_offset..len]);
         Poll::Ready(Ok(location))
     }
@@ -140,18 +195,25 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
 
         if this.write_buf_end_offset > 0 {
             // Buffer may be written but flush incomplete; continues in that case.
-            if let Poll::Ready(Err(e)) = Pin::new(&mut this).poll_flush_message(cx) {
-                return Poll::Ready(Err(e));
-            }
-            if this.write_buf_end_offset > 0 {
-                return Poll::Pending;
+            match Pin::new(&mut this).poll_flush_message(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
 
         let buf_len = buf.len();
-        if buf_len + 19 > this.write_buf.len() {
-            // TODO: if it's too big, we need to split up the message into this.max_payload_size chunks.
-            panic!("single message is larger than our write buf: {buf_len}");
+        let header_len = match source {
+            SocketAddr::V4(_) => 7,
+            SocketAddr::V6(_) => 19,
+        };
+        if let Err(e) = validate_snell_udp_write_len(
+            buf_len,
+            header_len,
+            this.max_payload_size,
+            this.write_buf.len(),
+        ) {
+            return Poll::Ready(Err(e));
         }
 
         let offset = match source {
@@ -310,6 +372,7 @@ impl AsyncReadSourcedMessage for SnellUdpClientStream {
             ))));
         };
 
+        validate_snell_udp_read_capacity(len - data_offset, buf.remaining())?;
         buf.put_slice(&this.read_buf[data_offset..len]);
         Poll::Ready(Ok(source_addr))
     }
@@ -326,22 +389,38 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
         let mut this = self.get_mut();
 
         if this.write_buf_end_offset > 0 {
-            if let Poll::Ready(Err(e)) = Pin::new(&mut this).poll_flush_message(cx) {
-                return Poll::Ready(Err(e));
-            }
-            if this.write_buf_end_offset > 0 {
-                return Poll::Pending;
+            match Pin::new(&mut this).poll_flush_message(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
 
         let buf_len = buf.len();
-        // Max header: cmd(1) + addr_len(1) + ip_version(1) + ipv6(16) + port(2) = 21
-        if buf_len + 21 > this.write_buf.len() {
-            panic!("single message is larger than our write buf: {buf_len}");
+        let header_len = match target.address() {
+            Address::Ipv4(_) => 9,
+            Address::Ipv6(_) => 21,
+            Address::Hostname(hostname) => {
+                let hostname_len = hostname.len();
+                if hostname_len > 255 {
+                    return Poll::Ready(Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "hostname too long",
+                    )));
+                }
+                2 + hostname_len + 2
+            }
+        };
+        if let Err(e) = validate_snell_udp_write_len(
+            buf_len,
+            header_len,
+            this.max_payload_size,
+            this.write_buf.len(),
+        ) {
+            return Poll::Ready(Err(e));
         }
 
         this.write_buf[0] = 1; // cmd = data
-
         let offset = match target.address() {
             Address::Ipv4(ip) => {
                 // address_len = 0 means IP address follows
@@ -361,9 +440,6 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
             Address::Hostname(hostname) => {
                 let hostname_bytes = hostname.as_bytes();
                 let hostname_len = hostname_bytes.len();
-                if hostname_len > 255 {
-                    return Poll::Ready(Err(std::io::Error::other("hostname too long")));
-                }
                 this.write_buf[1] = hostname_len as u8;
                 this.write_buf[2..2 + hostname_len].copy_from_slice(hostname_bytes);
                 let port_offset = 2 + hostname_len;
@@ -416,3 +492,231 @@ impl AsyncPing for SnellUdpClientStream {
 }
 
 impl AsyncSourcedMessageStream for SnellUdpClientStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future::poll_fn;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TestMessageIo {
+        reads: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl TestMessageIo {
+        fn with_read(packet: Vec<u8>) -> Self {
+            let this = Self::default();
+            this.reads.lock().unwrap().push_back(packet);
+            this
+        }
+
+        fn written(&self) -> Vec<Vec<u8>> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl AsyncReadMessage for TestMessageIo {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Some(packet) = self.reads.lock().unwrap().pop_front() else {
+                return Poll::Ready(Ok(()));
+            };
+            if packet.len() > buf.remaining() {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "test packet exceeds read buffer",
+                )));
+            }
+            buf.put_slice(&packet);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWriteMessage for TestMessageIo {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<()>> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for TestMessageIo {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for TestMessageIo {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for TestMessageIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for TestMessageIo {}
+
+    #[tokio::test]
+    async fn server_read_parses_hostname_target() {
+        let mut packet = vec![1, 11];
+        packet.extend_from_slice(b"example.com");
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(b"query");
+
+        let io = TestMessageIo::with_read(packet);
+        let mut stream = SnellUdpStream::new(Box::new(io), 0x3fff);
+
+        let mut read_buf = [0u8; 32];
+        let mut read = ReadBuf::new(&mut read_buf);
+        let target = poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut read))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target,
+            NetLocation::new(Address::Hostname("example.com".to_string()), 53)
+        );
+        assert_eq!(read.filled(), b"query");
+    }
+
+    #[tokio::test]
+    async fn server_write_sourced_message_encodes_ipv4_response() {
+        let io = TestMessageIo::default();
+        let writes = io.clone();
+        let mut stream = SnellUdpStream::new(Box::new(io), 0x3fff);
+        let source: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_sourced_message(cx, b"answer", &source))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writes.written(),
+            vec![vec![
+                4, 127, 0, 0, 1, 0x14, 0xb4, b'a', b'n', b's', b'w', b'e', b'r'
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn server_write_sourced_message_rejects_oversized_packet_without_panic() {
+        let io = TestMessageIo::default();
+        let writes = io.clone();
+        let mut stream = SnellUdpStream::new(Box::new(io), 12);
+        let source: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+
+        let err =
+            poll_fn(|cx| Pin::new(&mut stream).poll_write_sourced_message(cx, b"123456", &source))
+                .await
+                .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(writes.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_read_sourced_message_parses_ipv6_response() {
+        let source: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut packet = vec![6];
+        packet.extend_from_slice(&source.octets());
+        packet.extend_from_slice(&853u16.to_be_bytes());
+        packet.extend_from_slice(b"answer");
+
+        let io = TestMessageIo::with_read(packet);
+        let mut stream = SnellUdpClientStream::new(Box::new(io), 0x3fff);
+
+        let mut read_buf = [0u8; 32];
+        let mut read = ReadBuf::new(&mut read_buf);
+        let got_source =
+            poll_fn(|cx| Pin::new(&mut stream).poll_read_sourced_message(cx, &mut read))
+                .await
+                .unwrap();
+
+        assert_eq!(got_source, SocketAddr::new(source.into(), 853));
+        assert_eq!(read.filled(), b"answer");
+    }
+
+    #[tokio::test]
+    async fn client_write_targeted_message_encodes_domain_request() {
+        let io = TestMessageIo::default();
+        let writes = io.clone();
+        let mut stream = SnellUdpClientStream::new(Box::new(io), 0x3fff);
+        let target = NetLocation::new(Address::Hostname("dns.example".to_string()), 53);
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_targeted_message(cx, b"query", &target))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+
+        let mut expected = vec![1, 11];
+        expected.extend_from_slice(b"dns.example");
+        expected.extend_from_slice(&53u16.to_be_bytes());
+        expected.extend_from_slice(b"query");
+        assert_eq!(writes.written(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn client_write_targeted_message_rejects_oversized_packet_without_panic() {
+        let io = TestMessageIo::default();
+        let writes = io.clone();
+        let mut stream = SnellUdpClientStream::new(Box::new(io), 10);
+        let target = NetLocation::new(Address::Hostname("a".to_string()), 53);
+
+        let err =
+            poll_fn(|cx| Pin::new(&mut stream).poll_write_targeted_message(cx, b"123456", &target))
+                .await
+                .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(writes.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_rejects_payload_larger_than_caller_buffer_without_panic() {
+        let mut packet = vec![1, 0, 4, 8, 8, 8, 8];
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(b"abcdef");
+
+        let io = TestMessageIo::with_read(packet);
+        let mut stream = SnellUdpStream::new(Box::new(io), 0x3fff);
+
+        let mut read_buf = [0u8; 3];
+        let mut read = ReadBuf::new(&mut read_buf);
+        let err = poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut read))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+}

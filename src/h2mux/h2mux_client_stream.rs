@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::future::poll_fn;
 use h2::client::ResponseFuture;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
@@ -37,8 +38,8 @@ pub struct H2MuxClientStream {
     shutdown_sent: bool,
     /// Encoded stream request bytes to prepend on first write (None after written)
     request_bytes: Option<Bytes>,
-    /// Pending write data from partial send (combined_buffer, user_data_len, bytes_sent)
-    pending_write: Option<(Bytes, usize, usize)>,
+    /// Offset into request_bytes when the stream request was partially sent.
+    request_offset: usize,
     /// Destination for logging
     destination: NetLocation,
     /// Whether we've read the status response
@@ -93,10 +94,14 @@ impl H2MuxClientStream {
             recv_buf: Bytes::new(),
             shutdown_sent: false,
             request_bytes: Some(request_bytes),
-            pending_write: None,
+            request_offset: 0,
             destination,
             response_read: false,
         })
+    }
+
+    pub(super) async fn write_stream_request(&mut self) -> io::Result<()> {
+        poll_fn(|cx| self.poll_send_request(cx)).await
     }
 
     /// Resolve the pending receiver into a RecvStream.
@@ -287,6 +292,10 @@ impl H2MuxClientStream {
 
     /// Internal poll_write for data after request is written.
     fn poll_send_data(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         let current_capacity = self.send.capacity();
         if current_capacity < buf.len() {
             self.send.reserve_capacity(buf.len());
@@ -295,6 +304,9 @@ impl H2MuxClientStream {
         match self.send.poll_capacity(cx) {
             Poll::Ready(Some(Ok(capacity))) => {
                 let to_send = buf.len().min(capacity);
+                if to_send == 0 {
+                    return Poll::Pending;
+                }
                 self.send
                     .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
                     .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
@@ -310,6 +322,60 @@ impl H2MuxClientStream {
             Poll::Pending => Poll::Pending,
         }
     }
+
+    fn poll_send_request(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let Some(request_len) = self.request_bytes.as_ref().map(Bytes::len) else {
+                self.request_offset = 0;
+                return Poll::Ready(Ok(()));
+            };
+
+            if self.request_offset >= request_len {
+                self.request_bytes = None;
+                self.request_offset = 0;
+                return Poll::Ready(Ok(()));
+            }
+
+            let remaining_len = request_len - self.request_offset;
+            let current_capacity = self.send.capacity();
+            if current_capacity < remaining_len {
+                self.send.reserve_capacity(remaining_len);
+            }
+
+            match self.send.poll_capacity(cx) {
+                Poll::Ready(Some(Ok(capacity))) => {
+                    let to_send = remaining_len.min(capacity);
+                    if to_send == 0 {
+                        return Poll::Pending;
+                    }
+
+                    let start = self.request_offset;
+                    let end = start + to_send;
+                    let chunk = self
+                        .request_bytes
+                        .as_ref()
+                        .expect("request bytes must exist")
+                        .slice(start..end);
+                    self.send
+                        .send_data(chunk, false)
+                        .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
+                    self.request_offset = end;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "H2 poll_capacity error: {e}"
+                    ))));
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "H2 stream closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 impl AsyncRead for H2MuxClientStream {
@@ -318,6 +384,10 @@ impl AsyncRead for H2MuxClientStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // First, resolve the recv stream if not yet done
         if self.recv.is_none() {
             match self.poll_resolve_recv(cx) {
@@ -384,101 +454,37 @@ impl AsyncWrite for H2MuxClientStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // First, flush any pending partial write
-        if let Some((pending_data, user_len, sent)) = self.pending_write.take() {
-            let remaining = &pending_data[sent..];
-            let current_capacity = self.send.capacity();
-            if current_capacity < remaining.len() {
-                self.send.reserve_capacity(remaining.len());
-            }
-
-            match self.send.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(capacity))) => {
-                    let to_send = remaining.len().min(capacity);
-                    self.send
-                        .send_data(pending_data.slice(sent..sent + to_send), false)
-                        .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
-
-                    let new_sent = sent + to_send;
-                    if new_sent < pending_data.len() {
-                        // Still more to send
-                        self.pending_write = Some((pending_data, user_len, new_sent));
-                        return Poll::Pending;
-                    }
-                    // Pending write complete, return original user data length
-                    return Poll::Ready(Ok(user_len));
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 poll_capacity error: {e}"
-                    ))));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "H2 stream closed",
-                    )));
-                }
-                Poll::Pending => {
-                    self.pending_write = Some((pending_data, user_len, sent));
-                    return Poll::Pending;
-                }
+        if self.request_bytes.is_some() {
+            match self.poll_send_request(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
 
-        // Prepend StreamRequest on first write
-        if let Some(request_bytes) = self.request_bytes.take() {
-            let request_len = request_bytes.len();
-            let mut combined = BytesMut::with_capacity(request_len + buf.len());
-            combined.put_slice(&request_bytes);
-            combined.put_slice(buf);
-            let combined = combined.freeze();
-
-            let current_capacity = self.send.capacity();
-            if current_capacity < combined.len() {
-                self.send.reserve_capacity(combined.len());
-            }
-
-            match self.send.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(capacity))) => {
-                    let to_send = combined.len().min(capacity);
-                    self.send
-                        .send_data(combined.slice(..to_send), false)
-                        .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
-
-                    if to_send < combined.len() {
-                        // Partial write - track remaining data
-                        let user_written = to_send.saturating_sub(request_len).min(buf.len());
-                        self.pending_write = Some((combined, user_written, to_send));
-                        Poll::Pending
-                    } else {
-                        // Full write complete
-                        Poll::Ready(Ok(buf.len()))
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(format!(
-                    "H2 poll_capacity error: {e}"
-                )))),
-                Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "H2 stream closed",
-                ))),
-                Poll::Pending => {
-                    // No data sent yet - restore original request bytes only
-                    self.request_bytes = Some(request_bytes);
-                    Poll::Pending
-                }
-            }
-        } else {
-            self.poll_send_data(cx, buf)
-        }
+        self.poll_send_data(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.request_bytes.is_some() {
+            match self.poll_send_request(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.request_bytes.is_some() {
+            match self.poll_send_request(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         if !self.shutdown_sent {
             match self.send.send_data(Bytes::new(), true) {
                 Ok(()) => self.shutdown_sent = true,

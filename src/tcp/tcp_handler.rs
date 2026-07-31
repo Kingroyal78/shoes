@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,7 +8,40 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::ClientProxySelector;
 
+pub trait TrafficRecorder: Send + Sync + Debug {
+    fn add_traffic(&self, node_tag: &str, uid: u64, upload: u64, download: u64);
+    fn flush_pending_traffic(&self) {}
+    fn add_alive_ip_and_check_limit(
+        &self,
+        node_tag: &str,
+        uid: u64,
+        ip: std::net::IpAddr,
+        device_limit: Option<u64>,
+    ) -> bool;
+    fn remove_alive_ip(&self, node_tag: &str, uid: u64, ip: std::net::IpAddr);
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedUser {
+    pub node_tag: String,
+    pub uid: u64,
+    pub user_key: String,
+    pub speed_limit: Option<u64>,
+    pub device_limit: Option<u64>,
+    pub recorder: Option<Arc<dyn TrafficRecorder>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerUser {
+    pub credential: String,
+    pub authenticated_user: AuthenticatedUser,
+}
+
 pub enum TcpServerSetupResult {
+    PeerAddressOverride {
+        peer_addr: Option<SocketAddr>,
+        result: Box<TcpServerSetupResult>,
+    },
     TcpForward {
         remote_location: NetLocation,
         stream: Box<dyn AsyncStream>,
@@ -18,6 +52,7 @@ pub enum TcpServerSetupResult {
         initial_remote_data: Option<Box<[u8]>>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        authenticated_user: Option<AuthenticatedUser>,
     },
     BidirectionalUdp {
         need_initial_flush: bool,
@@ -25,18 +60,21 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn AsyncMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        authenticated_user: Option<AuthenticatedUser>,
     },
     MultiDirectionalUdp {
         need_initial_flush: bool,
         stream: Box<dyn AsyncTargetedMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        authenticated_user: Option<AuthenticatedUser>,
     },
     SessionBasedUdp {
         need_initial_flush: bool,
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        authenticated_user: Option<AuthenticatedUser>,
     },
     /// Connection has been fully handled (e.g., spawned as a background task).
     /// No further processing needed by the caller.
@@ -46,6 +84,9 @@ pub enum TcpServerSetupResult {
 impl TcpServerSetupResult {
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         match self {
+            TcpServerSetupResult::PeerAddressOverride { result, .. } => {
+                result.set_need_initial_flush(need_initial_flush);
+            }
             TcpServerSetupResult::TcpForward {
                 need_initial_flush: flush,
                 ..
@@ -75,6 +116,14 @@ pub trait TcpServerHandler: Send + Sync + Debug {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult>;
+
+    async fn setup_server_stream_with_peer_addr(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        _peer_addr: Option<SocketAddr>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream(server_stream).await
+    }
 }
 
 pub struct TcpClientSetupResult {

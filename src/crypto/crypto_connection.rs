@@ -299,6 +299,7 @@ mod tests {
             min_client_version: None,
             max_client_version: None,
             cipher_suites: Vec::new(),
+            selected_alpn: None,
         };
         let reality_server = RealityServerConnection::new(server_config).unwrap();
         let server_conn = CryptoConnection::new_reality_server(reality_server);

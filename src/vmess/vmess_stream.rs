@@ -106,6 +106,15 @@ pub struct VmessStream {
     is_eof: bool,
 }
 
+pub struct VmessRawStream {
+    stream: Box<dyn AsyncStream>,
+    initial_read_data: Option<BytesMut>,
+    initial_read_offset: usize,
+    pending_prefix_write: Option<BytesMut>,
+    prefix_write_offset: usize,
+}
+
+#[derive(Debug)]
 enum DecryptState {
     NeedData,
     BufferFull,
@@ -423,17 +432,26 @@ impl VmessStream {
                     ));
                 }
 
-                if self.tag_len > 0 && (data_len - padding_len) < self.tag_len {
+                let data_without_padding_len = data_len.checked_sub(padding_len).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "data length ({data_len}) is smaller than padding length ({padding_len})"
+                        ),
+                    )
+                })?;
+
+                if data_without_padding_len < self.tag_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "data length ({}) is smaller than tag length ({})",
-                            data_len, self.tag_len
+                            data_without_padding_len, self.tag_len
                         ),
                     ));
                 }
 
-                if data_len - padding_len == self.tag_len {
+                if data_without_padding_len == self.tag_len {
                     // TODO: should we bother to decrypt the eof packet?
                     return Ok(DecryptState::ReceivedEof);
                 }
@@ -449,8 +467,13 @@ impl VmessStream {
                     return Ok(DecryptState::NeedData);
                 }
 
-                let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                let processed_data_len = data_without_padding_len - self.tag_len;
+                if processed_data_len
+                    > self
+                        .processed_buf
+                        .len()
+                        .saturating_sub(self.processed_end_offset)
+                {
                     self.unprocessed_pending_len = Some((padding_len, data_len));
                     if self.unprocessed_start_offset == self.unprocessed_end_offset {
                         self.unprocessed_start_offset = 0;
@@ -467,8 +490,31 @@ impl VmessStream {
                     return Ok(DecryptState::NeedData);
                 }
 
-                let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                let data_without_padding_len = data_len.checked_sub(padding_len).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "data length ({data_len}) is smaller than padding length ({padding_len})"
+                        ),
+                    )
+                })?;
+                if data_without_padding_len < self.tag_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "data length ({}) is smaller than tag length ({})",
+                            data_without_padding_len, self.tag_len
+                        ),
+                    ));
+                }
+
+                let processed_data_len = data_without_padding_len - self.tag_len;
+                if processed_data_len
+                    > self
+                        .processed_buf
+                        .len()
+                        .saturating_sub(self.processed_end_offset)
+                {
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -676,6 +722,110 @@ impl VmessStream {
         self.unprocessed_start_offset = 0;
     }
 }
+
+impl VmessRawStream {
+    pub fn new(
+        stream: Box<dyn AsyncStream>,
+        prefix_write_bytes: Option<BytesMut>,
+        initial_read_data: Option<BytesMut>,
+    ) -> Self {
+        Self {
+            stream,
+            initial_read_data,
+            initial_read_offset: 0,
+            pending_prefix_write: prefix_write_bytes,
+            prefix_write_offset: 0,
+        }
+    }
+
+    fn poll_write_prefix(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while let Some(prefix) = self.pending_prefix_write.as_ref() {
+            if self.prefix_write_offset == prefix.len() {
+                self.pending_prefix_write = None;
+                self.prefix_write_offset = 0;
+                continue;
+            }
+
+            match Pin::new(&mut self.stream).poll_write(cx, &prefix[self.prefix_write_offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "write VMess raw response prefix eof",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    self.prefix_write_offset += written;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for VmessRawStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(data) = self.initial_read_data.take() {
+            let remaining = &data[self.initial_read_offset..];
+            let amount = remaining.len().min(buf.remaining());
+            if amount > 0 {
+                buf.put_slice(&remaining[..amount]);
+                self.initial_read_offset += amount;
+                if self.initial_read_offset < data.len() {
+                    self.initial_read_data = Some(data);
+                } else {
+                    self.initial_read_offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            self.initial_read_offset = 0;
+        }
+
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for VmessRawStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        ready!(self.poll_write_prefix(cx))?;
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        ready!(self.poll_write_prefix(cx))?;
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        ready!(self.poll_write_prefix(cx))?;
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for VmessRawStream {
+    fn supports_ping(&self) -> bool {
+        self.stream.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.stream).poll_write_ping(cx)
+    }
+}
+
+impl AsyncStream for VmessRawStream {}
 
 impl AsyncRead for VmessStream {
     fn poll_read(
@@ -1161,6 +1311,55 @@ mod tests {
     use aws_lc_rs::aead::{CHACHA20_POLY1305, UnboundKey};
     use shake::Shake128;
     use shake::digest::{ExtendableOutput, Update};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();
@@ -1181,16 +1380,47 @@ mod tests {
         assert_eq!(value, mask2.next_u16());
     }
 
+    #[tokio::test]
+    async fn raw_stream_reads_initial_data_before_inner_stream() {
+        let (_peer, stream) = tokio::io::duplex(64);
+        let mut raw = VmessRawStream::new(
+            Box::new(TestStream(stream)),
+            None,
+            Some(BytesMut::from(&b"header-body"[..])),
+        );
+
+        let mut buf = [0u8; 11];
+        raw.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(&buf, b"header-body");
+    }
+
+    #[tokio::test]
+    async fn raw_stream_writes_response_prefix_before_payload() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let mut raw = VmessRawStream::new(
+            Box::new(TestStream(stream)),
+            Some(BytesMut::from(&b"prefix"[..])),
+            None,
+        );
+
+        raw.write_all(b"payload").await.unwrap();
+        raw.flush().await.unwrap();
+
+        let mut buf = [0u8; 13];
+        peer.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(&buf, b"prefixpayload");
+    }
+
     #[test]
     fn test_length_mask_with_padding() {
         let reader = create_shake128_reader(&[0u8; 16]);
         let mut mask = LengthMask::new(reader, true);
 
-        let (padding, length_mask) = mask.next_values();
+        let (padding, _length_mask) = mask.next_values();
         // Padding should be less than MAX_PADDING_LEN (64)
         assert!(padding < MAX_PADDING_LEN);
-        // Length mask is just a u16
-        assert!(length_mask <= u16::MAX);
     }
 
     #[test]
@@ -1234,17 +1464,14 @@ mod tests {
         let mut mask = LengthMask::new(reader, true);
 
         // Get first pair
-        let (padding1, length_mask1) = mask.next_values();
+        let (padding1, _length_mask1) = mask.next_values();
         // Get second pair
-        let (padding2, length_mask2) = mask.next_values();
+        let (padding2, _length_mask2) = mask.next_values();
 
         // Values should be different (SHAKE128 produces pseudo-random output)
         // Though in rare cases they could be equal, so we just check they're valid
         assert!(padding1 < MAX_PADDING_LEN);
         assert!(padding2 < MAX_PADDING_LEN);
-        // Length masks can be any u16 value
-        assert!(length_mask1 <= u16::MAX);
-        assert!(length_mask2 <= u16::MAX);
     }
 
     #[test]
@@ -1349,6 +1576,68 @@ mod tests {
         let masked = length ^ mask;
         // XOR is reversible
         assert_eq!(masked ^ mask, length);
+    }
+
+    fn vmess_stream_without_encryption() -> VmessStream {
+        let (_peer, stream) = tokio::io::duplex(64);
+        VmessStream::new(
+            Box::new(TestStream(stream)),
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn nonzero_padding_mask() -> ([u8; 16], usize, u16) {
+        for seed in 0u8..=u8::MAX {
+            let mut iv = [0u8; 16];
+            iv[0] = seed;
+            let mut mask = LengthMask::new(create_shake128_reader(&iv), true);
+            let (padding_len, length_mask) = mask.next_values();
+            if padding_len > 0 {
+                return (iv, padding_len, length_mask);
+            }
+        }
+        panic!("could not find nonzero VMess padding mask");
+    }
+
+    #[test]
+    fn try_decrypt_rejects_data_len_smaller_than_padding_without_underflow() {
+        let (iv, padding_len, length_mask) = nonzero_padding_mask();
+        let mut stream = vmess_stream_without_encryption();
+        stream.read_length_mask = Some(LengthMask::new(create_shake128_reader(&iv), true));
+        let invalid_data_len = padding_len - 1;
+        let masked_len = (invalid_data_len as u16) ^ length_mask;
+        stream.unprocessed_buf[0..2].copy_from_slice(&masked_len.to_be_bytes());
+        stream.unprocessed_end_offset = 2;
+
+        let err = stream.try_decrypt().unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("smaller than padding length"));
+    }
+
+    #[test]
+    fn try_decrypt_accepts_chunk_that_exactly_fills_processed_buffer() {
+        let mut stream = vmess_stream_without_encryption();
+        let data_len = MAX_ENCRYPTED_READ_DATA_SIZE;
+        stream.unprocessed_buf[0..2].copy_from_slice(&(data_len as u16).to_be_bytes());
+        for (idx, byte) in stream.unprocessed_buf[2..2 + data_len]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (idx % 251) as u8;
+        }
+        stream.unprocessed_end_offset = 2 + data_len;
+
+        let state = stream.try_decrypt().unwrap();
+
+        assert!(matches!(state, DecryptState::Success));
+        assert_eq!(stream.processed_end_offset, stream.processed_buf.len());
     }
 
     #[test]

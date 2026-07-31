@@ -3,8 +3,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
+use aes_gcm::aead::consts::U12;
+use aes_gcm::aead::{AeadInOut, KeyInit};
+use aes_gcm::aes::Aes192;
+use aes_gcm::{AesGcm, Nonce as RustCryptoNonce};
 use aws_lc_rs::aead::{
-    Aad, Algorithm, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
+    Aad, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
 };
 use aws_lc_rs::error::Unspecified;
 use futures::ready;
@@ -15,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::aead_util::TAG_LEN;
 use super::salt_checker::SaltChecker;
+use super::shadowsocks_cipher::ShadowsocksAeadAlgorithm;
 use super::shadowsocks_key::ShadowsocksKey;
 use super::shadowsocks_stream_type::ShadowsocksStreamType;
 use crate::async_stream::{
@@ -22,6 +27,8 @@ use crate::async_stream::{
     AsyncStream, AsyncWriteMessage,
 };
 use crate::util::allocate_vec;
+
+type Aes192Gcm = AesGcm<Aes192, U12>;
 
 fn generate_iv(buf: &mut [u8]) {
     let mut rng = rand::rng();
@@ -34,18 +41,171 @@ impl IncreasingSequence {
     fn new() -> IncreasingSequence {
         IncreasingSequence([0u8; NONCE_LEN])
     }
-}
 
-impl NonceSequence for IncreasingSequence {
-    fn advance(&mut self) -> Result<Nonce, Unspecified> {
-        let ret = Nonce::assume_unique_for_key(self.0);
+    fn advance_bytes(&mut self) -> [u8; NONCE_LEN] {
+        let ret = self.0;
         for i in self.0.iter_mut() {
             *i = i.wrapping_add(1);
             if *i > 0 {
                 break;
             }
         }
-        Ok(ret)
+        ret
+    }
+}
+
+impl NonceSequence for IncreasingSequence {
+    fn advance(&mut self) -> Result<Nonce, Unspecified> {
+        Ok(Nonce::assume_unique_for_key(self.advance_bytes()))
+    }
+}
+
+enum ShadowsocksSealingKey {
+    AwsLc(SealingKey<IncreasingSequence>),
+    Aes192Gcm {
+        cipher: Box<Aes192Gcm>,
+        nonce: IncreasingSequence,
+    },
+}
+
+impl ShadowsocksSealingKey {
+    fn new(algorithm: ShadowsocksAeadAlgorithm, session_key: &[u8]) -> std::io::Result<Self> {
+        match algorithm {
+            ShadowsocksAeadAlgorithm::AwsLc(algorithm) => {
+                let unbound_key = UnboundKey::new(algorithm, session_key).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid Shadowsocks AEAD session key",
+                    )
+                })?;
+                Ok(Self::AwsLc(SealingKey::new(
+                    unbound_key,
+                    IncreasingSequence::new(),
+                )))
+            }
+            ShadowsocksAeadAlgorithm::Aes192Gcm => {
+                let cipher = Aes192Gcm::new_from_slice(session_key).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm session key",
+                    )
+                })?;
+                Ok(Self::Aes192Gcm {
+                    cipher: Box::new(cipher),
+                    nonce: IncreasingSequence::new(),
+                })
+            }
+        }
+    }
+
+    fn seal_in_place_separate_tag(&mut self, in_out: &mut [u8]) -> std::io::Result<[u8; TAG_LEN]> {
+        match self {
+            Self::AwsLc(key) => {
+                let tag = key
+                    .seal_in_place_separate_tag(Aad::empty(), in_out)
+                    .map_err(|_| std::io::Error::other("shadowsocks AEAD seal failed"))?;
+                let mut tag_bytes = [0u8; TAG_LEN];
+                tag_bytes.copy_from_slice(tag.as_ref());
+                Ok(tag_bytes)
+            }
+            Self::Aes192Gcm { cipher, nonce } => {
+                let nonce_bytes = nonce.advance_bytes();
+                let nonce: RustCryptoNonce<U12> = (&nonce_bytes[..]).try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm nonce length",
+                    )
+                })?;
+                let tag = cipher
+                    .encrypt_inout_detached(&nonce, b"", in_out.into())
+                    .map_err(|_| std::io::Error::other("aes-192-gcm seal failed"))?;
+                let mut tag_bytes = [0u8; TAG_LEN];
+                tag_bytes.copy_from_slice(tag.as_slice());
+                Ok(tag_bytes)
+            }
+        }
+    }
+}
+
+enum ShadowsocksOpeningKey {
+    AwsLc(OpeningKey<IncreasingSequence>),
+    Aes192Gcm {
+        cipher: Box<Aes192Gcm>,
+        nonce: IncreasingSequence,
+    },
+}
+
+impl ShadowsocksOpeningKey {
+    fn new(algorithm: ShadowsocksAeadAlgorithm, session_key: &[u8]) -> std::io::Result<Self> {
+        match algorithm {
+            ShadowsocksAeadAlgorithm::AwsLc(algorithm) => {
+                let unbound_key = UnboundKey::new(algorithm, session_key).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid Shadowsocks AEAD session key",
+                    )
+                })?;
+                Ok(Self::AwsLc(OpeningKey::new(
+                    unbound_key,
+                    IncreasingSequence::new(),
+                )))
+            }
+            ShadowsocksAeadAlgorithm::Aes192Gcm => {
+                let cipher = Aes192Gcm::new_from_slice(session_key).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm session key",
+                    )
+                })?;
+                Ok(Self::Aes192Gcm {
+                    cipher: Box::new(cipher),
+                    nonce: IncreasingSequence::new(),
+                })
+            }
+        }
+    }
+
+    fn open_in_place(&mut self, in_out: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::AwsLc(key) => key
+                .open_in_place(Aad::empty(), in_out)
+                .map(|_| ())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "open failed")),
+            Self::Aes192Gcm { cipher, nonce } => {
+                if in_out.len() < TAG_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "aes-192-gcm ciphertext is shorter than tag",
+                    ));
+                }
+                let nonce_bytes = nonce.advance_bytes();
+                let nonce: RustCryptoNonce<U12> = (&nonce_bytes[..]).try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm nonce length",
+                    )
+                })?;
+                let split_at = in_out.len() - TAG_LEN;
+                let (payload, tag_bytes) = in_out.split_at_mut(split_at);
+                let tag_bytes: [u8; TAG_LEN] = tag_bytes.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm tag length",
+                    )
+                })?;
+                let tag: aes_gcm::Tag = (&tag_bytes[..]).try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid aes-192-gcm tag length",
+                    )
+                })?;
+                cipher
+                    .decrypt_inout_detached(&nonce, b"", payload.into(), &tag)
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "open failed")
+                    })
+            }
+        }
     }
 }
 
@@ -53,15 +213,15 @@ pub struct ShadowsocksStream {
     stream: Box<dyn AsyncStream>,
 
     stream_type: ShadowsocksStreamType,
-    algorithm: &'static Algorithm,
+    algorithm: ShadowsocksAeadAlgorithm,
     salt_len: usize,
     key: Arc<Box<dyn ShadowsocksKey>>,
     salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
     encrypt_iv: Box<[u8]>,
     decrypt_iv: Option<Box<[u8]>>,
 
-    sealing_key: SealingKey<IncreasingSequence>,
-    opening_key: Option<OpeningKey<IncreasingSequence>>,
+    sealing_key: ShadowsocksSealingKey,
+    opening_key: Option<ShadowsocksOpeningKey>,
 
     unprocessed_buf: Box<[u8]>,
     unprocessed_start_offset: usize,
@@ -88,11 +248,27 @@ enum DecryptState {
 
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
+fn shadowsocks_message_too_large_error(len: usize, max_len: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("Shadowsocks message length {len} exceeds max payload length {max_len}"),
+    )
+}
+
+fn shadowsocks_initial_payload_too_large_error(len: usize, max_len: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "Shadowsocks initial payload length {len} exceeds max encrypted packet capacity {max_len}"
+        ),
+    )
+}
+
 impl ShadowsocksStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
         stream_type: ShadowsocksStreamType,
-        algorithm: &'static Algorithm,
+        algorithm: ShadowsocksAeadAlgorithm,
         salt_len: usize,
         key: Arc<Box<dyn ShadowsocksKey>>,
         salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
@@ -111,8 +287,7 @@ impl ShadowsocksStream {
         generate_iv(&mut encrypt_iv);
 
         let session_key = key.create_session_key(&encrypt_iv);
-        let unbound_key = UnboundKey::new(algorithm, &session_key).unwrap();
-        let sealing_key = SealingKey::new(unbound_key, IncreasingSequence::new());
+        let sealing_key = ShadowsocksSealingKey::new(algorithm, &session_key).unwrap();
 
         Self {
             stream,
@@ -150,8 +325,7 @@ impl ShadowsocksStream {
     fn process_opening_key(&mut self) -> std::io::Result<()> {
         let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
         let session_key = self.key.create_session_key(decrypt_iv);
-        let unbound_key = UnboundKey::new(self.algorithm, &session_key).unwrap();
-        let opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
+        let opening_key = ShadowsocksOpeningKey::new(self.algorithm, &session_key)?;
         self.opening_key = Some(opening_key);
         Ok(())
     }
@@ -183,7 +357,6 @@ impl ShadowsocksStream {
                     .as_mut()
                     .unwrap()
                     .open_in_place(
-                        Aad::empty(),
                         &mut self.unprocessed_buf[self.unprocessed_start_offset
                             ..self.unprocessed_start_offset + data_length_len],
                     )
@@ -235,7 +408,6 @@ impl ShadowsocksStream {
             .as_mut()
             .unwrap()
             .open_in_place(
-                Aad::empty(),
                 &mut self.unprocessed_buf[self.unprocessed_start_offset
                     ..self.unprocessed_start_offset + pending_len_with_tag],
             )
@@ -297,11 +469,7 @@ impl ShadowsocksStream {
         }
     }
 
-    fn encrypt_single(
-        &mut self,
-        input: &[u8],
-        write_length_header: bool,
-    ) -> std::result::Result<(), Unspecified> {
+    fn encrypt_single(&mut self, input: &[u8], write_length_header: bool) -> std::io::Result<()> {
         let output = &mut self.write_cache[self.write_cache_end_offset..];
         let input_len = input.len();
 
@@ -311,9 +479,9 @@ impl ShadowsocksStream {
 
             let tag = self
                 .sealing_key
-                .seal_in_place_separate_tag(Aad::empty(), &mut output[0..2])?;
+                .seal_in_place_separate_tag(&mut output[0..2])?;
 
-            output[2..2 + TAG_LEN].copy_from_slice(&tag.as_ref()[0..TAG_LEN]);
+            output[2..2 + TAG_LEN].copy_from_slice(&tag[0..TAG_LEN]);
 
             2 + TAG_LEN
         } else {
@@ -324,10 +492,10 @@ impl ShadowsocksStream {
 
         let tag = self
             .sealing_key
-            .seal_in_place_separate_tag(Aad::empty(), &mut output[written..written + input_len])?;
+            .seal_in_place_separate_tag(&mut output[written..written + input_len])?;
         written += input_len;
 
-        output[written..written + TAG_LEN].copy_from_slice(&tag.as_ref()[0..TAG_LEN]);
+        output[written..written + TAG_LEN].copy_from_slice(&tag[0..TAG_LEN]);
 
         written += TAG_LEN;
 
@@ -365,6 +533,24 @@ impl ShadowsocksStream {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn poll_flush_cache(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.write_cache_end_offset > 0 {
+            match self.do_write_cache(cx) {
+                Ok(all_written) => {
+                    if !all_written {
+                        return Poll::Pending;
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+
+        Poll::Ready(Ok(()))
     }
 
     fn reset_unprocessed_buf_offset(&mut self) {
@@ -417,7 +603,6 @@ impl ShadowsocksStream {
                     .as_mut()
                     .unwrap()
                     .open_in_place(
-                        Aad::empty(),
                         &mut self.unprocessed_buf[self.salt_len..self.salt_len + 11 + TAG_LEN],
                     )
                     .is_err()
@@ -483,7 +668,6 @@ impl ShadowsocksStream {
                     .as_mut()
                     .unwrap()
                     .open_in_place(
-                        Aad::empty(),
                         &mut self.unprocessed_buf
                             [self.salt_len..self.salt_len + 11 + self.salt_len + TAG_LEN],
                     )
@@ -571,7 +755,9 @@ impl ShadowsocksStream {
                     buf.len(),
                     self.write_cache.len() - self.write_cache_end_offset - METADATA_SIZE,
                 );
-                assert!(handled_len > 0);
+                if handled_len == 0 {
+                    return Err(shadowsocks_initial_payload_too_large_error(buf.len(), 0));
+                }
 
                 self.encrypt_single(&buf[0..handled_len], true)
                     .map_err(|_| std::io::Error::other("failed to encrypt initial packet"))?;
@@ -579,9 +765,19 @@ impl ShadowsocksStream {
                 Ok(handled_len)
             }
             ShadowsocksStreamType::AEAD2022Server => {
-                assert!(!self.is_initial_read);
+                if self.is_initial_read {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "cannot write Shadowsocks AEAD2022 server response before reading request header",
+                    ));
+                }
 
-                let decrypt_iv = self.decrypt_iv.take().unwrap();
+                let decrypt_iv = self.decrypt_iv.take().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "missing Shadowsocks AEAD2022 request salt for server response",
+                    )
+                })?;
 
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
                 self.write_cache_end_offset = self.salt_len;
@@ -593,14 +789,12 @@ impl ShadowsocksStream {
                 response_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
                 response_header[9..9 + self.salt_len].copy_from_slice(&decrypt_iv);
 
-                let handled_len = std::cmp::min(
-                    buf.len(),
-                    // subtract TAG_LEN and not METADATA_SIZE because we don't need the length header + tag.
-                    self.write_cache.len()
-                        - self.salt_len
-                        - (response_header.len() + TAG_LEN)
-                        - TAG_LEN,
-                );
+                // subtract TAG_LEN and not METADATA_SIZE because we don't need the length header + tag.
+                let max_initial_payload_len = self.write_cache.len()
+                    - self.salt_len
+                    - (response_header.len() + TAG_LEN)
+                    - TAG_LEN;
+                let handled_len = std::cmp::min(buf.len(), max_initial_payload_len);
 
                 response_header[9 + self.salt_len] = (handled_len >> 8) as u8;
                 response_header[9 + self.salt_len + 1] = (handled_len & 0xff) as u8;
@@ -628,13 +822,16 @@ impl ShadowsocksStream {
                 // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
                 // with the address and padding, and we need to send it all off in a single packet.
                 let buf_len = buf.len();
-                assert!(
-                    buf_len
-                        <= self.write_cache.len()
-                            - self.salt_len
-                            - (request_header.len() + TAG_LEN)
-                            - TAG_LEN
-                );
+                let max_initial_payload_len = self.write_cache.len()
+                    - self.salt_len
+                    - (request_header.len() + TAG_LEN)
+                    - TAG_LEN;
+                if buf_len > max_initial_payload_len {
+                    return Err(shadowsocks_initial_payload_too_large_error(
+                        buf_len,
+                        max_initial_payload_len,
+                    ));
+                }
 
                 request_header[9] = (buf_len >> 8) as u8;
                 request_header[10] = (buf_len & 0xff) as u8;
@@ -657,6 +854,10 @@ impl ShadowsocksStream {
         buf: &mut ReadBuf<'_>,
         fill_buffer: bool,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let this = self.get_mut();
 
         if this.is_initial_read && !this.is_eof {
@@ -740,6 +941,39 @@ impl ShadowsocksStream {
     }
 }
 
+pub fn try_decrypt_aead_length(
+    algorithm: ShadowsocksAeadAlgorithm,
+    key: &dyn ShadowsocksKey,
+    salt: &[u8],
+    encrypted_length: &[u8],
+    max_payload_len: usize,
+) -> std::io::Result<usize> {
+    if encrypted_length.len() != 2 + TAG_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid encrypted length chunk size {}, expected {}",
+                encrypted_length.len(),
+                2 + TAG_LEN
+            ),
+        ));
+    }
+    let session_key = key.create_session_key(salt);
+    let mut opening_key = ShadowsocksOpeningKey::new(algorithm, &session_key)?;
+    let mut chunk = encrypted_length.to_vec();
+    opening_key
+        .open_in_place(&mut chunk)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "open failed"))?;
+    let len = ((chunk[0] as usize) << 8) | (chunk[1] as usize);
+    if len > max_payload_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "data length larger than max allowed size",
+        ));
+    }
+    Ok(len)
+}
+
 impl AsyncRead for ShadowsocksStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -758,11 +992,20 @@ impl AsyncWrite for ShadowsocksStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         // TODO: This might not be optimal because we always immediately packetize `buf`, should we
         // do something smarter?
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         let this = self.get_mut();
 
         if this.is_initial_write {
             let handled_len = this.process_write_header(buf)?;
-            assert!(handled_len > 0 && this.write_cache_end_offset > 0);
+            if handled_len == 0 || this.write_cache_end_offset == 0 {
+                return Poll::Ready(Err(shadowsocks_initial_payload_too_large_error(
+                    buf.len(),
+                    0,
+                )));
+            }
             this.is_initial_write = false;
 
             if let Err(e) = this.do_write_cache(cx) {
@@ -810,30 +1053,18 @@ impl AsyncWrite for ShadowsocksStream {
         cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.write_cache_end_offset == 0 {
-            return Pin::new(&mut this.stream).poll_flush(cx);
-        }
-        while this.write_cache_end_offset > 0 {
-            match this.do_write_cache(cx) {
-                Ok(all_written) => {
-                    if !all_written {
-                        return Poll::Pending;
-                    }
-                }
-                Err(e) => {
-                    return Poll::Ready(Err(e));
-                }
-            }
-            ready!(Pin::new(&mut this.stream).poll_flush(cx))?;
-        }
-        Poll::Ready(Ok(()))
+        ready!(this.poll_flush_cache(cx))?;
+        Pin::new(&mut this.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        let this = self.get_mut();
+        ready!(this.poll_flush_cache(cx))?;
+        ready!(Pin::new(&mut this.stream).poll_flush(cx))?;
+        Pin::new(&mut this.stream).poll_shutdown(cx)
     }
 }
 
@@ -850,24 +1081,54 @@ impl AsyncReadMessage for ShadowsocksStream {
 impl AsyncWriteMessage for ShadowsocksStream {
     fn poll_write_message(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
         let this = self.get_mut();
+        let max_payload_len = this.stream_type.max_payload_len();
+        if buf.len() > max_payload_len {
+            return Poll::Ready(Err(shadowsocks_message_too_large_error(
+                buf.len(),
+                max_payload_len,
+            )));
+        }
 
         if this.is_initial_write {
             let handled_len = this.process_write_header(buf)?;
-            assert!(handled_len == buf.len());
+            if handled_len != buf.len() {
+                return Poll::Ready(Err(shadowsocks_initial_payload_too_large_error(
+                    buf.len(),
+                    handled_len,
+                )));
+            }
             this.is_initial_write = false;
             return Poll::Ready(Ok(()));
         }
 
-        let write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
-        let packet_size = buf.len() + METADATA_SIZE;
-        assert!(packet_size <= this.write_cache.len());
+        let mut write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
+        let packet_size = buf.len().checked_add(METADATA_SIZE).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Shadowsocks message length overflows encrypted packet size",
+            )
+        })?;
+        if packet_size > this.write_cache.len() {
+            return Poll::Ready(Err(shadowsocks_message_too_large_error(
+                buf.len(),
+                max_payload_len,
+            )));
+        }
 
         if packet_size > write_cache_space {
-            return Poll::Pending;
+            ready!(this.poll_flush_cache(cx))?;
+            write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
+            if packet_size > write_cache_space {
+                return Poll::Pending;
+            }
         }
 
         this.encrypt_single(buf, true)
@@ -911,4 +1172,249 @@ impl AsyncMessageStream for ShadowsocksStream {}
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    use futures::future::poll_fn;
+    use tokio::io::AsyncWrite;
+
+    use super::super::{DefaultKey, ShadowsocksCipher};
+
+    struct SinkStream;
+
+    impl AsyncRead for SinkStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SinkStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for SinkStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for SinkStream {}
+
+    struct PendingOnceSinkStream {
+        written: StdArc<StdMutex<Vec<u8>>>,
+        wrote_once: bool,
+        returned_pending: bool,
+    }
+
+    impl PendingOnceSinkStream {
+        fn new(written: StdArc<StdMutex<Vec<u8>>>) -> Self {
+            Self {
+                written,
+                wrote_once: false,
+                returned_pending: false,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingOnceSinkStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingOnceSinkStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            if !self.wrote_once {
+                self.written.lock().unwrap().push(buf[0]);
+                self.wrote_once = true;
+                return Poll::Ready(Ok(1));
+            }
+
+            if !self.returned_pending {
+                self.returned_pending = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for PendingOnceSinkStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingOnceSinkStream {}
+
+    fn test_stream(stream_type: ShadowsocksStreamType) -> ShadowsocksStream {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let key: Arc<Box<dyn ShadowsocksKey>> =
+            Arc::new(Box::new(DefaultKey::new("test-password", cipher.key_len())));
+        ShadowsocksStream::new(
+            Box::new(SinkStream),
+            stream_type,
+            cipher.algorithm(),
+            cipher.salt_len(),
+            key,
+            None,
+        )
+    }
+
+    fn test_stream_with_inner(
+        stream_type: ShadowsocksStreamType,
+        inner: Box<dyn AsyncStream>,
+    ) -> ShadowsocksStream {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let key: Arc<Box<dyn ShadowsocksKey>> =
+            Arc::new(Box::new(DefaultKey::new("test-password", cipher.key_len())));
+        ShadowsocksStream::new(
+            inner,
+            stream_type,
+            cipher.algorithm(),
+            cipher.salt_len(),
+            key,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn zero_length_stream_and_message_writes_are_noops() {
+        let mut stream = test_stream(ShadowsocksStreamType::Aead);
+
+        let written = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, b""))
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
+        assert!(stream.is_initial_write);
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, b""))
+            .await
+            .unwrap();
+        assert!(stream.is_initial_write);
+    }
+
+    #[tokio::test]
+    async fn zero_sized_read_is_noop() {
+        let mut stream = test_stream(ShadowsocksStreamType::Aead);
+        let mut out = [];
+        let mut read = ReadBuf::new(&mut out);
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut read))
+            .await
+            .unwrap();
+
+        assert!(read.filled().is_empty());
+        assert!(stream.is_initial_read);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_encrypted_cache() {
+        let written = StdArc::new(StdMutex::new(Vec::new()));
+        let inner = PendingOnceSinkStream::new(written.clone());
+        let mut stream = test_stream_with_inner(ShadowsocksStreamType::Aead, Box::new(inner));
+
+        let accepted = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, b"payload"))
+            .await
+            .unwrap();
+        assert_eq!(accepted, b"payload".len());
+        assert_eq!(written.lock().unwrap().len(), 1);
+        assert!(stream.write_cache_end_offset > 0);
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_shutdown(cx))
+            .await
+            .unwrap();
+
+        assert!(stream.write_cache_end_offset == 0);
+        assert!(written.lock().unwrap().len() > 1);
+    }
+
+    #[tokio::test]
+    async fn message_write_rejects_legacy_aead_payload_over_cap() {
+        let mut stream = test_stream(ShadowsocksStreamType::Aead);
+        let oversized = vec![0u8; ShadowsocksStreamType::Aead.max_payload_len() + 1];
+
+        let err = poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &oversized))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(stream.is_initial_write);
+    }
+
+    #[tokio::test]
+    async fn initial_aead2022_message_over_header_capacity_returns_error() {
+        let mut stream = test_stream(ShadowsocksStreamType::AEAD2022Client);
+        let request_header_len = 1 + 8 + 2;
+        let max_initial_payload_len =
+            stream.write_cache.len() - stream.salt_len - (request_header_len + TAG_LEN) - TAG_LEN;
+        assert!(max_initial_payload_len < stream.stream_type.max_payload_len());
+        let oversized = vec![0u8; max_initial_payload_len + 1];
+
+        let err = poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &oversized))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(stream.is_initial_write);
+    }
 }

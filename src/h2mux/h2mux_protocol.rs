@@ -83,12 +83,31 @@ impl SessionRequest {
 
         let mut padding = false;
         if version == VERSION_1 {
-            padding = reader.read_u8().await? != 0;
+            let padding_flag = reader.read_u8().await?;
+            padding = match padding_flag {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid mux padding flag: {value}"),
+                    ));
+                }
+            };
             if padding {
                 let padding_len = reader.read_u16().await?;
-                // Skip padding bytes
-                let mut skip_buf = vec![0u8; padding_len as usize];
-                reader.read_exact(&mut skip_buf).await?;
+                if !(MIN_PADDING..=MAX_PADDING).contains(&padding_len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid mux session padding length: {padding_len}, expected {MIN_PADDING}..={MAX_PADDING}"
+                        ),
+                    ));
+                }
+                let mut skip_buf = [0u8; MAX_PADDING as usize];
+                reader
+                    .read_exact(&mut skip_buf[..padding_len as usize])
+                    .await?;
             }
         }
 
@@ -464,6 +483,37 @@ mod tests {
         assert_eq!(encoded[0], VERSION_1);
         assert_eq!(encoded[1], MuxProtocol::H2Mux as u8);
         assert_eq!(encoded[2], 1); // padding enabled
+    }
+
+    #[tokio::test]
+    async fn test_session_request_decode_rejects_non_boolean_padding_flag() {
+        let mut input = &[VERSION_1, MuxProtocol::H2Mux as u8, 2][..];
+        let error = SessionRequest::decode(&mut input).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_session_request_decode_rejects_padding_outside_bounds() {
+        for padding_len in [MIN_PADDING - 1, MAX_PADDING + 1] {
+            let mut encoded = vec![VERSION_1, MuxProtocol::H2Mux as u8, 1];
+            encoded.extend_from_slice(&padding_len.to_be_bytes());
+            encoded.resize(encoded.len() + padding_len as usize, 0);
+
+            let error = SessionRequest::decode(&mut &encoded[..]).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_request_decode_accepts_padding_bounds() {
+        for padding_len in [MIN_PADDING, MAX_PADDING] {
+            let mut encoded = vec![VERSION_1, MuxProtocol::H2Mux as u8, 1];
+            encoded.extend_from_slice(&padding_len.to_be_bytes());
+            encoded.resize(encoded.len() + padding_len as usize, 0);
+
+            let decoded = SessionRequest::decode(&mut &encoded[..]).await.unwrap();
+            assert!(decoded.padding);
+        }
     }
 
     #[tokio::test]

@@ -5,4 +5,4 @@
 pub mod frame;
 pub mod message_stream;
 
-pub use message_stream::XudpMessageStream;
+pub use message_stream::{XudpFixedMessageStream, XudpMessageStream};

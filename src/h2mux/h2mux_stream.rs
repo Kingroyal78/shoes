@@ -43,6 +43,10 @@ impl AsyncRead for H2MuxStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // Return buffered data first
         if !self.recv_buf.is_empty() {
             let to_copy = self.recv_buf.len().min(buf.remaining());
@@ -91,6 +95,10 @@ impl AsyncWrite for H2MuxStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // Reserve capacity if current capacity is insufficient for the write
         let current_capacity = self.send.capacity();
         if current_capacity < buf.len() {
@@ -101,6 +109,9 @@ impl AsyncWrite for H2MuxStream {
         match self.send.poll_capacity(cx) {
             Poll::Ready(Some(Ok(capacity))) => {
                 let to_send = buf.len().min(capacity);
+                if to_send == 0 {
+                    return Poll::Pending;
+                }
                 self.send
                     .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
                     .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;

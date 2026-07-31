@@ -1,0 +1,63 @@
+# Production V2Board node-server configuration.
+# This file configures inbound listeners and panel integration only. Generic
+# local-YAML clients, outbound proxy chains, TUN, and utility proxy listeners
+# are outside the production acceptance boundary documented by this project.
+
+v2board:
+  api_host: "http://127.0.0.1"
+  api_key: "replace-with-v2board-server-token"
+  api_timeout_secs: 30
+  error_body_limit_bytes: 4096
+  user_list_body_limit_bytes: 10485760
+  # Optional local files used when V2Board route_id rules reference geosite:xxx
+  # or geoip:xxx. Files are plain text, one matcher per line. geosite files
+  # accept bare keywords, keyword:, domain:, full:, and regexp:. geoip files
+  # accept IP/CIDR entries.
+  # route_rule_sets:
+  #   geosite:
+  #     netflix: "/etc/shoes/rules/geosite-netflix.txt"
+  #   geoip:
+  #     cn: "/etc/shoes/rules/geoip-cn.txt"
+  nodes:
+    - tag: "vless-1"
+      node_id: 1
+      # shadowsocks/ss, vmess/v2ray, vless, trojan, anytls, tuic,
+      # hysteria/hysteria2, naive/naiveproxy, or v2node.
+      node_type: "vless"
+      listen: "0.0.0.0"
+      # Optional per-node overrides:
+      # api_host: "https://panel.example.com"
+      # api_key: "per-node-server-token"
+      # pull_interval_secs: 30
+      # push_interval_secs: 30
+      # tls:
+      #   cert_file: "/etc/shoes/tls/fullchain.pem"
+      #   key_file: "/etc/shoes/tls/privkey.pem"
+      # Trojan only: TLS-decoded decoy destination for unauthenticated probes.
+      # This is direct-only and must use a different port from the node listener.
+      # trojan_fallback: "127.0.0.1:8443"
+      # Hysteria2 only: optional bounded static HTTP/3 masquerade response.
+      # This serves fixed local content; it is not a reverse proxy.
+      # hysteria2_masquerade:
+      #   status_code: 404
+      #   content_type: "text/html; charset=utf-8"
+      #   body: "<html><body>Not Found</body></html>"
+
+runtime:
+  data_dir: "/var/lib/shoes"
+  pull_interval_secs: 60
+  push_interval_secs: 60
+  node_report_min_traffic: 0
+  device_online_min_traffic: 0
+  max_legacy_shadowsocks_users: 10000
+  tcp_fast_open: false
+
+# Optional global TLS files for panel nodes that enable TLS but do not provide
+# tls_settings.cert_file/key_file. Per-node v2board.nodes[].tls wins.
+# tls:
+#   cert_file: "/etc/shoes/tls/fullchain.pem"
+#   key_file: "/etc/shoes/tls/privkey.pem"
+
+log:
+  level: "info"
+  # file: "/var/log/shoes/shoes.log"

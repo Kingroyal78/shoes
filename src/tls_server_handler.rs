@@ -15,14 +15,14 @@ use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::shadow_tls::{
     ParsedClientHello, ShadowTlsServerTarget, read_client_hello, setup_shadowtls_server_stream,
 };
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerHandler, TcpServerSetupResult};
 
 use crate::address::NetLocation;
 
 /// Configuration for Vision VLESS inner protocol
 #[derive(Debug, Clone)]
 pub struct VisionVlessConfig {
-    pub user_id: Box<[u8]>,
+    pub users: Vec<(Box<[u8]>, Option<AuthenticatedUser>)>,
     pub udp_enabled: bool,
     pub fallback: Option<NetLocation>,
 }
@@ -98,7 +98,16 @@ impl TlsServerHandler {
 impl TcpServerHandler for TlsServerHandler {
     async fn setup_server_stream(
         &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_peer_addr(server_stream, None)
+            .await
+    }
+
+    async fn setup_server_stream_with_peer_addr(
+        &self,
         mut server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<std::net::SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let parsed_client_hello = read_client_hello(&mut server_stream).await?;
 
@@ -174,12 +183,14 @@ impl TcpServerHandler for TlsServerHandler {
 
                 let mut target_setup_result = match inner_protocol {
                     InnerProtocol::Normal(handler) => {
-                        handler.setup_server_stream(Box::new(tls_stream)).await
+                        handler
+                            .setup_server_stream_with_peer_addr(Box::new(tls_stream), peer_addr)
+                            .await
                     }
                     InnerProtocol::VisionVless(vision_cfg) => {
                         crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                             tls_stream,
-                            &vision_cfg.user_id,
+                            &vision_cfg.users,
                             vision_cfg.udp_enabled,
                             effective_selector.clone(),
                             &self.fallback_resolver,
@@ -193,6 +204,7 @@ impl TcpServerHandler for TlsServerHandler {
                             naive_cfg,
                             effective_selector.clone(),
                             self.fallback_resolver.clone(),
+                            peer_addr,
                         )
                         .await
                     }
@@ -222,6 +234,7 @@ impl TcpServerHandler for TlsServerHandler {
                     target,
                     parsed_client_hello,
                     &self.fallback_resolver,
+                    peer_addr,
                 )
                 .await
             }

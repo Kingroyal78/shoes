@@ -84,7 +84,12 @@ impl ShadowTlsStream {
     }
 
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
-        assert!(self.unprocessed_end_offset == 0);
+        if self.unprocessed_end_offset != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "feed_initial_read_data called with pending unprocessed data",
+            ));
+        }
 
         if data.len() > self.unprocessed_buf.len() {
             return Err(std::io::Error::other(
@@ -146,13 +151,6 @@ impl ShadowTlsStream {
         }
 
         let frame_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        if frame_len < 4 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Frame length too short",
-            ));
-        }
-
         let total_len = TLS_HEADER_LEN + frame_len;
         if self.unprocessed_end_offset < total_len {
             return Ok(DeframeState::NeedData);
@@ -167,7 +165,7 @@ impl ShadowTlsStream {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
                     self.unprocessed_end_offset -= total_len;
-                    return Ok(DeframeState::HandshakeFrame);
+                    return Ok(DeframeState::SkippedFrame);
                 } else {
                     self.unprocessed_end_offset = 0;
                     return Ok(DeframeState::NeedData);
@@ -176,6 +174,13 @@ impl ShadowTlsStream {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid record type",
+            ));
+        }
+
+        if frame_len < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Frame length too short",
             ));
         }
 
@@ -200,7 +205,7 @@ impl ShadowTlsStream {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
                     self.unprocessed_end_offset -= total_len;
-                    return Ok(DeframeState::HandshakeFrame);
+                    return Ok(DeframeState::SkippedFrame);
                 } else {
                     self.unprocessed_end_offset = 0;
                     return Ok(DeframeState::NeedData);
@@ -221,8 +226,10 @@ impl ShadowTlsStream {
         }
         self.read_hmac.update(&expected_digest);
 
-        self.processed_buf[0..payload_len].copy_from_slice(payload);
-        self.processed_end_offset = payload_len;
+        if payload_len > 0 {
+            self.processed_buf[0..payload_len].copy_from_slice(payload);
+            self.processed_end_offset = payload_len;
+        }
 
         if total_len < self.unprocessed_end_offset {
             self.unprocessed_buf
@@ -232,7 +239,11 @@ impl ShadowTlsStream {
             self.unprocessed_end_offset = 0;
         }
 
-        Ok(DeframeState::Success)
+        if payload_len == 0 {
+            Ok(DeframeState::SkippedFrame)
+        } else {
+            Ok(DeframeState::Success)
+        }
     }
 }
 
@@ -240,7 +251,7 @@ enum DeframeState {
     NeedData,
     Success,
     ReceivedAlert,
-    HandshakeFrame,
+    SkippedFrame,
 }
 
 impl AsyncRead for ShadowTlsStream {
@@ -250,6 +261,10 @@ impl AsyncRead for ShadowTlsStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         if this.processed_end_offset > 0 {
             this.read_processed(buf);
@@ -268,7 +283,7 @@ impl AsyncRead for ShadowTlsStream {
                     }
                     DeframeState::NeedData => break,
                     DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                    DeframeState::HandshakeFrame => {}
+                    DeframeState::SkippedFrame => {}
                 }
             }
 
@@ -297,7 +312,7 @@ impl AsyncRead for ShadowTlsStream {
                             }
                             DeframeState::NeedData => break,
                             DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                            DeframeState::HandshakeFrame => {}
+                            DeframeState::SkippedFrame => {}
                         }
                     }
                 }
@@ -314,6 +329,10 @@ impl AsyncWrite for ShadowTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         let this = self.get_mut();
 
         while this.write_buf_pos < this.write_buf_end {
@@ -408,3 +427,185 @@ impl AsyncPing for ShadowTlsStream {
 }
 
 impl AsyncStream for ShadowTlsStream {}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
+    };
+
+    use super::*;
+    use crate::async_stream::AsyncPing;
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            unreachable!("test stream does not support ping")
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn new_hmac() -> ShadowTlsHmac {
+        let key = aws_lc_rs::hmac::Key::new(
+            aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            b"shadowtls-test-password",
+        );
+        ShadowTlsHmac::new(&key)
+    }
+
+    fn make_app_data_frame(hmac: &mut ShadowTlsHmac, payload: &[u8]) -> Vec<u8> {
+        hmac.update(payload);
+        let digest = hmac.digest();
+        hmac.update(&digest);
+
+        let frame_len = 4 + payload.len();
+        let mut frame = Vec::with_capacity(TLS_HEADER_LEN + frame_len);
+        frame.extend_from_slice(&[
+            CONTENT_TYPE_APPLICATION_DATA,
+            0x03,
+            0x03,
+            (frame_len >> 8) as u8,
+            frame_len as u8,
+        ]);
+        frame.extend_from_slice(&digest);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[tokio::test]
+    async fn empty_write_is_noop() {
+        let (client_io, mut peer_io) = duplex(1024);
+        let read_hmac = new_hmac();
+        let write_hmac = new_hmac();
+        let mut stream = ShadowTlsStream::new(
+            Box::new(TestStream(client_io)),
+            &[],
+            read_hmac,
+            write_hmac,
+            None,
+        )
+        .unwrap();
+
+        let written = stream.write(&[]).await.unwrap();
+        assert_eq!(written, 0);
+        stream.flush().await.unwrap();
+
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer_io.read_exact(&mut byte))
+                .await
+                .is_err(),
+            "empty write must not emit a ShadowTLS record"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skips_zero_payload_application_record() {
+        let (mut peer_io, server_io) = duplex(1024);
+        let mut write_hmac = new_hmac();
+        let read_hmac = new_hmac();
+        let mut stream = ShadowTlsStream::new(
+            Box::new(TestStream(server_io)),
+            &[],
+            read_hmac,
+            new_hmac(),
+            None,
+        )
+        .unwrap();
+
+        let mut frames = make_app_data_frame(&mut write_hmac, &[]);
+        frames.extend_from_slice(&make_app_data_frame(&mut write_hmac, b"ok"));
+        peer_io.write_all(&frames).await.unwrap();
+
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ok");
+    }
+
+    #[tokio::test]
+    async fn handshake_mode_skips_short_change_cipher_spec_record() {
+        let (mut peer_io, server_io) = duplex(1024);
+        let mut write_hmac = new_hmac();
+        let read_hmac = new_hmac();
+        let mut handshake_hmac_state = new_hmac();
+        handshake_hmac_state.update(b"already-consumed-handshake-data");
+        let handshake_hmac = Some(handshake_hmac_state);
+        let mut stream = ShadowTlsStream::new(
+            Box::new(TestStream(server_io)),
+            &[],
+            read_hmac,
+            new_hmac(),
+            handshake_hmac,
+        )
+        .unwrap();
+
+        let mut frames = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        frames.extend_from_slice(&make_app_data_frame(&mut write_hmac, b"ok"));
+        peer_io.write_all(&frames).await.unwrap();
+
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ok");
+    }
+
+    #[tokio::test]
+    async fn zero_sized_read_is_noop() {
+        let (client_io, _peer_io) = duplex(1024);
+        let mut stream = ShadowTlsStream::new(
+            Box::new(TestStream(client_io)),
+            b"ready",
+            new_hmac(),
+            new_hmac(),
+            None,
+        )
+        .unwrap();
+
+        let mut empty = [];
+        let n = stream.read(&mut empty).await.unwrap();
+        assert_eq!(n, 0);
+    }
+}

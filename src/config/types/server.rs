@@ -684,6 +684,9 @@ pub enum ServerProxyConfig {
         password: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        /// TLS-decoded fallback destination for unauthenticated probe traffic.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback: Option<NetLocation>,
     },
     Tls {
         // sni_targets is the previous field name
@@ -927,6 +930,7 @@ mod tests {
                     cipher: "chacha20-poly1305".try_into().unwrap(),
                     password: "ss_password".to_string(),
                 }),
+                fallback: None,
             },
             transport: Transport::Tcp,
             tcp_settings: None,

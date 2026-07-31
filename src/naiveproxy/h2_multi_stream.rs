@@ -74,6 +74,10 @@ impl AsyncWrite for H2MultiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // Only reserve capacity when needed to avoid resetting h2's internal state on re-polls
         if self.send.capacity() == 0 {
             self.send.reserve_capacity(buf.len());

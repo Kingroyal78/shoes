@@ -111,6 +111,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for H2MuxPaddingStream<S> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         loop {
             match this.read_state {
                 ReadState::Passthrough => {
@@ -147,6 +151,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for H2MuxPaddingStream<S> {
                         u16::from_be_bytes([this.read_header[0], this.read_header[1]]) as usize;
                     let padding_len =
                         u16::from_be_bytes([this.read_header[2], this.read_header[3]]) as usize;
+                    if !(MIN_PADDING as usize..=MAX_PADDING as usize).contains(&padding_len) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid h2mux frame padding length: {padding_len}, expected {MIN_PADDING}..={MAX_PADDING}"
+                            ),
+                        )));
+                    }
                     this.read_count += 1;
 
                     if data_len == 0 {
@@ -204,7 +216,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for H2MuxPaddingStream<S> {
                                 let n = temp_buf.filled().len();
                                 if n == 0 {
                                     this.read_state = ReadState::SkipPadding { remaining };
-                                    return Poll::Ready(Ok(()));
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "EOF while reading padding frame padding",
+                                    )));
                                 }
                                 remaining -= n;
                             }
@@ -218,7 +233,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for H2MuxPaddingStream<S> {
 
                     // Padding complete, transition to next state
                     if this.read_count >= FIRST_PADDINGS {
-                        let _ = mem::take(&mut this.write_buffer);
                         this.read_state = ReadState::Passthrough;
                     } else {
                         this.read_state = ReadState::Header { pos: 0 };
@@ -251,7 +265,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                     while pos < this.write_buffer.len() {
                         let remaining = &this.write_buffer[pos..];
                         match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                            Poll::Ready(Ok(n)) => pos += n,
+                            Poll::Ready(Ok(n)) => {
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::WriteZero,
+                                        "write zero while flushing padding frame",
+                                    )));
+                                }
+                                pos += n;
+                            }
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                             Poll::Pending => {
                                 this.write_state = WriteState::Pending { pos, payload_len };
@@ -268,7 +290,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                     while pos < this.write_buffer.len() {
                         let remaining = &this.write_buffer[pos..];
                         match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                            Poll::Ready(Ok(n)) => pos += n,
+                            Poll::Ready(Ok(n)) => {
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::WriteZero,
+                                        "write zero while flushing padding frame",
+                                    )));
+                                }
+                                pos += n;
+                            }
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                             Poll::Pending => {
                                 this.write_state = WriteState::Partial { pos };
@@ -299,6 +329,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
 
                     match Pin::new(&mut this.inner).poll_write(cx, &this.write_buffer) {
                         Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero while writing padding frame",
+                                )));
+                            }
                             if n == this.write_buffer.len() {
                                 this.finish_write_flush();
                             } else {
@@ -333,7 +369,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                 while pos < this.write_buffer.len() {
                     let remaining = &this.write_buffer[pos..];
                     match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => pos += n,
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero while flushing padding frame",
+                                )));
+                            }
+                            pos += n;
+                        }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             this.write_state = WriteState::Pending { pos, payload_len };
@@ -347,7 +391,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                 while pos < this.write_buffer.len() {
                     let remaining = &this.write_buffer[pos..];
                     match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => pos += n,
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero while flushing padding frame",
+                                )));
+                            }
+                            pos += n;
+                        }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             this.write_state = WriteState::Partial { pos };
@@ -372,7 +424,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                 while pos < this.write_buffer.len() {
                     let remaining = &this.write_buffer[pos..];
                     match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => pos += n,
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero while shutting down padding frame",
+                                )));
+                            }
+                            pos += n;
+                        }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             this.write_state = WriteState::Pending {
@@ -390,7 +450,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for H2MuxPaddingStream<S> {
                 while pos < this.write_buffer.len() {
                     let remaining = &this.write_buffer[pos..];
                     match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => pos += n,
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero while shutting down padding frame",
+                                )));
+                            }
+                            pos += n;
+                        }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             this.write_state = WriteState::Partial { pos };
@@ -555,10 +623,63 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    #[tokio::test]
+    async fn test_padding_zero_sized_read_is_noop() {
+        use futures::future::poll_fn;
+
+        let (mut client, server) = duplex(65536);
+        let mut server_stream = H2MuxPaddingStream::new(server);
+
+        let mut client_stream = H2MuxPaddingStream::new(client);
+        client_stream.write_all(b"hello").await.unwrap();
+        client_stream.flush().await.unwrap();
+        client = client_stream.inner;
+
+        let mut empty = [];
+        let mut read_buf = ReadBuf::new(&mut empty);
+        poll_fn(|cx| Pin::new(&mut server_stream).poll_read(cx, &mut read_buf))
+            .await
+            .unwrap();
+        assert!(read_buf.filled().is_empty());
+
+        let mut out = [0u8; 5];
+        server_stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"hello");
+
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_padding_rejects_frame_padding_outside_bounds() {
+        for padding_len in [MIN_PADDING - 1, MAX_PADDING + 1] {
+            let (mut client, server) = duplex(2048);
+            let mut server_stream = H2MuxPaddingStream::new(server);
+            client.write_all(&1u16.to_be_bytes()).await.unwrap();
+            client.write_all(&padding_len.to_be_bytes()).await.unwrap();
+            client.write_all(&[0]).await.unwrap();
+
+            let error = server_stream.read_u8().await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_padding_rejects_truncated_padding_bytes() {
+        let (mut client, server) = duplex(2048);
+        let mut server_stream = H2MuxPaddingStream::new(server);
+        client.write_all(&1u16.to_be_bytes()).await.unwrap();
+        client.write_all(&MIN_PADDING.to_be_bytes()).await.unwrap();
+        client.write_all(&[42]).await.unwrap();
+        client.write_all(&[0; 16]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        assert_eq!(server_stream.read_u8().await.unwrap(), 42);
+        let error = server_stream.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     #[test]
     fn test_padding_constants() {
-        // Verify padding range
-        assert!(MIN_PADDING <= MAX_PADDING);
         assert_eq!(MIN_PADDING, 256);
         assert_eq!(MAX_PADDING, 767);
         assert_eq!(FIRST_PADDINGS, 16);

@@ -48,6 +48,57 @@ impl PaddingType {
     }
 }
 
+/// Client padding-type offer as seen by the HTTP server.
+///
+/// `Absent` preserves compatibility with clients that predate explicit type
+/// negotiation. `Malformed` is kept distinct so an invalid header never
+/// silently enables a padding format the client may not understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddingTypeRequest<'a> {
+    Absent,
+    Value(&'a str),
+    Malformed,
+}
+
+/// Select the padding format for a server-side CONNECT tunnel.
+///
+/// Padding is opt-in through the request's `padding` header. When an explicit
+/// type offer is present, only a type actually offered by the client is
+/// selected.
+pub fn negotiate_server_padding(
+    padding_enabled: bool,
+    has_padding_header: bool,
+    padding_type_request: PaddingTypeRequest<'_>,
+) -> PaddingType {
+    if !padding_enabled || !has_padding_header {
+        return PaddingType::None;
+    }
+
+    match padding_type_request {
+        PaddingTypeRequest::Absent => PaddingType::Variant1,
+        PaddingTypeRequest::Value(value) => parse_padding_type_request(value)
+            .into_iter()
+            .find(|&padding_type| padding_type == PaddingType::Variant1)
+            .unwrap_or(PaddingType::None),
+        PaddingTypeRequest::Malformed => PaddingType::None,
+    }
+}
+
+/// Add response headers for the negotiated server padding format.
+///
+/// An unpadded tunnel intentionally receives neither padding header.
+pub fn add_server_padding_response_headers(
+    mut response: http::response::Builder,
+    padding_type: PaddingType,
+) -> http::response::Builder {
+    if padding_type != PaddingType::None {
+        let padding_len = rand::rng().random_range(30..=62);
+        response = response.header("padding", generate_padding_header(padding_len));
+        response = response.header("padding-type-reply", (padding_type as u8).to_string());
+    }
+    response
+}
+
 /// Direction of the connection (kept for API compatibility).
 /// Note: Padding behavior is now uniform for both directions per NaiveProxy spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +420,12 @@ impl<S: AsyncWrite + Unpin> NaivePaddingStream<S> {
 
         match Pin::new(&mut self.inner).poll_write(cx, to_write) {
             Poll::Ready(Ok(n)) => {
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write padded frame",
+                    )));
+                }
                 self.write_start += n;
                 if self.write_start >= self.write_end {
                     self.num_written_frames += 1;
@@ -458,6 +515,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if !this.should_pad_writes() {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
@@ -542,6 +603,7 @@ impl<S: AsyncStream> AsyncStream for NaivePaddingStream<S> {}
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -561,6 +623,76 @@ mod tests {
     }
 
     #[test]
+    fn test_server_padding_negotiation_is_opt_in() {
+        assert_eq!(
+            negotiate_server_padding(true, false, PaddingTypeRequest::Absent),
+            PaddingType::None
+        );
+        assert_eq!(
+            negotiate_server_padding(false, true, PaddingTypeRequest::Value("1, 0")),
+            PaddingType::None
+        );
+    }
+
+    #[test]
+    fn test_server_padding_negotiation_preserves_legacy_and_supported_offers() {
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Absent),
+            PaddingType::Variant1
+        );
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Value("1, 0")),
+            PaddingType::Variant1
+        );
+    }
+
+    #[test]
+    fn test_server_padding_negotiation_respects_none_and_unsupported_offers() {
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Value("0")),
+            PaddingType::None
+        );
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Value("2, 99")),
+            PaddingType::None
+        );
+    }
+
+    #[test]
+    fn test_server_padding_negotiation_handles_malformed_offers_conservatively() {
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Value("not-a-type")),
+            PaddingType::None
+        );
+        assert_eq!(
+            negotiate_server_padding(true, true, PaddingTypeRequest::Malformed),
+            PaddingType::None
+        );
+    }
+
+    #[test]
+    fn test_unpadded_server_response_has_no_padding_headers() {
+        let response =
+            add_server_padding_response_headers(http::Response::builder(), PaddingType::None)
+                .body(())
+                .unwrap();
+
+        assert!(!response.headers().contains_key("padding"));
+        assert!(!response.headers().contains_key("padding-type-reply"));
+    }
+
+    #[test]
+    fn test_padded_server_response_advertises_selected_type() {
+        let response =
+            add_server_padding_response_headers(http::Response::builder(), PaddingType::Variant1)
+                .body(())
+                .unwrap();
+
+        assert!(response.headers().contains_key("padding"));
+        assert_eq!(response.headers().get("padding-type-reply").unwrap(), "1");
+    }
+
+    #[test]
     fn test_padding_type_from_u8() {
         assert_eq!(PaddingType::from_u8(0), Some(PaddingType::None));
         assert_eq!(PaddingType::from_u8(1), Some(PaddingType::Variant1));
@@ -575,7 +707,7 @@ mod tests {
         frame.extend_from_slice(&payload_len.to_be_bytes());
         frame.push(padding_len);
         frame.extend_from_slice(payload);
-        frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        frame.resize(frame.len() + padding_len as usize, 0);
         frame
     }
 
@@ -594,7 +726,7 @@ mod tests {
     fn test_frame_encoding_empty_payload() {
         // Pure padding frame (payload_len = 0)
         let frame = encode_test_frame(b"", 50);
-        assert_eq!(frame.len(), 3 + 0 + 50);
+        assert_eq!(frame.len(), 3 + 50);
         assert_eq!(&frame[0..2], &[0x00, 0x00]); // payload_len = 0
         assert_eq!(frame[2], 50); // padding_len
     }
@@ -682,6 +814,50 @@ mod tests {
     }
 
     impl AsyncStream for MockStream {}
+
+    struct ZeroWriteStream;
+
+    impl AsyncRead for ZeroWriteStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ZeroWriteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Unpin for ZeroWriteStream {}
+
+    impl AsyncPing for ZeroWriteStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ZeroWriteStream {}
 
     #[tokio::test]
     async fn test_read_single_padded_frame() {
@@ -935,6 +1111,35 @@ mod tests {
         assert_eq!(payload_len, payload.len());
         assert_eq!(&written[3..3 + payload_len], payload);
         assert_eq!(written.len(), 3 + payload_len + padding_len);
+    }
+
+    #[tokio::test]
+    async fn test_zero_length_write_is_noop() {
+        let mock = MockStream::new(vec![]);
+        let mut stream =
+            NaivePaddingStream::new(mock, PaddingDirection::Client, PaddingType::Variant1);
+
+        let n = stream.write(b"").await.unwrap();
+
+        assert_eq!(n, 0);
+        assert!(stream.inner.written.is_empty());
+        assert_eq!(stream.num_written_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_zero_from_inner_returns_write_zero_error() {
+        let mut stream = NaivePaddingStream::new(
+            ZeroWriteStream,
+            PaddingDirection::Client,
+            PaddingType::Variant1,
+        );
+
+        let err = tokio::time::timeout(Duration::from_millis(100), stream.write(b"payload"))
+            .await
+            .expect("write should not spin when the inner stream makes no progress")
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_md5, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
-use super::vmess_stream::{ReadHeaderInfo, VmessStream};
+use super::vmess_stream::{ReadHeaderInfo, VmessRawStream, VmessStream};
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
@@ -27,7 +27,8 @@ use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_sess
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
+    AuthenticatedUser, ServerUser, TcpClientHandler, TcpClientSetupResult, TcpServerHandler,
+    TcpServerSetupResult,
 };
 use crate::util::{allocate_vec, write_all};
 use crate::uuid_util::parse_uuid;
@@ -51,10 +52,10 @@ enum DataCipher {
 impl From<&str> for DataCipher {
     fn from(name: &str) -> Self {
         match name {
-            "" | "any" => DataCipher::Any,
+            "" | "any" | "auto" => DataCipher::Any,
             "aes-128-gcm" => DataCipher::Aes128Gcm,
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => DataCipher::ChaCha20Poly1305,
-            "none" => DataCipher::None,
+            "none" | "zero" => DataCipher::None,
             _ => {
                 panic!("Unknown cipher: {name}");
             }
@@ -64,17 +65,23 @@ impl From<&str> for DataCipher {
 
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
-    instruction_key: [u8; 16],
-    aead_decrypting_key: CipherDecryptingKey,
+    users: Vec<VmessServerUser>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+}
+
+struct VmessServerUser {
+    instruction_key: [u8; 16],
+    aead_decrypting_key: CipherDecryptingKey,
+    authenticated_user: Option<AuthenticatedUser>,
 }
 
 impl std::fmt::Debug for VmessTcpServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmessTcpServerHandler")
             .field("data_cipher", &self.data_cipher)
+            .field("user_count", &self.users.len())
             .field("udp_enabled", &self.udp_enabled)
             .finish_non_exhaustive()
     }
@@ -88,22 +95,53 @@ impl VmessTcpServerHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
-        user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
-
-        let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
-        let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
-
         Self {
             data_cipher: cipher_name.into(),
-            aead_decrypting_key,
-            instruction_key,
+            users: vec![create_vmess_server_user(user_id, None)],
             udp_enabled,
             proxy_selector,
             resolver,
         }
+    }
+
+    pub fn new_multi(
+        cipher_name: &str,
+        users: Vec<ServerUser>,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Self {
+        Self {
+            data_cipher: cipher_name.into(),
+            users: users
+                .into_iter()
+                .map(|user| {
+                    create_vmess_server_user(&user.credential, Some(user.authenticated_user))
+                })
+                .collect(),
+            udp_enabled,
+            proxy_selector,
+            resolver,
+        }
+    }
+}
+
+fn create_vmess_server_user(
+    user_id: &str,
+    authenticated_user: Option<AuthenticatedUser>,
+) -> VmessServerUser {
+    let mut user_id_bytes = parse_uuid(user_id).unwrap();
+    user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+    let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
+
+    let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
+    let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
+    let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
+
+    VmessServerUser {
+        instruction_key,
+        aead_decrypting_key,
+        authenticated_user,
     }
 }
 
@@ -125,33 +163,42 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let mut aead_bytes = [0u8; 16];
         aead_bytes.copy_from_slice(&cert_hash);
 
-        self.aead_decrypting_key
-            .decrypt(&mut aead_bytes, DecryptionContext::None)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "AEAD auth ID decryption failed",
-                )
-            })?;
-        let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
-        let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
-
-        if checksum != expected_checksum {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "AEAD authentication failed: checksum mismatch",
-            ));
-        }
-
-        let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
         let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
-            ));
-        }
+        let matched_user = self.users.iter().find_map(|user| {
+            let mut candidate = aead_bytes;
+            if user
+                .aead_decrypting_key
+                .decrypt(&mut candidate, DecryptionContext::None)
+                .is_err()
+            {
+                return None;
+            }
+            let checksum = super::crc32::crc32c(&candidate[0..12]);
+            let expected_checksum = u32::from_be_bytes(candidate[12..16].try_into().unwrap());
+            if checksum != expected_checksum {
+                return None;
+            }
+            let time_secs = u64::from_be_bytes(candidate[0..8].try_into().unwrap());
+            let time_delta = time_secs.abs_diff(current_time_secs);
+            if time_delta > 120 {
+                return Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+                )));
+            }
+            Some(Ok((user.instruction_key, user.authenticated_user.clone())))
+        });
+
+        let (instruction_key, authenticated_user) = match matched_user {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD authentication failed: unknown VMess user",
+                ));
+            }
+        };
 
         let mut encrypted_payload_length = [0u8; 18];
         stream_reader
@@ -164,12 +211,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .await?;
 
         let header_length_aead_key = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
         );
 
         let header_length_nonce = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
@@ -193,12 +240,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 
         let header_aead_key = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Key", &cert_hash, &nonce],
         );
 
         let header_nonce = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
@@ -366,13 +413,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let response_authentication_v = fixed_header[33];
         let option = fixed_header[34];
 
-        if option & 0x01 != 0x01 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Standard format data stream was not requested",
-            ));
-        }
-
         if option & 0x10 == 0x10 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -380,8 +420,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
+        let enable_chunk_stream = option & 0x01 == 0x01;
         let enable_chunk_masking = option & 0x04 == 0x04;
         let enable_global_padding = option & 0x08 == 0x08;
+
+        if enable_chunk_masking && !enable_chunk_stream {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Chunk masking cannot be enabled without chunk stream",
+            ));
+        }
 
         if enable_global_padding && !enable_chunk_masking {
             return Err(std::io::Error::new(
@@ -417,6 +465,13 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     "Server only allows {:?} but client requested {:?}",
                     self.data_cipher, requested_data_cipher
                 ),
+            ));
+        }
+
+        if !enable_chunk_stream && requested_data_cipher != DataCipher::None {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Raw VMess data stream is only supported for zero security",
             ));
         }
 
@@ -540,6 +595,13 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     && host == MUX_DESTINATION_HOST
                     && remote_location.port() == MUX_DESTINATION_PORT
                 {
+                    if authenticated_user.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "h2mux is not supported for authenticated V2Board users",
+                        ));
+                    }
+
                     // Create VMess stream with response header for h2mux
                     let mut vmess_stream = VmessStream::new(
                         server_stream,
@@ -578,6 +640,30 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     return Ok(TcpServerSetupResult::AlreadyHandled);
                 }
 
+                if !enable_chunk_stream {
+                    let unparsed_data = stream_reader.unparsed_data();
+                    let initial_read_data = if unparsed_data.is_empty() {
+                        None
+                    } else {
+                        Some(BytesMut::from(unparsed_data))
+                    };
+                    let server_stream = Box::new(VmessRawStream::new(
+                        server_stream,
+                        Some(prefix_bytes),
+                        initial_read_data,
+                    ));
+
+                    return Ok(TcpServerSetupResult::TcpForward {
+                        remote_location,
+                        stream: server_stream,
+                        need_initial_flush: false,
+                        connection_success_response: None,
+                        initial_remote_data: None,
+                        proxy_selector: self.proxy_selector.clone(),
+                        authenticated_user: authenticated_user.clone(),
+                    });
+                }
+
                 let mut vmess_stream = VmessStream::new(
                     server_stream,
                     false, // is_udp = false
@@ -604,6 +690,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     connection_success_response: None,
                     initial_remote_data: None,
                     proxy_selector: self.proxy_selector.clone(),
+                    authenticated_user: authenticated_user.clone(),
                 })
             }
             COMMAND_UDP => {
@@ -637,6 +724,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     stream: server_stream,
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    authenticated_user: authenticated_user.clone(),
                 })
             }
             COMMAND_MUX => {
@@ -674,6 +762,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     stream: Box::new(xudp_stream),
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    authenticated_user,
                 })
             }
             unknown_protocol_type => Err(std::io::Error::new(
@@ -693,8 +782,25 @@ struct AeadHeaderReader {
 impl AeadHeaderReader {
     fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
-        data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
-        self.cursor += len;
+        let end = self.cursor.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMess AEAD header cursor overflow",
+            )
+        })?;
+        if end > self.decrypted_header.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "VMess AEAD header is too short: need {} bytes at offset {}, have {} bytes",
+                    len,
+                    self.cursor,
+                    self.decrypted_header.len().saturating_sub(self.cursor)
+                ),
+            ));
+        }
+        data.copy_from_slice(&self.decrypted_header[self.cursor..end]);
+        self.cursor = end;
         Ok(())
     }
 
@@ -1262,5 +1368,88 @@ impl VmessTcpClientHandler {
         );
 
         Ok(Box::new(vmess_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    use super::{AeadHeaderReader, DataCipher};
+    use crate::async_stream::{AsyncPing, AsyncStream};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[test]
+    fn data_cipher_accepts_v2board_and_sing_box_defaults() {
+        assert_eq!(DataCipher::from(""), DataCipher::Any);
+        assert_eq!(DataCipher::from("auto"), DataCipher::Any);
+        assert_eq!(DataCipher::from("any"), DataCipher::Any);
+        assert_eq!(DataCipher::from("zero"), DataCipher::None);
+    }
+
+    #[test]
+    fn aead_header_reader_rejects_short_decrypted_header_without_panicking() {
+        let (_peer, stream) = tokio::io::duplex(8);
+        let mut reader = AeadHeaderReader {
+            server_stream: Box::new(TestStream(stream)),
+            decrypted_header: vec![0; 2].into_boxed_slice(),
+            cursor: 0,
+        };
+        let mut out = [0u8; 3];
+
+        let err = reader.read_slice_into(&mut out).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("VMess AEAD header is too short"));
     }
 }

@@ -4,6 +4,7 @@
 //! after TLS/Reality termination.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::async_stream::AsyncStream;
@@ -26,7 +27,16 @@ pub async fn setup_naive_server_stream<IO: AsyncStream + 'static>(
     naive_cfg: &NaiveConfig,
     effective_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
 ) -> io::Result<TcpServerSetupResult> {
     let use_h2 = tls_stream.is_reality() || tls_stream.alpn_protocol() == Some(b"h2");
-    run_naive_hyper_service(tls_stream, naive_cfg, effective_selector, resolver, use_h2).await
+    run_naive_hyper_service(
+        tls_stream,
+        naive_cfg,
+        effective_selector,
+        resolver,
+        use_h2,
+        peer_addr,
+    )
+    .await
 }

@@ -17,7 +17,7 @@ use crate::anytls::anytls_padding::PaddingFactory;
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
 use crate::async_stream::AsyncStream;
-use crate::socks_handler::write_location_to_vec;
+use crate::socks_handler::try_write_location_to_vec;
 
 /// Outgoing message types for the unified writer channel
 enum OutgoingMessage {
@@ -690,7 +690,7 @@ impl AnyTlsClientSession {
         };
 
         // Encode destination address
-        let dest_data = write_location_to_vec(&destination);
+        let dest_data = try_write_location_to_vec(&destination)?;
 
         // Try to take the initial buffer (only first stream gets it)
         // If present, we send Settings + SYN + destination as single message

@@ -14,6 +14,7 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::hysteria2_server::{Hysteria2ServerUser, Hysteria2ServerUsers, Hysteria2StartConfig};
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -23,6 +24,7 @@ use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+use crate::tuic_server::{TuicServerUser, TuicServerUsers};
 use crate::uuid_util::parse_uuid;
 
 async fn start_quic_server(
@@ -45,7 +47,7 @@ async fn start_quic_server(
         let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
 
         let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
+            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)?;
 
         let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
@@ -132,136 +134,148 @@ async fn process_streams(
         }
     };
 
-    match setup_result {
-        TcpServerSetupResult::TcpForward {
-            remote_location,
-            stream: mut server_stream,
-            need_initial_flush: server_need_initial_flush,
-            proxy_selector,
-            connection_success_response,
-            initial_remote_data,
-        } => {
-            let setup_client_stream_future = timeout(
-                Duration::from_secs(60),
-                setup_client_tcp_stream(
+    let mut setup_result = setup_result;
+    loop {
+        return match setup_result {
+            TcpServerSetupResult::PeerAddressOverride { result, .. } => {
+                setup_result = *result;
+                continue;
+            }
+            TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: mut server_stream,
+                need_initial_flush: server_need_initial_flush,
+                proxy_selector,
+                connection_success_response,
+                initial_remote_data,
+                authenticated_user: _,
+            } => {
+                let setup_client_stream_future = timeout(
+                    Duration::from_secs(60),
+                    setup_client_tcp_stream(
+                        &mut server_stream,
+                        proxy_selector,
+                        resolver,
+                        remote_location.clone(),
+                        None,
+                    ),
+                );
+
+                let mut client_stream = match setup_client_stream_future.await {
+                    Ok(Ok(Some(s))) => s,
+                    Ok(Ok(None)) => {
+                        // Must have been blocked.
+                        let _ = server_stream.shutdown().await;
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        let _ = server_stream.shutdown().await;
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to setup client stream to {remote_location}: {e}"),
+                        ));
+                    }
+                    Err(elapsed) => {
+                        let _ = server_stream.shutdown().await;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("client setup to {remote_location} timed out: {elapsed}"),
+                        ));
+                    }
+                };
+
+                if let Some(data) = connection_success_response {
+                    server_stream.write_all(&data).await?;
+                    // server_need_initial_flush should be set to true by the handler if
+                    // it's needed.
+                }
+
+                let client_need_initial_flush = match initial_remote_data {
+                    Some(data) => {
+                        client_stream.write_all(&data).await?;
+                        true
+                    }
+                    None => false,
+                };
+
+                let copy_result = copy_bidirectional(
                     &mut server_stream,
+                    &mut client_stream,
+                    server_need_initial_flush,
+                    client_need_initial_flush,
+                )
+                .await;
+
+                let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+
+                copy_result?;
+                Ok(())
+            }
+            TcpServerSetupResult::BidirectionalUdp {
+                remote_location,
+                stream: server_stream,
+                need_initial_flush: server_need_initial_flush,
+                proxy_selector,
+                authenticated_user: _,
+            } => {
+                let action = proxy_selector
+                    .judge(remote_location.into(), &resolver)
+                    .await?;
+                match action {
+                    ConnectDecision::Allow {
+                        chain_group,
+                        remote_location,
+                    } => {
+                        let client_stream = chain_group
+                            .connect_udp_bidirectional(&resolver, remote_location)
+                            .await?;
+
+                        run_udp_copy(
+                            server_stream,
+                            client_stream,
+                            server_need_initial_flush,
+                            false,
+                        )
+                        .await
+                    }
+                    ConnectDecision::Block => Ok(()),
+                }
+            }
+            TcpServerSetupResult::MultiDirectionalUdp {
+                stream: server_stream,
+                need_initial_flush,
+                proxy_selector,
+                authenticated_user: _,
+            } => {
+                // Routes each packet based on its destination
+                run_udp_routing(
+                    ServerStream::Targeted(server_stream),
                     proxy_selector,
                     resolver,
-                    remote_location.clone(),
-                ),
-            );
-
-            let mut client_stream = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    // Must have been blocked.
-                    let _ = server_stream.shutdown().await;
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
-                }
-                Err(elapsed) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
-                }
-            };
-
-            if let Some(data) = connection_success_response {
-                server_stream.write_all(&data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
+                    need_initial_flush,
+                )
+                .await
             }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    client_stream.write_all(&data).await?;
-                    true
-                }
-                None => false,
-            };
-
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-                server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
-
-            let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
-
-            copy_result?;
-            Ok(())
-        }
-        TcpServerSetupResult::BidirectionalUdp {
-            remote_location,
-            stream: server_stream,
-            need_initial_flush: server_need_initial_flush,
-            proxy_selector,
-        } => {
-            let action = proxy_selector
-                .judge(remote_location.into(), &resolver)
-                .await?;
-            match action {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location,
-                } => {
-                    let client_stream = chain_group
-                        .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
-
-                    run_udp_copy(
-                        server_stream,
-                        client_stream,
-                        server_need_initial_flush,
-                        false,
-                    )
-                    .await
-                }
-                ConnectDecision::Block => Ok(()),
+            TcpServerSetupResult::SessionBasedUdp {
+                stream: server_stream,
+                need_initial_flush,
+                proxy_selector,
+                authenticated_user: _,
+            } => {
+                // Routes each session based on its destination
+                run_udp_routing(
+                    ServerStream::Session(server_stream),
+                    proxy_selector,
+                    resolver,
+                    need_initial_flush,
+                )
+                .await
             }
-        }
-        TcpServerSetupResult::MultiDirectionalUdp {
-            stream: server_stream,
-            need_initial_flush,
-            proxy_selector,
-        } => {
-            // Routes each packet based on its destination
-            run_udp_routing(
-                ServerStream::Targeted(server_stream),
-                proxy_selector,
-                resolver,
-                need_initial_flush,
-            )
-            .await
-        }
-        TcpServerSetupResult::SessionBasedUdp {
-            stream: server_stream,
-            need_initial_flush,
-            proxy_selector,
-        } => {
-            // Routes each session based on its destination
-            run_udp_routing(
-                ServerStream::Session(server_stream),
-                proxy_selector,
-                resolver,
-                need_initial_flush,
-            )
-            .await
-        }
-        TcpServerSetupResult::AlreadyHandled => {
-            // Connection already handled by a spawned task (e.g., Reality fallback)
-            Ok(())
-        }
+            TcpServerSetupResult::AlreadyHandled => {
+                // Connection already handled by a spawned task (e.g., Reality fallback)
+                Ok(())
+            }
+        };
     }
 }
 
@@ -337,23 +351,29 @@ pub async fn start_quic_servers(
             password,
             udp_enabled,
         } => {
-            // TODO: hash password instead of passing directly
-            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            let users = Hysteria2ServerUsers::new(vec![Hysteria2ServerUser::new(password, None)])?;
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
-                    bind_address,
-                    quic_server_config,
-                    hysteria2_password,
-                    client_proxy_selector,
-                    resolver,
-                    num_endpoints,
-                    udp_enabled,
-                )
-                .await?;
+                let users = users.clone();
+                let hysteria2_handles =
+                    crate::hysteria2_server::start_hysteria2_server(Hysteria2StartConfig {
+                        bind_address,
+                        quic_server_config,
+                        users,
+                        client_proxy_selector,
+                        resolver,
+                        num_endpoints,
+                        udp_enabled,
+                        up_mbps: 0,
+                        down_mbps: 0,
+                        ignore_client_bandwidth: false,
+                        obfs: None,
+                        masquerade: None,
+                    })
+                    .await?;
                 handles.extend(hysteria2_handles);
             }
         }
@@ -362,21 +382,24 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
         } => {
-            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-            let password: &'static str = Box::leak(password.into_boxed_str());
+            let uuid: [u8; 16] = parse_uuid(&uuid)?.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid tuic uuid length")
+            })?;
+            let users = TuicServerUsers::new(vec![TuicServerUser::new(uuid, password, None)])?;
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
+                let users = users.clone();
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config,
-                    uuid,
-                    password,
+                    users,
                     client_proxy_selector,
                     resolver,
                     num_endpoints,
                     zero_rtt_handshake,
+                    None,
                 )
                 .await?;
                 handles.extend(tuic_handles);

@@ -1,6 +1,7 @@
 mod h2_multi_stream;
 mod naive_client_handler;
 mod naive_client_session;
+pub(crate) mod naive_h3_service;
 mod naive_hyper_service;
 mod naive_padding_stream;
 mod naive_server_handler;
