@@ -4,7 +4,7 @@
 
 The sample below shows the full production shape. Remove or comment the top-level `tls` block unless those certificate files exist; `shoes validate` checks that configured TLS paths are readable.
 
-This reference documents only the V2Board node-server configuration used in production. Generic local-YAML clients, outbound proxy chains, TUN, utility SOCKS/HTTP listeners, and client-side protocol options are outside this backend's acceptance boundary; legacy examples for those code paths are not production configuration guidance.
+This reference documents the V2Board node-server configuration used in production: inbound listeners, panel integration, and the local outbound routing layer (`outbounds`, `default_out`, `route_rules`, `rule_providers`). Generic local-YAML client configurations, TUN, utility SOCKS/HTTP listeners, and client-side protocol options are outside this backend's acceptance boundary; legacy examples for those code paths are not production configuration guidance.
 
 ```yaml
 v2board:
@@ -49,6 +49,45 @@ tls:
 
 log:
   level: "info"
+
+# Optional local outbounds for node-side routing. V2Board is not involved;
+# outbound credentials live in this file, so keep it private (chmod 0600).
+outbounds:
+  - tag: "unlock"
+    type: "vless"
+    server: "203.0.113.10"
+    port: 443
+    user_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    udp: true
+    tls:
+      enabled: true
+      sni: "unlock.example.com"
+      allow_insecure: false
+      # cert_file: "/etc/shoes/ca/unlock-ca.pem"
+      alpn: ["h2", "http/1.1"]
+    transport:
+      type: "ws"
+      path: "/unlock"
+      host: "unlock.example.com"
+  - tag: "socks-hop"
+    type: "socks5"
+    server: "127.0.0.1"
+    port: 1080
+  - tag: "via-socks"
+    chain: ["socks-hop", "unlock"]
+  - tag: "direct"
+    type: "direct"
+
+default_out: "direct"
+
+# route_rules:
+#   - "DOMAIN-SUFFIX,netflix.com,unlock"
+#   - "MATCH,direct"
+
+# rule_providers:
+#   - tag: "netflix"
+#     path: "/etc/shoes/rules/netflix.yaml"
+#     reload_interval_secs: 300
 ```
 
 ## `v2board`
@@ -114,6 +153,96 @@ Each node:
 
 - `level`: `error`, `warn`, `info`, `debug`, `trace`, or `off`.
 - `file`: optional log file path. `-l/--log-file` can add more destinations.
+
+## `outbounds`
+
+Optional local outbounds used for node-side routing. The panel is not
+involved: outbounds, routes, and rule files live in the local YAML only.
+Outbound credentials are stored in this file, so keep it private with mode
+`0600` (same convention as the `runtime.data_dir` LKG snapshots) and never
+log it.
+
+Each outbound is a flat entry; `tag` is required and must be unique:
+
+- `tag`: unique runtime name, referenced by `route_rules`, `default_out`,
+  and other outbounds' `chain` lists.
+- `chain`: optional list of outbound tags. When present, the outbound
+  forwards through those hops and its `type`/`server`/credential fields are
+  ignored. Every hop must be a configured outbound tag, chains must be
+  non-empty, and cycles are rejected. Chain hops are assembled into the
+  generic engine's `ClientChainHop` by the runtime; each leaf outbound
+  converts to a single `ClientConfig`.
+- `type`: `direct`, `http`, `socks`/`socks5`, `ss`/`shadowsocks`, `snell`,
+  `vless`, `trojan`, `vmess`, `anytls`, `naive`/`naiveproxy`, `shadowtls`,
+  or `ws`/`websocket` (the last is rejected: `ws` is a transport, not an
+  outbound). A bare `- tag: direct` (no fields) is also accepted.
+- `server`, `port`: upstream address. Required for every non-direct type.
+- Credentials, required per type: `user_id` for `vless`/`vmess`;
+  `cipher`+`password` for `ss`/`snell`; `password` for `trojan`/`anytls`;
+  `username`+`password` for `naiveproxy`; `cipher`+`user_id` for `vmess`;
+  `username`/`password` optional for `socks`/`http`. `shadowtls` uses
+  `password` for both the ShadowTLS handshake secret and the inner
+  Shadowsocks password, with `cipher` selecting the inner cipher.
+  `snell` rejects `2022-blake3-*` ciphers. `ss` supports the legacy AEAD
+  ciphers `aes-128-gcm`/`aes-192-gcm`/`aes-256-gcm`/`chacha20-ietf-poly1305`
+  and the 2022 ciphers with a base64 `password`.
+- `udp`: enable UDP forwarding where the protocol supports it; default
+  `true` (no-op for `http`, `socks`, `trojan`, `naiveproxy`).
+- `tls`: optional client TLS settings:
+  - `enabled`: default is inferred. `trojan`, `anytls`, and `naiveproxy`
+    imply TLS when `enabled` is absent (same rule as the inbound side);
+    `vless`/`vmess` need an explicit `enabled: true` — a `transport` alone
+    does not enable TLS.
+  - `sni`: SNI hostname; defaults to the `server` hostname.
+  - `allow_insecure`: skip server certificate verification; default `false`.
+  - `cert_file`: PEM file with the private CA that signed the upstream
+    server certificate. It is read and embedded in the client TLS config,
+    so it must be readable (checked by `shoes validate`) and must be kept
+    private. Do not reuse the server-side `tls.cert_file`/`key_file`
+    (inbound certificate files) here — those are for the node listeners,
+    not for outbound verification.
+  - `alpn`: list of ALPN protocols, e.g. `["h2", "http/1.1"]`; default empty.
+- `reality`: optional, `vless` only. `public_key` and `server_name` are
+  required, `short_id` is optional hex (default all zeros) and is validated
+  like the inbound Reality short ids. Reality replaces the TLS layer:
+  combining it with `tls` or `transport` is rejected.
+- `transport`: optional transport settings. Only `type: ws` is supported
+  for now (`grpc`, `httpupgrade`, and `xhttp` are rejected by validate).
+  `path` defaults to `/`; `host` is sent as the `Host` header.
+
+Assembly order (flat YAML → generic engine nesting): credentials build the
+inner protocol, then `reality` or `tls` wraps it, then `ws` wraps that —
+`tls + ws + vless` becomes
+`Websocket { protocol: Tls { protocol: Vless } }`.
+
+## `default_out`
+
+Optional fallback outbound tag used when no `route_rules` entry matches. It
+must reference a configured outbound tag. When absent, behavior is
+identical to today: direct. An explicit `MATCH` rule takes precedence over
+`default_out` because rules are matched in order and `MATCH` is the last
+resort of the rule list.
+
+## `route_rules`
+
+Optional CRS (Clash/sing-box style) one-liners, matched in order with
+first match wins. Each line is
+`<TYPE>,<value>[,<value>...],<outbound tag>`. Supported types: `DOMAIN-SUFFIX`,
+`DOMAIN`, `DOMAIN-KEYWORD`, `DOMAIN-REGEX`, `IP-CIDR`, `IP-CIDR6`, `GEOSITE`,
+`GEOIP`, `PROTOCOL` (sniffed `http`/`tls`/`bittorrent`/`ssh`/`quic`), and
+`MATCH` (explicit catch-all with no value). `GEOSITE`/`GEOIP` reference the
+`v2board.route_rule_sets` local files by label. Every line is parsed by
+`shoes validate`; rule-set expansion and compilation happen at runtime, not
+during validate.
+
+## `rule_providers`
+
+Optional external CRS rule files, hot-reloaded by mtime polling. Each entry:
+
+- `tag`: unique provider name used in diagnostics.
+- `path`: file containing one CRS one-liner per line. Must exist and parse;
+  checked by `shoes validate` (via `check_provider_files`).
+- `reload_interval_secs`: mtime poll interval; default `300`.
 
 ## Protocol Notes
 

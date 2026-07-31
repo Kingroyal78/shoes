@@ -58,6 +58,7 @@
 mod address;
 mod anytls;
 mod async_stream;
+mod backend_config;
 mod buf_reader;
 mod client_proxy_chain;
 mod client_proxy_selector;
@@ -105,6 +106,7 @@ mod tuic_server;
 mod uot;
 mod util;
 mod uuid_util;
+mod v2board;
 mod vless;
 mod vmess;
 mod websocket;

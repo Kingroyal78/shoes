@@ -1,5 +1,6 @@
 # Production V2Board node-server configuration.
-# This file configures inbound listeners and panel integration only. Generic
+# This file configures inbound listeners, panel integration, and optional
+# local outbound routing (outbounds/route_rules/rule_providers). Generic
 # local-YAML clients, outbound proxy chains, TUN, and utility proxy listeners
 # are outside the production acceptance boundary documented by this project.
 
@@ -61,3 +62,50 @@ runtime:
 log:
   level: "info"
   # file: "/var/log/shoes/shoes.log"
+
+# ---------------------------------------------------------------------------
+# Optional local outbound routing. V2Board is not involved; outbound
+# credentials live in this file, so keep it private (chmod 0600).
+# ---------------------------------------------------------------------------
+# outbounds:
+#   - tag: "unlock"
+#     type: "vless"
+#     server: "203.0.113.10"
+#     port: 443
+#     user_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+#     udp: true                    # default true
+#     tls:                         # trojan/anytls/naiveproxy imply TLS when absent
+#       enabled: true
+#       sni: "unlock.example.com"
+#       allow_insecure: false
+#       # cert_file: "/etc/shoes/ca/unlock-ca.pem"   # private CA pinning
+#       alpn: ["h2", "http/1.1"]
+#     transport:                   # optional; only ws is supported for now
+#       type: "ws"
+#       path: "/unlock"
+#       host: "unlock.example.com"
+#   - tag: "socks-hop"
+#     type: "socks5"               # aliases: socks, ss, naive, ws, ...
+#     server: "127.0.0.1"
+#     port: 1080
+#   - tag: "via-socks"             # chain: forwards through the listed tags
+#     chain: ["socks-hop", "unlock"]
+#   - tag: "direct"
+#     type: "direct"
+
+# Fallback outbound when no route rule matches; absent == direct.
+# default_out: "direct"
+
+# CRS one-liners; matched in order, first match wins. MATCH is the explicit
+# catch-all; GEOSITE/GEOIP reference v2board.route_rule_sets files.
+# route_rules:
+#   - "DOMAIN-SUFFIX,netflix.com,unlock"
+#   - "GEOSITE,netflix,unlock"
+#   - "IP-CIDR,103.102.0.0/24,unlock"
+#   - "MATCH,direct"
+
+# External CRS rule files (one-liner per line), hot-reloaded by mtime.
+# rule_providers:
+#   - tag: "netflix"
+#     path: "/etc/shoes/rules/netflix.yaml"
+#     reload_interval_secs: 300

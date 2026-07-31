@@ -4,6 +4,7 @@ pub mod http;
 pub mod httpupgrade;
 pub mod lkg;
 pub mod mapper;
+pub mod outbound;
 pub mod plugin_api;
 pub mod proxy_protocol;
 pub mod route_rule_set;
