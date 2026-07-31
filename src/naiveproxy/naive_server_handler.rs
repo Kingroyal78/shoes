@@ -34,6 +34,7 @@ pub async fn setup_naive_server_stream<IO: AsyncStream + 'static>(
         tls_stream,
         naive_cfg,
         effective_selector,
+        naive_cfg.outbound_dispatcher.clone(),
         resolver,
         use_h2,
         peer_addr,

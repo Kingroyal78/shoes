@@ -637,6 +637,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     let proxy_selector = self.proxy_selector.clone();
                     let resolver = self.resolver.clone();
                     let udp_enabled = self.udp_enabled;
+                    let outbound_dispatcher = self.outbound_dispatcher.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_h2mux_session(
@@ -645,6 +646,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                             udp_enabled,
                             proxy_selector,
                             resolver,
+                            outbound_dispatcher,
                         )
                         .await
                         {
@@ -741,6 +743,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     stream: server_stream,
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 })
             }
@@ -779,6 +782,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     stream: Box::new(xudp_stream),
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user,
                 })
             }

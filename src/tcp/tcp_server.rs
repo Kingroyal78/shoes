@@ -324,6 +324,7 @@ pub async fn handle_server_setup_result(
                 stream: mut server_stream,
                 need_initial_flush: server_need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher,
                 authenticated_user,
             } => {
                 let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
@@ -345,12 +346,16 @@ pub async fn handle_server_setup_result(
                     server_stream =
                         Box::new(SpeedLimitedMessageStream::new(server_stream, speed_limiter));
                 }
-                let (sniffed_protocol, initial_udp_data) =
-                    if proxy_selector.requires_protocol_sniff() {
-                        sniff_bidirectional_udp_protocol(&mut server_stream).await?
-                    } else {
-                        (None, None)
-                    };
+                let (sniffed_protocol, initial_udp_data) = if proxy_selector
+                    .requires_protocol_sniff()
+                    || outbound_dispatcher
+                        .as_ref()
+                        .is_some_and(|d| d.requires_protocol_sniff())
+                {
+                    sniff_bidirectional_udp_protocol(&mut server_stream).await?
+                } else {
+                    (None, None)
+                };
                 let action = proxy_selector
                     .judge_with_protocol(remote_location.into(), &resolver, sniffed_protocol)
                     .await?;
@@ -359,9 +364,18 @@ pub async fn handle_server_setup_result(
                         chain_group,
                         remote_location,
                     } => {
-                        let mut client_stream = chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await?;
+                        let mut client_stream = match &outbound_dispatcher {
+                            Some(dispatcher) => {
+                                dispatcher
+                                    .connect_udp_bidirectional(&remote_location, &resolver)
+                                    .await?
+                            }
+                            None => {
+                                chain_group
+                                    .connect_udp_bidirectional(&resolver, remote_location)
+                                    .await?
+                            }
+                        };
                         let client_need_initial_flush = match initial_udp_data {
                             Some(data) => {
                                 write_udp_message(&mut client_stream, &data).await?;
@@ -388,6 +402,7 @@ pub async fn handle_server_setup_result(
                 stream: mut server_stream,
                 need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher,
                 authenticated_user,
             } => {
                 let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
@@ -414,6 +429,7 @@ pub async fn handle_server_setup_result(
                 run_udp_routing(
                     ServerStream::Targeted(server_stream),
                     proxy_selector,
+                    outbound_dispatcher,
                     resolver,
                     need_initial_flush,
                 )
@@ -423,6 +439,7 @@ pub async fn handle_server_setup_result(
                 stream: mut server_stream,
                 need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher,
                 authenticated_user,
             } => {
                 let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
@@ -449,6 +466,7 @@ pub async fn handle_server_setup_result(
                 run_udp_routing(
                     ServerStream::Session(server_stream),
                     proxy_selector,
+                    outbound_dispatcher,
                     resolver,
                     need_initial_flush,
                 )

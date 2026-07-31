@@ -200,6 +200,7 @@ impl TcpServerHandler for SnellServerHandler {
                         udp_enabled,
                         proxy_selector,
                         resolver,
+                        None,
                     )
                     .await
                     {
@@ -235,6 +236,7 @@ impl TcpServerHandler for SnellServerHandler {
                 stream: Box::new(udp_stream),
                 need_initial_flush: false,
                 proxy_selector: self.proxy_selector.clone(),
+                outbound_dispatcher: None,
                 authenticated_user: None,
             })
         }

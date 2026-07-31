@@ -302,6 +302,7 @@ pub async fn setup_socks_server_stream_inner(
                 stream: Box::new(uot_stream),
                 need_initial_flush: false,
                 proxy_selector: proxy_selector.clone(),
+                outbound_dispatcher: None,
                 authenticated_user: None,
             });
         } else if host == UOT_V2_MAGIC_ADDRESS {
@@ -335,6 +336,7 @@ pub async fn setup_socks_server_stream_inner(
                     stream: Box::new(uot_v2_stream),
                     need_initial_flush: false,
                     proxy_selector: proxy_selector.clone(),
+                    outbound_dispatcher: None,
                     authenticated_user: None,
                 });
             } else {
@@ -354,6 +356,7 @@ pub async fn setup_socks_server_stream_inner(
                     stream: Box::new(uot_stream),
                     need_initial_flush: false,
                     proxy_selector: proxy_selector.clone(),
+                    outbound_dispatcher: None,
                     authenticated_user: None,
                 });
             }
@@ -484,7 +487,7 @@ async fn run_udp_associate(
 
     // Runs per-destination routing in parallel with TCP monitoring.
     tokio::select! {
-        result = run_udp_routing(ServerStream::Targeted(server_stream), proxy_selector, resolver, false) => {
+        result = run_udp_routing(ServerStream::Targeted(server_stream), proxy_selector, None, resolver, false) => {
             result
         }
         _ = monitor_tcp_close(&mut tcp_stream) => {

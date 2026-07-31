@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
@@ -65,7 +66,7 @@ use crate::tuic_server::{TuicServerUser, TuicServerUsers, start_tuic_server};
 use crate::v2board::grpc::GrpcServerHandler;
 use crate::v2board::http::{V2RayHttp2ServerHandler, V2RayHttpServerHandler};
 use crate::v2board::httpupgrade::HttpUpgradeServerHandler;
-use crate::v2board::outbound::compiler::compile_route_rules;
+use crate::v2board::outbound::compiler::{compile_route_rules, provider_mtimes};
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 use crate::v2board::proxy_protocol::ProxyProtocolServerHandler;
 use crate::v2board::route_rule_set::{load_geoip_matchers, load_geosite_matchers};
@@ -106,6 +107,7 @@ enum RuntimeNodeKind {
         quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
         users: TuicServerUsers,
         proxy_selector: Arc<ClientProxySelector>,
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         zero_rtt_handshake: bool,
         congestion_control: Option<String>,
         num_endpoints: usize,
@@ -114,6 +116,7 @@ enum RuntimeNodeKind {
         quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
         users: Hysteria2ServerUsers,
         proxy_selector: Arc<ClientProxySelector>,
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         num_endpoints: usize,
         udp_enabled: bool,
         up_mbps: u64,
@@ -208,6 +211,7 @@ impl RuntimeNode {
                 quic_server_config,
                 users,
                 proxy_selector,
+                outbound_dispatcher,
                 zero_rtt_handshake,
                 congestion_control,
                 num_endpoints,
@@ -234,6 +238,7 @@ impl RuntimeNode {
                             users.clone(),
                             proxy_selector.clone(),
                             resolver.clone(),
+                            outbound_dispatcher.clone(),
                             num_endpoints,
                             zero_rtt_handshake,
                             congestion_control.clone(),
@@ -247,6 +252,7 @@ impl RuntimeNode {
                 quic_server_config,
                 users,
                 proxy_selector,
+                outbound_dispatcher,
                 num_endpoints,
                 udp_enabled,
                 up_mbps,
@@ -277,6 +283,7 @@ impl RuntimeNode {
                             users: users.clone(),
                             client_proxy_selector: proxy_selector.clone(),
                             resolver: resolver.clone(),
+                            outbound_dispatcher: outbound_dispatcher.clone(),
                             num_endpoints,
                             udp_enabled,
                             up_mbps,
@@ -911,12 +918,26 @@ fn build_outbound_dispatcher(
         };
         chains.insert(outbound.tag.clone(), group);
     }
-    Ok(Some(Arc::new(OutboundDispatcher::new(
-        Some(rules),
-        chains,
-        app_config.default_out.clone(),
-        direct,
-    ))))
+    Ok(Some(Arc::new(if app_config.rule_providers.is_empty() {
+        OutboundDispatcher::new(Some(rules), chains, app_config.default_out.clone(), direct)
+    } else {
+        let baseline_mtimes = provider_mtimes(&app_config.rule_providers)?;
+        let min_interval = app_config
+            .rule_providers
+            .iter()
+            .map(|p| Duration::from_secs(p.reload_interval_secs))
+            .min()
+            .unwrap_or(Duration::from_secs(300));
+        OutboundDispatcher::new(Some(rules), chains, app_config.default_out.clone(), direct)
+            .with_rule_refresh(
+                node_tag,
+                &app_config.route_rules,
+                app_config.rule_providers.clone(),
+                app_config.v2board.route_rule_sets.clone(),
+                min_interval,
+                baseline_mtimes,
+            )
+    })))
 }
 
 /// Resolves the full hop `ClientConfig` list for an outbound tag, expanding
@@ -980,12 +1001,25 @@ fn build_runtime_node_with_shadowsocks_mux(
     match spec.node_type {
         // UDP-only listeners do not use the outbound dispatcher yet; the
         // legacy selector dial path applies.
-        NodeType::Tuic => return build_tuic_runtime_node(spec, tracker, proxy_selector),
+        NodeType::Tuic => {
+            return build_tuic_runtime_node(spec, tracker, proxy_selector, outbound_dispatcher);
+        }
         NodeType::Hysteria => {
-            return build_hysteria2_runtime_node(spec, tracker, proxy_selector);
+            return build_hysteria2_runtime_node(
+                spec,
+                tracker,
+                proxy_selector,
+                outbound_dispatcher,
+            );
         }
         NodeType::Naiveproxy => {
-            return build_naiveproxy_runtime_node(spec, tracker, proxy_selector, resolver);
+            return build_naiveproxy_runtime_node(
+                spec,
+                tracker,
+                proxy_selector,
+                resolver,
+                outbound_dispatcher,
+            );
         }
         _ => {}
     }
@@ -1018,6 +1052,7 @@ fn build_tuic_runtime_node(
     spec: RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (zero_rtt_handshake, congestion_control, udp_relay_mode, disable_sni) = match &spec.protocol
@@ -1092,6 +1127,7 @@ fn build_tuic_runtime_node(
             quic_server_config,
             users,
             proxy_selector,
+            outbound_dispatcher,
             zero_rtt_handshake,
             congestion_control,
             num_endpoints: get_num_threads().max(1),
@@ -1103,6 +1139,7 @@ fn build_hysteria2_runtime_node(
     spec: RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (up_mbps, down_mbps, ignore_client_bandwidth, obfs, obfs_password, masquerade) =
@@ -1177,6 +1214,7 @@ fn build_hysteria2_runtime_node(
             quic_server_config,
             users,
             proxy_selector,
+            outbound_dispatcher,
             num_endpoints: get_num_threads().max(1),
             udp_enabled: true,
             up_mbps,
@@ -1193,6 +1231,7 @@ fn build_naiveproxy_runtime_node(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let quic_congestion_control = match &spec.protocol {
@@ -1227,6 +1266,7 @@ fn build_naiveproxy_runtime_node(
         fallback_path: None,
         udp_enabled: true,
         padding_enabled: true,
+        outbound_dispatcher,
     };
 
     match &spec.transport {

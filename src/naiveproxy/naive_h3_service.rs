@@ -191,6 +191,7 @@ pub async fn start_naive_h3_server(
         fallback_path: naive_cfg.fallback_path,
         resolver,
         proxy_selector: client_proxy_selector,
+        outbound_dispatcher: naive_cfg.outbound_dispatcher,
         peer_addr: None,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
@@ -404,6 +405,7 @@ async fn run_h3_tunnel(
         let stream_context = NaiveStreamContext {
             resolver: config.resolver.clone(),
             proxy_selector: config.proxy_selector.clone(),
+            outbound_dispatcher: config.outbound_dispatcher.clone(),
             udp_enabled: config.udp_enabled,
             user_name: username,
             authenticated_user,

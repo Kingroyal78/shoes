@@ -64,6 +64,9 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn AsyncMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        /// Node-side outbound dispatcher for local routing rules; `None`
+        /// keeps the legacy selector chain-group dial.
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         authenticated_user: Option<AuthenticatedUser>,
     },
     MultiDirectionalUdp {
@@ -71,6 +74,9 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn AsyncTargetedMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        /// Node-side outbound dispatcher for local routing rules; `None`
+        /// keeps the legacy selector chain-group dial.
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         authenticated_user: Option<AuthenticatedUser>,
     },
     SessionBasedUdp {
@@ -78,6 +84,9 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
+        /// Node-side outbound dispatcher for local routing rules; `None`
+        /// keeps the legacy selector chain-group dial.
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         authenticated_user: Option<AuthenticatedUser>,
     },
     /// Connection has been fully handled (e.g., spawned as a background task).

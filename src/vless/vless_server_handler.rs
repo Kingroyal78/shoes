@@ -298,6 +298,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     let proxy_selector = self.proxy_selector.clone();
                     let resolver = self.resolver.clone();
                     let udp_enabled = self.udp_enabled;
+                    let outbound_dispatcher = self.outbound_dispatcher.clone();
 
                     // Pass any unparsed data for the h2mux session
                     let initial_data = stream_reader.unparsed_data_owned();
@@ -309,6 +310,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                             udp_enabled,
                             proxy_selector,
                             resolver,
+                            outbound_dispatcher,
                         )
                         .await
                         {
@@ -362,6 +364,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     stream: Box::new(vless_stream),
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 })
             }
@@ -385,6 +388,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     stream: Box::new(xudp_stream),
                     need_initial_flush: false,
                     proxy_selector: self.proxy_selector.clone(),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user,
                 })
             }
@@ -556,6 +560,7 @@ where
                 stream: Box::new(xudp_stream),
                 need_initial_flush: false, // VisionStream sends VLESS response on first write
                 proxy_selector: proxy_selector.clone(),
+                outbound_dispatcher: outbound_dispatcher.clone(),
                 authenticated_user,
             })
         }

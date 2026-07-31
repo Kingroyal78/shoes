@@ -218,6 +218,7 @@ async fn process_streams(
                 stream: server_stream,
                 need_initial_flush: server_need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher: _,
                 authenticated_user: _,
             } => {
                 let action = proxy_selector
@@ -247,12 +248,14 @@ async fn process_streams(
                 stream: server_stream,
                 need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher: _,
                 authenticated_user: _,
             } => {
                 // Routes each packet based on its destination
                 run_udp_routing(
                     ServerStream::Targeted(server_stream),
                     proxy_selector,
+                    None,
                     resolver,
                     need_initial_flush,
                 )
@@ -262,12 +265,14 @@ async fn process_streams(
                 stream: server_stream,
                 need_initial_flush,
                 proxy_selector,
+                outbound_dispatcher: _,
                 authenticated_user: _,
             } => {
                 // Routes each session based on its destination
                 run_udp_routing(
                     ServerStream::Session(server_stream),
                     proxy_selector,
+                    None,
                     resolver,
                     need_initial_flush,
                 )
@@ -367,6 +372,7 @@ pub async fn start_quic_servers(
                         users,
                         client_proxy_selector,
                         resolver,
+                        outbound_dispatcher: None,
                         num_endpoints,
                         udp_enabled,
                         up_mbps: 0,
@@ -399,6 +405,7 @@ pub async fn start_quic_servers(
                     users,
                     client_proxy_selector,
                     resolver,
+                    None,
                     num_endpoints,
                     zero_rtt_handshake,
                     None,

@@ -32,6 +32,7 @@ use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
 use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
 use crate::tls_server_handler::NaiveConfig;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 use tokio::io::AsyncReadExt;
 
@@ -107,6 +108,7 @@ pub(super) struct NaiveServiceConfig {
     pub(super) fallback_path: Option<PathBuf>,
     pub(super) resolver: Arc<dyn Resolver>,
     pub(super) proxy_selector: Arc<ClientProxySelector>,
+    pub(super) outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     pub(super) peer_addr: Option<SocketAddr>,
     pub(super) udp_enabled: bool,
     pub(super) padding_enabled: bool,
@@ -133,6 +135,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     tls_stream: CryptoTlsStream<IO>,
     naive_cfg: &NaiveConfig,
     effective_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
     use_h2: bool,
     peer_addr: Option<SocketAddr>,
@@ -144,6 +147,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         fallback_path: naive_cfg.fallback_path.clone(),
         resolver,
         proxy_selector: effective_selector,
+        outbound_dispatcher,
         peer_addr,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
@@ -303,6 +307,7 @@ async fn naive_service(
     let on_upgrade = hyper::upgrade::on(&mut req);
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
+    let outbound_dispatcher = config.outbound_dispatcher.clone();
     let peer_addr = config.peer_addr;
     let udp_enabled = config.udp_enabled;
 
@@ -314,6 +319,7 @@ async fn naive_service(
                 let stream_context = NaiveStreamContext {
                     resolver,
                     proxy_selector,
+                    outbound_dispatcher,
                     udp_enabled,
                     user_name: username,
                     authenticated_user,
@@ -461,6 +467,7 @@ async fn serve_fallback(
 pub(super) struct NaiveStreamContext {
     pub resolver: Arc<dyn Resolver>,
     pub proxy_selector: Arc<ClientProxySelector>,
+    pub outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     pub udp_enabled: bool,
     pub user_name: String,
     pub authenticated_user: Option<AuthenticatedUser>,
@@ -477,6 +484,7 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
     let NaiveStreamContext {
         resolver,
         proxy_selector,
+        outbound_dispatcher,
         udp_enabled,
         user_name,
         authenticated_user,
@@ -500,6 +508,7 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
             return run_udp_routing(
                 ServerStream::Targeted(server_stream),
                 proxy_selector,
+                outbound_dispatcher.clone(),
                 resolver,
                 false,
             )
@@ -535,9 +544,18 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
                         chain_group,
                         remote_location,
                     } => {
-                        let client_stream = chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await?;
+                        let client_stream = match &outbound_dispatcher {
+                            Some(dispatcher) => {
+                                dispatcher
+                                    .connect_udp_bidirectional(&remote_location, &resolver)
+                                    .await?
+                            }
+                            None => {
+                                chain_group
+                                    .connect_udp_bidirectional(&resolver, remote_location)
+                                    .await?
+                            }
+                        };
 
                         return run_udp_copy(server_stream, client_stream, false, false).await;
                     }
@@ -556,6 +574,7 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
                 return run_udp_routing(
                     ServerStream::Targeted(server_stream),
                     proxy_selector,
+                    outbound_dispatcher.clone(),
                     resolver,
                     false,
                 )
@@ -584,10 +603,18 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-        } => {
-            let result = chain_group.connect_tcp(remote_location, &resolver).await?;
-            result.client_stream
-        }
+        } => match &outbound_dispatcher {
+            Some(dispatcher) => dispatcher
+                .dial_tcp(remote_location.location(), None, &resolver)
+                .await
+                .map_err(|e| e.to_io_error())?,
+            None => {
+                chain_group
+                    .connect_tcp(remote_location, &resolver)
+                    .await?
+                    .client_stream
+            }
+        },
         ConnectDecision::Block => {
             debug!("NaiveProxy: connection blocked by rules");
             return Ok(());

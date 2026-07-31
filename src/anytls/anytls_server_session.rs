@@ -982,17 +982,36 @@ impl AnyTlsSession {
                 let server_stream: Box<dyn AsyncMessageStream> =
                     scope.wrap_message_stream(Box::new(VlessMessageStream::new(stream)));
 
-                // Connect through the proxy chain
-                let client_stream = match chain_group
-                    .connect_udp_bidirectional(&self.resolver, remote_location)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        // Send SYNACK with error (protocol v2)
-                        let error_msg = format!("UDP connect failed: {}", e);
-                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        return Err(e);
+                // Connect through the proxy chain (local routing rules take
+                // over the dial when a dispatcher is configured)
+                let client_stream = match &self.outbound_dispatcher {
+                    Some(dispatcher) => {
+                        match dispatcher
+                            .connect_udp_bidirectional(&remote_location, &self.resolver)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => {
+                                // Send SYNACK with error (protocol v2)
+                                let error_msg = format!("UDP connect failed: {}", e);
+                                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    None => {
+                        match chain_group
+                            .connect_udp_bidirectional(&self.resolver, remote_location)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => {
+                                // Send SYNACK with error (protocol v2)
+                                let error_msg = format!("UDP connect failed: {}", e);
+                                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                                return Err(e);
+                            }
+                        }
                     }
                 };
 
@@ -1061,6 +1080,7 @@ impl AnyTlsSession {
         let result = run_udp_routing(
             ServerStream::Targeted(server_stream),
             self.proxy_provider.clone(),
+            self.outbound_dispatcher.clone(),
             self.resolver.clone(),
             false, // no initial flush needed
         )

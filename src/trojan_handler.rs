@@ -795,6 +795,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                     .proxy_selector
                     .clone()
                     .expect("proxy_selector required for server handler"),
+                outbound_dispatcher: self.outbound_dispatcher.clone(),
                 authenticated_user,
             });
         }
@@ -816,6 +817,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                 .clone()
                 .expect("proxy_selector required for server handler");
             let resolver = self.resolver.clone().expect("resolver required for h2mux");
+            let outbound_dispatcher = self.outbound_dispatcher.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = handle_h2mux_session(
@@ -824,6 +826,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                     false,
                     proxy_selector,
                     resolver,
+                    outbound_dispatcher,
                 )
                 .await
                 {

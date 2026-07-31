@@ -18,6 +18,7 @@ use crate::shadow_tls::{
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerHandler, TcpServerSetupResult};
 
 use crate::address::NetLocation;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 /// Configuration for Vision VLESS inner protocol
 #[derive(Debug, Clone)]
@@ -34,6 +35,9 @@ pub struct NaiveConfig {
     pub fallback_path: Option<PathBuf>,
     pub udp_enabled: bool,
     pub padding_enabled: bool,
+    /// Node-side outbound dispatcher for local routing rules; `None` keeps
+    /// the legacy selector chain dial.
+    pub outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 }
 
 /// What to do after TLS/Reality termination.

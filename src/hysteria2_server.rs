@@ -1,9 +1,11 @@
 use lru::LruCache;
 use std::collections::{HashMap, hash_map::Entry};
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -11,8 +13,8 @@ use log::{debug, error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -42,8 +44,10 @@ const PROTOCOL_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
 const HYSTERIA_MIBPS_TO_BPS: u64 = 125_000;
 const HYSTERIA2_OBFS_MAX_QUIC_UDP_PAYLOAD: u16 = 1444;
 
-use crate::address::NetLocation;
-use crate::async_stream::AsyncStream;
+use crate::address::{NetLocation, ResolvedLocation};
+use crate::async_stream::{
+    AsyncFlushMessage, AsyncMessageStream, AsyncReadMessage, AsyncStream, AsyncWriteMessage,
+};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, SniffedProtocol};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::hysteria2_obfs::Hysteria2Obfs;
@@ -56,6 +60,7 @@ use crate::tcp::tcp_server::{
     AuthenticatedConnectionScope, DirectionalSpeedLimiters, setup_client_tcp_stream,
 };
 use crate::util::allocate_vec;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerUser {
@@ -191,6 +196,7 @@ pub struct Hysteria2StartConfig {
     pub users: Hysteria2ServerUsers,
     pub client_proxy_selector: Arc<ClientProxySelector>,
     pub resolver: Arc<dyn Resolver>,
+    pub outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     pub num_endpoints: usize,
     pub udp_enabled: bool,
     pub up_mbps: u64,
@@ -204,6 +210,7 @@ pub struct Hysteria2StartConfig {
 struct Hysteria2ConnectionContext {
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     users: Hysteria2ServerUsers,
     udp_enabled: bool,
     down_mbps: u64,
@@ -219,6 +226,7 @@ async fn process_connection(
     let Hysteria2ConnectionContext {
         client_proxy_selector,
         resolver,
+        outbound_dispatcher,
         users,
         udp_enabled,
         down_mbps,
@@ -303,6 +311,8 @@ async fn process_connection(
     let udp_cancel_token = cancel_token.clone();
     let udp_connection_scope = connection_scope.clone();
 
+    let udp_dispatcher = outbound_dispatcher.clone();
+
     let uni_connection = connection.clone();
 
     // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
@@ -312,6 +322,7 @@ async fn process_connection(
             run_udp_local_to_remote_loop(
                 udp_connection,
                 udp_client_proxy_selector,
+                udp_dispatcher,
                 udp_resolver,
                 udp_cancel_token,
                 udp_connection_scope,
@@ -629,7 +640,7 @@ async fn send_hysteria2_masquerade_response(
 }
 
 struct UdpSession {
-    send_socket: Arc<UdpSocket>,
+    packet_tx: mpsc::Sender<(Bytes, SocketAddr)>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
     last_location: NetLocation,
@@ -661,12 +672,11 @@ struct PreparedHysteria2UdpPacket {
 }
 
 impl UdpSession {
-    // TODO: remove this function completely and inline?
     #[allow(clippy::too_many_arguments)]
     fn start(
+        client_stream: Box<dyn AsyncMessageStream>,
         session_id: u32,
         connection: quinn::Connection,
-        client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
@@ -674,11 +684,13 @@ impl UdpSession {
         parent_cancel_token: &CancellationToken,
         connection_scope: Arc<AuthenticatedConnectionScope>,
     ) -> Self {
-        // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
+        let (tx, rx) = mpsc::channel(64);
+
+        let fallback_address_bytes: Bytes = initial_location.to_string().into_bytes().into();
 
         let session = UdpSession {
-            send_socket: client_socket.clone(),
+            packet_tx: tx,
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
@@ -687,17 +699,19 @@ impl UdpSession {
         };
 
         tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_loop(
+            if let Err(e) = run_udp_session_loop(
+                client_stream,
+                rx,
                 session_id,
                 connection,
-                client_socket,
                 override_local_write_location,
+                fallback_address_bytes,
                 session_cancel_token,
                 connection_scope,
             )
             .await
             {
-                error!("UDP remote-to-local write loop ended with error: {e}");
+                error!("UDP session loop ended with error: {e}");
             }
         });
 
@@ -705,11 +719,14 @@ impl UdpSession {
     }
 }
 
-async fn run_udp_remote_to_local_loop(
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_session_loop(
+    mut client_stream: Box<dyn AsyncMessageStream>,
+    mut rx: mpsc::Receiver<(Bytes, SocketAddr)>,
     session_id: u32,
     connection: quinn::Connection,
-    socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
+    fallback_address_bytes: Bytes,
     cancel_token: CancellationToken,
     connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
@@ -728,101 +745,109 @@ async fn run_udp_remote_to_local_loop(
     };
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(65535);
+    let mut read_buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
-            Ok(res) => res,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        return Ok(());
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Ok(());
+            }
+            packet = rx.recv() => {
+                match packet {
+                    Some((payload, _socket_addr)) => {
+                        poll_fn(|cx| Pin::new(&mut client_stream).poll_write_message(cx, &payload))
+                            .await
+                            .map_err(|e| std::io::Error::other(format!("UDP session write failed: {e}")))?;
+                        poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
+                            .await
+                            .map_err(|e| std::io::Error::other(format!("UDP session flush failed: {e}")))?;
                     }
-                    result = socket.readable() => {
-                        result?;
-                        continue;
-                    }
+                    None => return Ok(()),
                 }
             }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {e}"
-                )));
-            }
-        };
-
-        // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
-        // This prevents starvation during heavy UDP traffic.
-        loop_count = loop_count.wrapping_add(1);
-        if loop_count == 0 {
-            tokio::task::yield_now().await;
-        }
-
-        let packet_id = next_packet_id;
-        next_packet_id = next_packet_id.wrapping_add(1);
-
-        let (address_bytes, address_len_bytes) = match original_address_bytes {
-            Some((ref a, ref b)) => (a.clone(), b.clone()),
-            None => {
-                let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
-                // no need to do a length check since this is a socket address and an IP.
-                let address_len = address_bytes.len();
-                let address_len_bytes = encode_varint(address_len as u64)?.into();
-                (address_bytes, address_len_bytes)
-            }
-        };
-
-        // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
-        let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
-
-        if max_datagram_size <= header_overhead {
-            return Err(std::io::Error::other(format!(
-                "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-            )));
-        }
-
-        connection_scope.throttle_download_bytes(payload_len).await;
-        if header_overhead + payload_len <= max_datagram_size {
-            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
-            datagram.extend_from_slice(&session_id.to_be_bytes());
-            datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 1
-            datagram.extend_from_slice(&[0, 1]);
-            datagram.extend_from_slice(&address_len_bytes);
-            datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
-
-            connection
-                .send_datagram(datagram.freeze())
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
-            connection_scope.record_download_bytes(payload_len);
-        } else {
-            let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = payload_len.div_ceil(available_payload);
-            let fragment_count = u8::try_from(fragment_count).map_err(|_| {
-                std::io::Error::other(format!(
-                    "UDP payload length {payload_len} requires too many fragments"
-                ))
-            })?;
-            for fragment_id in 0..fragment_count {
-                let start = (fragment_id as usize) * available_payload;
-                let end = std::cmp::min(start + available_payload, payload_len);
-                let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
-                datagram.extend_from_slice(&session_id.to_be_bytes());
-                datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_id, fragment_count]);
-                datagram.extend_from_slice(&address_len_bytes);
-                datagram.extend_from_slice(&address_bytes);
-                datagram.extend_from_slice(&buf[start..end]);
-
-                connection.send_datagram(datagram.freeze()).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to send datagram fragment {fragment_id}: {e}"
-                    ))
+            result = poll_fn(|cx| {
+                let mut rb = ReadBuf::new(&mut read_buf);
+                match Pin::new(&mut client_stream).poll_read_message(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }) => {
+                let payload_len = result.map_err(|e| {
+                    std::io::Error::other(format!("UDP session read failed: {e}"))
                 })?;
+                if payload_len == 0 {
+                    continue;
+                }
+
+                loop_count = loop_count.wrapping_add(1);
+                if loop_count == 0 {
+                    tokio::task::yield_now().await;
+                }
+
+                let packet_id = next_packet_id;
+                next_packet_id = next_packet_id.wrapping_add(1);
+
+                let (address_bytes, address_len_bytes) = match original_address_bytes {
+                    Some((ref a, ref b)) => (a.clone(), b.clone()),
+                    None => {
+                        let addr_len = fallback_address_bytes.len();
+                        let addr_len_bytes = encode_varint(addr_len as u64)?.into();
+                        (fallback_address_bytes.clone(), addr_len_bytes)
+                    }
+                };
+
+                let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+
+                if max_datagram_size <= header_overhead {
+                    return Err(std::io::Error::other(format!(
+                        "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
+                    )));
+                }
+
+                connection_scope.throttle_download_bytes(payload_len).await;
+                if header_overhead + payload_len <= max_datagram_size {
+                    let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
+                    datagram.extend_from_slice(&session_id.to_be_bytes());
+                    datagram.extend_from_slice(&packet_id.to_be_bytes());
+                    datagram.extend_from_slice(&[0, 1]);
+                    datagram.extend_from_slice(&address_len_bytes);
+                    datagram.extend_from_slice(&address_bytes);
+                    datagram.extend_from_slice(&read_buf[..payload_len]);
+
+                    connection
+                        .send_datagram(datagram.freeze())
+                        .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
+                    connection_scope.record_download_bytes(payload_len);
+                } else {
+                    let available_payload = max_datagram_size - header_overhead;
+                    let fragment_count = payload_len.div_ceil(available_payload);
+                    let fragment_count = u8::try_from(fragment_count).map_err(|_| {
+                        std::io::Error::other(format!(
+                            "UDP payload length {payload_len} requires too many fragments"
+                        ))
+                    })?;
+                    for fragment_id in 0..fragment_count {
+                        let start = (fragment_id as usize) * available_payload;
+                        let end = std::cmp::min(start + available_payload, payload_len);
+                        let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+                        datagram.extend_from_slice(&session_id.to_be_bytes());
+                        datagram.extend_from_slice(&packet_id.to_be_bytes());
+                        datagram.extend_from_slice(&[fragment_id, fragment_count]);
+                        datagram.extend_from_slice(&address_len_bytes);
+                        datagram.extend_from_slice(&address_bytes);
+                        datagram.extend_from_slice(&read_buf[start..end]);
+
+                        connection.send_datagram(datagram.freeze()).map_err(|e| {
+                            std::io::Error::other(format!(
+                                "Failed to send datagram fragment {fragment_id}: {e}"
+                            ))
+                        })?;
+                    }
+                    connection_scope.record_download_bytes(payload_len);
+                }
             }
-            connection_scope.record_download_bytes(payload_len);
         }
     }
 }
@@ -998,6 +1023,7 @@ fn remove_hysteria2_fragments_for_session(fragments: &mut UdpFragmentMap, sessio
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
     cancel_token: CancellationToken,
     connection_scope: Arc<AuthenticatedConnectionScope>,
@@ -1134,117 +1160,80 @@ async fn run_udp_local_to_remote_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
-                let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
-                    sniff_udp_protocol(&complete_payload)
-                } else {
-                    None
-                };
-                let action = client_proxy_selector
-                    .judge_with_protocol(
-                        remote_location.clone().into(),
-                        &resolver,
-                        sniffed_protocol,
-                    )
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {remote_location}");
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to judge UDP forward to {remote_location}: {e}");
-                        continue;
-                    }
-                };
-
-                // the remote location specified at the beginning of a session is assumed
-                // to be the remote location for the entire session iif it does not match
-                // the resolved address, as per the official client - which is only if
-                // it's a hostname. in our case, we also have to handle when the remote
-                // location is replaced by a different location in the rules.
-                //
-                // it's possible that when we receive packets on the client socket,
-                // it could be the resolved hostname versus what was initially provided,
-                // and we need to write datagrams back to the user using their provided
-                // address so that they know where it's from.
-                //
-                // it would be much simpler to always replace, or never, but we stick to
-                // the official client behavior for now.
-                //
-                // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
-
-                let resolved_address = match resolver_cache
-                    .resolve_location(updated_location.location())
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to resolve initial remote location {remote_location}: {e}");
-                        continue;
-                    }
-                };
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
+                if let Some(dispatcher) = &outbound_dispatcher {
+                    let sniffed_protocol = if dispatcher.requires_protocol_sniff() {
+                        sniff_udp_protocol(&complete_payload)
                     } else {
-                        (None, None)
+                        None
+                    };
+                    let _ = sniffed_protocol;
+
+                    let resolved_address = match resolver_cache
+                        .resolve_location(&remote_location)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                "Failed to resolve initial remote location {remote_location}: {e}"
+                            );
+                            continue;
+                        }
                     };
 
-                // even if the remote location is ipv4, a future location could be ipv6.
-                // TODO: the configured client socket is for the current remote_location, but
-                // the remote_location could be changed later on with a different client_socket
-                // configuration.
-                // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                    let (override_remote_write_address, override_local_write_location) =
+                        if resolved_address.to_string() != remote_location.to_string() {
+                            (Some(resolved_address), Some(remote_location.clone()))
+                        } else {
+                            (None, None)
+                        };
 
-                let session = UdpSession::start(
-                    session_id,
-                    connection.clone(),
-                    Arc::new(client_socket),
-                    remote_location.clone(),
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
-                    &cancel_token,
-                    connection_scope.clone(),
-                );
-                entry.insert(session)
-            }
-            Entry::Occupied(ref mut entry) => entry.get_mut(),
-        };
+                    let resolved =
+                        ResolvedLocation::with_resolved(remote_location.clone(), resolved_address);
+                    let client_stream = match dispatcher
+                        .connect_udp_bidirectional(&resolved, &resolver)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                "Dispatcher failed to open UDP session to {remote_location}: {e}"
+                            );
+                            continue;
+                        }
+                    };
 
-        let socket_addr = match session.override_remote_write_address {
-            Some(addr) => addr,
-            None => {
-                if remote_location == session.last_location {
-                    session.last_socket_addr
-                } else {
-                    warn!(
-                        "Location changed during ongoing UDP session: {}",
-                        remote_location.clone()
+                    let session = UdpSession::start(
+                        client_stream,
+                        session_id,
+                        connection.clone(),
+                        remote_location.clone(),
+                        resolved_address,
+                        override_local_write_location,
+                        override_remote_write_address,
+                        &cancel_token,
+                        connection_scope.clone(),
                     );
+                    entry.insert(session)
+                } else {
+                    let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+                        sniff_udp_protocol(&complete_payload)
+                    } else {
+                        None
+                    };
                     let action = client_proxy_selector
                         .judge_with_protocol(
                             remote_location.clone().into(),
                             &resolver,
-                            if client_proxy_selector.requires_protocol_sniff() {
-                                sniff_udp_protocol(&complete_payload)
-                            } else {
-                                None
-                            },
+                            sniffed_protocol,
                         )
                         .await;
-                    let updated_location = match action {
+
+                    let (chain_group, updated_location) = match action {
                         Ok(ConnectDecision::Allow {
-                            chain_group: _,
+                            chain_group,
                             remote_location,
-                        }) => remote_location,
+                        }) => (chain_group, remote_location),
                         Ok(ConnectDecision::Block) => {
                             warn!("Blocked UDP forward to {remote_location}");
                             continue;
@@ -1254,38 +1243,127 @@ async fn run_udp_local_to_remote_loop(
                             continue;
                         }
                     };
-                    let updated_socket_addr = match resolver_cache
+
+                    let resolved_address = match resolver_cache
                         .resolve_location(updated_location.location())
                         .await
                     {
                         Ok(s) => s,
                         Err(e) => {
                             error!(
-                                "Failed to resolve updated remote location {}: {e}",
-                                updated_location.location()
+                                "Failed to resolve initial remote location {remote_location}: {e}"
                             );
                             continue;
                         }
                     };
-                    session.last_location = updated_location.into_location();
-                    session.last_socket_addr = updated_socket_addr;
-                    updated_socket_addr
+
+                    let (override_remote_write_address, override_local_write_location) =
+                        if resolved_address.to_string() != remote_location.to_string() {
+                            (Some(resolved_address), Some(remote_location.clone()))
+                        } else {
+                            (None, None)
+                        };
+
+                    let client_stream = match chain_group
+                        .connect_udp_bidirectional(&resolver, updated_location)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                "Chain group failed to open UDP session to {remote_location}: {e}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let session = UdpSession::start(
+                        client_stream,
+                        session_id,
+                        connection.clone(),
+                        remote_location.clone(),
+                        resolved_address,
+                        override_local_write_location,
+                        override_remote_write_address,
+                        &cancel_token,
+                        connection_scope.clone(),
+                    );
+                    entry.insert(session)
+                }
+            }
+            Entry::Occupied(ref mut entry) => entry.get_mut(),
+        };
+
+        let socket_addr = if let Some(ref _dispatcher) = outbound_dispatcher {
+            session.last_socket_addr
+        } else {
+            match session.override_remote_write_address {
+                Some(addr) => addr,
+                None => {
+                    if remote_location == session.last_location {
+                        session.last_socket_addr
+                    } else {
+                        warn!(
+                            "Location changed during ongoing UDP session: {}",
+                            remote_location.clone()
+                        );
+                        let action = client_proxy_selector
+                            .judge_with_protocol(
+                                remote_location.clone().into(),
+                                &resolver,
+                                if client_proxy_selector.requires_protocol_sniff() {
+                                    sniff_udp_protocol(&complete_payload)
+                                } else {
+                                    None
+                                },
+                            )
+                            .await;
+                        let updated_location = match action {
+                            Ok(ConnectDecision::Allow {
+                                chain_group: _,
+                                remote_location,
+                            }) => remote_location,
+                            Ok(ConnectDecision::Block) => {
+                                warn!("Blocked UDP forward to {remote_location}");
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("Failed to judge UDP forward to {remote_location}: {e}");
+                                continue;
+                            }
+                        };
+                        let updated_socket_addr = match resolver_cache
+                            .resolve_location(updated_location.location())
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!(
+                                    "Failed to resolve updated remote location {}: {e}",
+                                    updated_location.location()
+                                );
+                                continue;
+                            }
+                        };
+                        session.last_location = updated_location.into_location();
+                        session.last_socket_addr = updated_socket_addr;
+                        updated_socket_addr
+                    }
                 }
             }
         };
 
-        connection_scope
-            .throttle_upload_bytes(complete_payload.len())
-            .await;
+        let payload_len = complete_payload.len();
+        connection_scope.throttle_upload_bytes(payload_len).await;
         if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
+            .packet_tx
+            .send((complete_payload, socket_addr))
             .await
         {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
             sessions.remove(&session_id);
         } else {
-            connection_scope.record_upload_bytes(complete_payload.len());
+            connection_scope.record_upload_bytes(payload_len);
             session.last_activity = std::time::Instant::now();
         }
     }
@@ -1601,6 +1679,7 @@ pub async fn start_hysteria2_server(
         users,
         client_proxy_selector,
         resolver,
+        outbound_dispatcher,
         num_endpoints,
         udp_enabled,
         up_mbps,
@@ -1690,6 +1769,7 @@ pub async fn start_hysteria2_server(
         let connection_context = Hysteria2ConnectionContext {
             client_proxy_selector: client_proxy_selector.clone(),
             resolver: resolver.clone(),
+            outbound_dispatcher: outbound_dispatcher.clone(),
             users: users.clone(),
             udp_enabled,
             down_mbps,

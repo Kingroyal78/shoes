@@ -613,6 +613,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             let expected_padding = self.h2mux_padding;
 
             let initial_data = stream_reader.unparsed_data_owned();
+            let outbound_dispatcher = self.outbound_dispatcher.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = handle_h2mux_session_with_context(
@@ -621,6 +622,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     udp_enabled,
                     proxy_selector,
                     resolver,
+                    outbound_dispatcher,
                     expected_padding,
                     authenticated_user,
                     peer_addr,
@@ -664,6 +666,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                         .proxy_selector
                         .clone()
                         .expect("proxy_selector required for server handler"),
+                    outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 });
             } else if host == UOT_V2_MAGIC_ADDRESS {
@@ -695,6 +698,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                             .proxy_selector
                             .clone()
                             .expect("proxy_selector required for server handler"),
+                        outbound_dispatcher: self.outbound_dispatcher.clone(),
                         authenticated_user: authenticated_user.clone(),
                     });
                 } else {
@@ -716,6 +720,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                             .proxy_selector
                             .clone()
                             .expect("proxy_selector required for server handler"),
+                        outbound_dispatcher: self.outbound_dispatcher.clone(),
                         authenticated_user: authenticated_user.clone(),
                     });
                 }

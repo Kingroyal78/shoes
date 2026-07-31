@@ -20,6 +20,7 @@ use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
 use crate::tcp::tcp_server::handle_server_setup_result;
 use crate::uot::SocksPacketAddrStream;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 use crate::vless::VlessMessageStream;
 
 use super::MuxProtocol;
@@ -362,6 +363,7 @@ pub async fn handle_h2mux_session<S>(
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -372,6 +374,7 @@ where
         udp_enabled,
         proxy_selector,
         resolver,
+        outbound_dispatcher,
         None,
         None,
         None,
@@ -389,6 +392,7 @@ pub async fn handle_h2mux_session_with_context<S>(
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     expected_padding: bool,
     authenticated_user: Option<AuthenticatedUser>,
     peer_addr: Option<SocketAddr>,
@@ -402,6 +406,7 @@ where
         udp_enabled,
         proxy_selector,
         resolver,
+        outbound_dispatcher,
         Some(expected_padding),
         authenticated_user,
         peer_addr,
@@ -416,6 +421,7 @@ async fn handle_h2mux_session_inner<S>(
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     expected_padding: Option<bool>,
     authenticated_user: Option<AuthenticatedUser>,
     peer_addr: Option<SocketAddr>,
@@ -444,6 +450,7 @@ where
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
         let authenticated_user = authenticated_user.clone();
+        let outbound_dispatcher = outbound_dispatcher.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_h2mux_stream(
@@ -451,6 +458,7 @@ where
                 udp_enabled,
                 proxy_selector,
                 resolver,
+                outbound_dispatcher,
                 authenticated_user,
                 peer_addr,
             )
@@ -471,6 +479,7 @@ async fn handle_h2mux_stream(
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     authenticated_user: Option<AuthenticatedUser>,
     peer_addr: Option<SocketAddr>,
 ) -> io::Result<()> {
@@ -506,6 +515,7 @@ async fn handle_h2mux_stream(
                 stream: Box::new(SocksPacketAddrStream::new_socks(Box::new(stream))),
                 need_initial_flush: false,
                 proxy_selector,
+                outbound_dispatcher,
                 authenticated_user,
             }
         } else {
@@ -515,6 +525,7 @@ async fn handle_h2mux_stream(
                 stream: Box::new(VlessMessageStream::new(Box::new(stream))),
                 need_initial_flush: false,
                 proxy_selector,
+                outbound_dispatcher,
                 authenticated_user,
             }
         };
@@ -527,7 +538,7 @@ async fn handle_h2mux_stream(
             connection_success_response: None,
             initial_remote_data: None,
             proxy_selector,
-            outbound_dispatcher: None,
+            outbound_dispatcher,
             authenticated_user,
         };
         handle_server_setup_result(setup_result, resolver, peer_addr).await

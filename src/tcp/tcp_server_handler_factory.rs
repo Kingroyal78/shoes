@@ -366,6 +366,7 @@ fn create_tls_server_target(
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,
+            outbound_dispatcher: None,
         })
     } else if vision {
         // Vision requires VLESS protocol (validated in config/mod.rs)
@@ -526,6 +527,7 @@ fn create_reality_server_target(
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,
+            outbound_dispatcher: None,
         })
     } else if vision {
         // Vision requires VLESS protocol (validated in config/mod.rs)

@@ -8,14 +8,18 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::backend_config::{RouteRuleSetsConfig, RuleProviderConfig};
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::client_proxy_selector::SniffedProtocol;
 use crate::h2mux::PrependStream;
 use crate::resolver::{Resolver, resolve_addresses};
 
+use super::compiler::{compile_route_rules, provider_mtimes};
 use super::index::CompiledRules;
 
 /// Dial result: the established stream (direct or proxied).
@@ -59,22 +63,38 @@ impl From<std::io::Error> for DialError {
 
 /// The node-side outbound dispatcher. Shared (`Arc`) across handlers.
 pub struct OutboundDispatcher {
-    /// Compiled rules; `None` when no local routing is configured.
-    rules: Option<Arc<CompiledRules>>,
+    /// Compiled rules; `None` when no local routing is configured. Guarded so
+    /// rule-provider hot reload can swap the compiled set.
+    rules: RwLock<Option<Arc<CompiledRules>>>,
     /// Tag → chain group (round-robin over chains).
     chains: HashMap<String, Arc<ClientChainGroup>>,
     /// Fallback outbound tag when no rule matches; `None` = direct.
     default_out: Option<String>,
     /// Prebuilt direct chain group used when no routing is configured.
     direct: Arc<ClientChainGroup>,
+    /// Rule-provider reload state; `None` when hot reload is not configured.
+    refresh: Option<RwLock<RuleRefreshState>>,
+}
+
+/// Hot-reload state for `rule_providers` files. The compiled rule set is
+/// swapped lazily on the next dial once provider mtimes change.
+struct RuleRefreshState {
+    node_tag: String,
+    config_lines: Vec<String>,
+    providers: Vec<RuleProviderConfig>,
+    rule_sets: RouteRuleSetsConfig,
+    interval: Duration,
+    last_check: Instant,
+    last_mtimes: HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for OutboundDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutboundDispatcher")
-            .field("has_routing", &self.rules.is_some())
+            .field("has_routing", &self.rules.read().unwrap().is_some())
             .field("chain_tags", &self.chains.keys().collect::<Vec<_>>())
             .field("default_out", &self.default_out)
+            .field("hot_reload", &self.refresh.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -115,48 +135,102 @@ impl OutboundDispatcher {
         direct: Arc<ClientChainGroup>,
     ) -> Self {
         Self {
-            rules,
+            rules: RwLock::new(rules),
             chains,
             default_out,
             direct,
+            refresh: None,
+        }
+    }
+
+    /// Attaches rule-provider hot reload. `interval` is the minimum of the
+    /// configured provider reload intervals; `last_mtimes` seeds the mtime
+    /// baseline so the first dial does not reload unnecessarily.
+    pub fn with_rule_refresh(
+        mut self,
+        node_tag: &str,
+        config_lines: &[String],
+        providers: Vec<RuleProviderConfig>,
+        rule_sets: RouteRuleSetsConfig,
+        interval: Duration,
+        last_mtimes: HashMap<String, u64>,
+    ) -> Self {
+        self.refresh = Some(RwLock::new(RuleRefreshState {
+            node_tag: node_tag.to_string(),
+            config_lines: config_lines.to_vec(),
+            providers,
+            rule_sets,
+            interval,
+            last_check: Instant::now(),
+            last_mtimes,
+        }));
+        self
+    }
+
+    /// Recompiles the rule set when a rule-provider file's mtime changed and
+    /// the reload interval elapsed. Swaps the compiled set on success; on
+    /// failure keeps the previous set and retries on the next check.
+    pub fn maybe_refresh_rules(&self) {
+        let Some(lock) = &self.refresh else {
+            return;
+        };
+        let mut state = match lock.try_write() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.last_check.elapsed() < state.interval {
+            return;
+        }
+        state.last_check = Instant::now();
+        let Ok(mtimes) = provider_mtimes(&state.providers) else {
+            return;
+        };
+        if mtimes == state.last_mtimes {
+            return;
+        }
+        match compile_route_rules(
+            &state.node_tag,
+            &state.config_lines,
+            &state.providers,
+            &state.rule_sets,
+        ) {
+            Ok(compiled) => {
+                state.last_mtimes = mtimes;
+                *self.rules.write().unwrap() = Some(Arc::new(compiled));
+                log::info!("outbound rules reloaded: provider mtimes changed");
+            }
+            Err(err) => log::warn!("outbound rules reload failed: {err}"),
         }
     }
 
     pub fn has_routing(&self) -> bool {
-        self.rules.is_some()
+        self.rules.read().unwrap().is_some()
     }
 
     /// True when the compiled rules contain `PROTOCOL` matchers, requiring
     /// protocol sniffing on incoming connections.
     pub fn requires_protocol_sniff(&self) -> bool {
         self.rules
+            .read()
+            .unwrap()
             .as_ref()
             .is_some_and(|rules| rules.has_protocol_rules())
     }
 
-    /// Dial `target`, optionally with a sniffed protocol. Resolver is used to
-    /// resolve hostname targets when IP rules exist.
-    ///
-    /// Decision order: protocol rule (only when `sniffed` is `Some`), then
-    /// domain rule (hostname targets only), then IP rule (IP literals
-    /// directly, hostname targets via DNS when IP rules exist), then the
-    /// `MATCH` catch-all, then `default_out`, then direct. The `match_*`
-    /// indexes each return the smallest-order hit within their matcher type,
-    /// so cross-type order (protocol vs domain vs IP) is approximated by this
-    /// fixed priority rather than by global rule order.
-    pub async fn dial_tcp(
+    /// Decides the outbound tag for `target`, mirroring `dial_tcp`'s decision
+    /// order. `None` means direct. Sniffed protocols are only consulted when
+    /// `sniffed` is `Some`.
+    async fn select_outbound(
         &self,
         target: &NetLocation,
         sniffed: Option<SniffedProtocol>,
         resolver: &Arc<dyn Resolver>,
-    ) -> Result<DialedStream, DialError> {
-        let Some(rules) = self.rules.as_ref() else {
-            log::debug!("outbound dispatch {target}: no routing configured, direct");
-            return dial_via_group(&self.direct, target, resolver).await;
+    ) -> Result<Option<String>, DialError> {
+        let Some(rules) = self.rules.read().unwrap().clone() else {
+            return Ok(None);
         };
         if rules.is_empty() {
-            log::debug!("outbound dispatch {target}: empty rule set, direct");
-            return dial_via_group(&self.direct, target, resolver).await;
+            return Ok(None);
         }
 
         // 1. Protocol bucket, only consulted when a protocol was sniffed.
@@ -192,25 +266,122 @@ impl OutboundDispatcher {
         }
 
         // 4. Fallbacks: MATCH catch-all, then default_out, then direct.
-        let outbound = match outbound {
-            Some(tag) => tag,
-            None => match rules.match_catch_all().or(self.default_out.as_deref()) {
-                Some(tag) => tag,
-                None => {
-                    log::debug!("outbound dispatch {target}: no rule matched, direct");
-                    return dial_via_group(&self.direct, target, resolver).await;
-                }
-            },
+        Ok(outbound
+            .map(str::to_string)
+            .or_else(|| rules.match_catch_all().map(str::to_string))
+            .or_else(|| self.default_out.clone()))
+    }
+
+    /// Dial `target`, optionally with a sniffed protocol. Resolver is used to
+    /// resolve hostname targets when IP rules exist.
+    ///
+    /// Decision order: protocol rule (only when `sniffed` is `Some`), then
+    /// domain rule (hostname targets only), then IP rule (IP literals
+    /// directly, hostname targets via DNS when IP rules exist), then the
+    /// `MATCH` catch-all, then `default_out`, then direct. The `match_*`
+    /// indexes each return the smallest-order hit within their matcher type,
+    /// so cross-type order (protocol vs domain vs IP) is approximated by this
+    /// fixed priority rather than by global rule order.
+    pub async fn dial_tcp(
+        &self,
+        target: &NetLocation,
+        sniffed: Option<SniffedProtocol>,
+        resolver: &Arc<dyn Resolver>,
+    ) -> Result<DialedStream, DialError> {
+        self.maybe_refresh_rules();
+        let Some(outbound) = self.select_outbound(target, sniffed, resolver).await? else {
+            log::debug!("outbound dispatch {target}: no rule matched, direct");
+            return dial_via_group(&self.direct, target, resolver).await;
         };
 
-        // 5. Dial through the matched outbound's chain group. A tag without a
-        //    chain group is a configuration error: fail-closed.
+        // Dial through the matched outbound's chain group. A tag without a
+        // chain group is a configuration error: fail-closed.
         let group = self
             .chains
-            .get(outbound)
+            .get(&outbound)
             .ok_or(DialError::MissingOutbound)?;
         log::debug!("outbound dispatch {target}: outbound `{outbound}`");
         dial_via_group(group, target, resolver).await
+    }
+
+    /// Establishes a bidirectional UDP relay stream for `target` through the
+    /// matched outbound's chain group. The target is pre-resolved (callers
+    /// resolve hostnames), so only domain/IP literals and fallbacks apply.
+    pub async fn connect_udp_bidirectional(
+        &self,
+        target: &ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        self.maybe_refresh_rules();
+        let Some(rules) = self.rules.read().unwrap().clone() else {
+            log::debug!("outbound dispatch {target}: no routing configured, direct");
+            return self
+                .direct
+                .connect_udp_bidirectional(resolver, target.clone())
+                .await;
+        };
+        if rules.is_empty() {
+            log::debug!("outbound dispatch {target}: empty rule set, direct");
+            return self
+                .direct
+                .connect_udp_bidirectional(resolver, target.clone())
+                .await;
+        }
+
+        // 1. Domain rules apply to hostname targets only.
+        let mut outbound: Option<String> = None;
+        if let Some(domain) = target.address().hostname() {
+            outbound = rules.match_domain(domain).map(str::to_string);
+        }
+
+        // 2. IP rules match the pre-resolved address directly.
+        if outbound.is_none() {
+            outbound = match target.address() {
+                Address::Ipv4(ip) => rules
+                    .match_ip(IpAddr::V4(*ip), target.location().port())
+                    .map(str::to_string),
+                Address::Ipv6(ip) => rules
+                    .match_ip(IpAddr::V6(*ip), target.location().port())
+                    .map(str::to_string),
+                Address::Hostname(_) => None,
+            };
+        }
+
+        // 3. Fallbacks: MATCH catch-all, then default_out, then direct.
+        let Some(outbound) = outbound
+            .or_else(|| rules.match_catch_all().map(str::to_string))
+            .or_else(|| self.default_out.clone())
+        else {
+            log::debug!("outbound dispatch {target}: no rule matched, direct");
+            return self
+                .direct
+                .connect_udp_bidirectional(resolver, target.clone())
+                .await;
+        };
+
+        let group = self
+            .chains
+            .get(&outbound)
+            .ok_or_else(|| DialError::MissingOutbound.to_io_error())?;
+        log::debug!("outbound dispatch {target}: outbound `{outbound}` (udp)");
+        group
+            .connect_udp_bidirectional(resolver, target.clone())
+            .await
+    }
+}
+
+impl DialError {
+    pub(crate) fn to_io_error(&self) -> std::io::Error {
+        match self {
+            DialError::Blocked(target) => std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("target blocked by routing rules: {target}"),
+            ),
+            DialError::MissingOutbound => {
+                std::io::Error::new(std::io::ErrorKind::NotFound, self.to_string())
+            }
+            DialError::Io(err) => std::io::Error::new(err.kind(), err.to_string()),
+        }
     }
 }
 

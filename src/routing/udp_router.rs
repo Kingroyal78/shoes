@@ -36,6 +36,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::protocol_sniff::sniff_udp_protocol;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::util::allocate_vec;
+use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 /// Timeout for inactive sessions
 const SESSION_TIMEOUT_SECS: u64 = 200;
@@ -404,6 +405,7 @@ pub struct UdpRouter<'a> {
     last_server_write: Instant,
 
     selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
 }
 
@@ -412,6 +414,7 @@ impl<'a> UdpRouter<'a> {
     pub fn new(
         server: &'a mut ServerStream,
         selector: Arc<ClientProxySelector>,
+        outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         resolver: Arc<dyn Resolver>,
         need_initial_flush: bool,
     ) -> Self {
@@ -443,6 +446,7 @@ impl<'a> UdpRouter<'a> {
             expiry_iteration: 0,
             last_server_write: Instant::now(),
             selector,
+            outbound_dispatcher,
             resolver,
         }
     }
@@ -1039,18 +1043,24 @@ impl<'a> UdpRouter<'a> {
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination.clone();
-        let sniffed_protocol = if selector.requires_protocol_sniff() {
+        let sniffed_protocol = if selector.requires_protocol_sniff()
+            || self
+                .outbound_dispatcher
+                .as_ref()
+                .is_some_and(|dispatcher| dispatcher.requires_protocol_sniff())
+        {
             sniff_udp_protocol(data)
         } else {
             None
         };
+        let outbound_dispatcher = self.outbound_dispatcher.clone();
 
         let future: SessionCreateFuture = Box::pin(async move {
             let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
             // Create ResolvedLocation with pre-resolved address
             let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
             let decision = selector
-                .judge_with_protocol(resolved_location, &resolver, sniffed_protocol)
+                .judge_with_protocol(resolved_location.clone(), &resolver, sniffed_protocol)
                 .await?;
 
             match decision {
@@ -1058,9 +1068,18 @@ impl<'a> UdpRouter<'a> {
                     chain_group,
                     remote_location,
                 } => {
-                    let client_stream = chain_group
-                        .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
+                    let client_stream = match &outbound_dispatcher {
+                        Some(dispatcher) => {
+                            dispatcher
+                                .connect_udp_bidirectional(&remote_location, &resolver)
+                                .await?
+                        }
+                        None => {
+                            chain_group
+                                .connect_udp_bidirectional(&resolver, remote_location)
+                                .await?
+                        }
+                    };
 
                     Ok(SessionCreateResult {
                         remote: client_stream,
@@ -1330,10 +1349,18 @@ impl UdpRouter<'_> {
 pub async fn run_udp_routing(
     mut server: ServerStream,
     selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
     need_initial_flush: bool,
 ) -> io::Result<()> {
-    let result = UdpRouter::new(&mut server, selector, resolver, need_initial_flush).await;
+    let result = UdpRouter::new(
+        &mut server,
+        selector,
+        outbound_dispatcher,
+        resolver,
+        need_initial_flush,
+    )
+    .await;
     let _ = server.shutdown_message().await;
     result
 }
