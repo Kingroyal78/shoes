@@ -15,6 +15,22 @@
         "api_timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "HTTP timeout for V2Board API calls." },
         "error_body_limit_bytes": { "type": "integer", "minimum": 1, "default": 4096, "description": "Maximum panel error body bytes retained in errors/logs." },
         "user_list_body_limit_bytes": { "type": "integer", "minimum": 1, "default": 10485760, "description": "Maximum user-list response body size." },
+        "route_rule_sets": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "geosite": {
+              "type": "object",
+              "additionalProperties": { "type": "string", "minLength": 1 },
+              "description": "Local plain-text rule files for V2Board geosite: route matchers, one matcher per line (bare keyword, keyword:, domain:, full:, or regexp:)."
+            },
+            "geoip": {
+              "type": "object",
+              "additionalProperties": { "type": "string", "minLength": 1 },
+              "description": "Local plain-text rule files for V2Board geoip: route matchers, one IP/CIDR per line."
+            }
+          }
+        },
         "nodes": {
           "type": "array",
           "minItems": 1,
@@ -35,7 +51,9 @@
               "api_key": { "type": "string", "description": "Optional per-node server_token override." },
               "pull_interval_secs": { "type": "integer", "minimum": 1, "description": "Optional per-node config/user pull interval override." },
               "push_interval_secs": { "type": "integer", "minimum": 1, "description": "Optional per-node traffic/alive push interval override." },
-              "tls": { "$ref": "#/$defs/tls", "description": "Optional per-node TLS certificate files. Overrides top-level tls." }
+              "tls": { "$ref": "#/$defs/tls", "description": "Optional per-node TLS certificate files. Overrides top-level tls." },
+              "trojan_fallback": { "type": "string", "description": "Optional host:port direct decoy destination for Trojan nodes. Must use a different port from the node listener." },
+              "hysteria2_masquerade": { "$ref": "#/$defs/hysteria2_masquerade", "description": "Optional static HTTP/3 response for Hysteria2 ordinary and failed-auth requests; not a reverse proxy." }
             }
           }
         }
@@ -76,6 +94,16 @@
       "properties": {
         "cert_file": { "type": "string", "description": "Readable PEM certificate chain path." },
         "key_file": { "type": "string", "description": "Readable PEM private key path." }
+      }
+    },
+    "hysteria2_masquerade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["body"],
+      "properties": {
+        "status_code": { "type": "integer", "minimum": 100, "maximum": 599, "default": 404, "description": "HTTP/3 status code; informational and body-forbidden statuses are rejected." },
+        "content_type": { "type": "string", "default": "text/html; charset=utf-8", "maxLength": 256, "description": "HTTP/3 content type." },
+        "body": { "type": "string", "maxLength": 65536, "description": "Static response body (max 64 KiB)." }
       }
     }
   }
