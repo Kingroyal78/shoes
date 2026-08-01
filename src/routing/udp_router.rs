@@ -549,7 +549,11 @@ impl<'a> UdpRouter<'a> {
             };
 
             let len = read_buf.filled().len();
-            if len == 0 {
+            // EOF on targeted streams is signaled by an UNSPECIFIED
+            // destination (see PacketAddrStream/SocksPacketAddrStream);
+            // a zero-length payload with a real destination is a legal
+            // empty UDP datagram and must still be forwarded.
+            if len == 0 && packet.destination.is_unspecified() {
                 self.set_server_read_eof();
                 break;
             }
