@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{debug, error};
+use log::{debug, error, warn};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
@@ -1016,7 +1016,10 @@ async fn run_udp_session_loop(
                     std::io::Error::other(format!("UDP session read failed: {e}"))
                 })?;
                 if payload_len == 0 {
-                    continue;
+                    // EOF on the upstream stream: the dialed chain group
+                    // reached end-of-stream. Exit the session loop instead of
+                    // busy-spinning on streams that return Ready(Ok(0)) forever.
+                    return Ok(());
                 }
 
                 // Yield periodically to allow quinn's internal tasks to run
@@ -1678,42 +1681,16 @@ async fn forward_udp_packet(
         }
     };
 
-    let (socket_addr, is_updated) = if outbound_dispatcher.is_some() {
-        (last_socket_addr, false)
-    } else {
-        let mut addr = last_socket_addr;
-        let mut updated = false;
-        if last_location != remote_location {
-            let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
-                sniff_udp_protocol(payload)
-            } else {
-                None
-            };
-            let action = client_proxy_selector
-                .judge_with_protocol(remote_location.clone().into(), resolver, sniffed_protocol)
-                .await?;
-            let updated_location = match action {
-                ConnectDecision::Allow {
-                    chain_group: _,
-                    remote_location,
-                } => remote_location,
-                ConnectDecision::Block => {
-                    return Err(std::io::Error::other(format!(
-                        "Blocked UDP forward to {remote_location}"
-                    )));
-                }
-            };
-            addr = resolve_single_address(resolver, updated_location.location())
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to resolve updated remote location {remote_location}: {e}"
-                    ))
-                })?;
-            updated = true;
-        }
-        (addr, updated)
-    };
+    let socket_addr = last_socket_addr;
+    if last_location != remote_location {
+        // The session's upstream stream is target-fixed at dial time; a
+        // mid-session destination change from the client cannot be honored
+        // (the client should open a new assoc for a new target).
+        warn!(
+            "Location changed during ongoing UDP session: {} (was {})",
+            remote_location, last_location
+        );
+    }
 
     connection_scope.throttle_upload_bytes(payload.len()).await;
     let payload_bytes = Bytes::copy_from_slice(payload);
@@ -1727,7 +1704,7 @@ async fn forward_udp_packet(
 
     if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
         session.last_activity = std::time::Instant::now();
-        if is_updated {
+        if last_location != remote_location {
             session.update_last_location(remote_location, socket_addr);
         }
     }

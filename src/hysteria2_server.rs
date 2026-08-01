@@ -778,7 +778,9 @@ async fn run_udp_session_loop(
                     std::io::Error::other(format!("UDP session read failed: {e}"))
                 })?;
                 if payload_len == 0 {
-                    continue;
+                    // EOF on the upstream stream: exit the session loop instead
+                    // of busy-spinning on streams that return Ready(Ok(0)) forever.
+                    return Ok(());
                 }
 
                 loop_count = loop_count.wrapping_add(1);
@@ -1031,36 +1033,36 @@ async fn run_udp_local_to_remote_loop(
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
     let mut fragments = new_udp_fragment_map();
-    let mut last_cleanup = std::time::Instant::now();
 
     // Match reference implementation defaults for UDP session management
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-    loop {
-        let now = std::time::Instant::now();
-        if (now - last_cleanup) > CLEANUP_INTERVAL {
-            let mut expired_session_ids = Vec::new();
-            sessions.retain(|session_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
-                    debug!("Removing inactive UDP session {session_id}");
-                    expired_session_ids.push(*session_id);
-                    false
-                } else {
-                    true
-                }
-            });
-            for session_id in expired_session_ids {
-                remove_hysteria2_fragments_for_session(&mut fragments, session_id);
-            }
-            last_cleanup = now;
-        }
+    let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
+    // Skip the first immediate tick (first cleanup at CLEANUP_INTERVAL).
+    cleanup_interval.tick().await;
 
-        let data = connection
-            .read_datagram()
-            .await
+    loop {
+        tokio::select! {
+            _ = cleanup_interval.tick() => {
+                let mut expired_session_ids = Vec::new();
+                sessions.retain(|session_id, session| {
+                    if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                        // Cancel the session's background task before removing
+                        session.cancel_token.cancel();
+                        debug!("Removing inactive UDP session {session_id}");
+                        expired_session_ids.push(*session_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for session_id in expired_session_ids {
+                    remove_hysteria2_fragments_for_session(&mut fragments, session_id);
+                }
+            }
+            data = connection.read_datagram() => {
+        let data = data
             .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
 
         // Per official hysteria reference (server.go:332-353), parse errors are ignored
@@ -1294,70 +1296,17 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        let socket_addr = if let Some(ref _dispatcher) = outbound_dispatcher {
-            if remote_location != session.last_location {
-                warn!(
-                    "Location changed during ongoing UDP session with dispatcher: {} (was {})",
-                    remote_location, session.last_location
-                );
-            }
-            session.last_socket_addr
-        } else {
-            match session.override_remote_write_address {
-                Some(addr) => addr,
-                None => {
-                    if remote_location == session.last_location {
-                        session.last_socket_addr
-                    } else {
-                        warn!(
-                            "Location changed during ongoing UDP session: {}",
-                            remote_location.clone()
-                        );
-                        let action = client_proxy_selector
-                            .judge_with_protocol(
-                                remote_location.clone().into(),
-                                &resolver,
-                                if client_proxy_selector.requires_protocol_sniff() {
-                                    sniff_udp_protocol(&complete_payload)
-                                } else {
-                                    None
-                                },
-                            )
-                            .await;
-                        let updated_location = match action {
-                            Ok(ConnectDecision::Allow {
-                                chain_group: _,
-                                remote_location,
-                            }) => remote_location,
-                            Ok(ConnectDecision::Block) => {
-                                warn!("Blocked UDP forward to {remote_location}");
-                                continue;
-                            }
-                            Err(e) => {
-                                error!("Failed to judge UDP forward to {remote_location}: {e}");
-                                continue;
-                            }
-                        };
-                        let updated_socket_addr = match resolver_cache
-                            .resolve_location(updated_location.location())
-                            .await
-                        {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(
-                                    "Failed to resolve updated remote location {}: {e}",
-                                    updated_location.location()
-                                );
-                                continue;
-                            }
-                        };
-                        session.last_location = updated_location.into_location();
-                        session.last_socket_addr = updated_socket_addr;
-                        updated_socket_addr
-                    }
-                }
-            }
-        };
+        let socket_addr = session.last_socket_addr;
+        if remote_location != session.last_location {
+            // The session's upstream stream is target-fixed at dial time; a
+            // mid-session destination change from the client cannot be
+            // honored (the client should open a new session for a new target).
+            warn!(
+                "Location changed during ongoing UDP session: {} (was {})",
+                remote_location, session.last_location
+            );
+            session.last_location = remote_location.clone();
+        }
 
         let payload_len = complete_payload.len();
         connection_scope.throttle_upload_bytes(payload_len).await;
@@ -1371,6 +1320,8 @@ async fn run_udp_local_to_remote_loop(
         } else {
             connection_scope.record_upload_bytes(payload_len);
             session.last_activity = std::time::Instant::now();
+        }
+            }
         }
     }
 }

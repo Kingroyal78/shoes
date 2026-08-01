@@ -186,12 +186,12 @@ impl TrafficTracker {
 
     pub async fn persist(&self) -> std::io::Result<()> {
         let bytes = self.snapshot_bytes()?;
-        tokio::fs::write(&self.snapshot_path, bytes).await
+        persist_atomic(&self.snapshot_path, &bytes).await
     }
 
     fn persist_blocking(&self) -> std::io::Result<()> {
         let bytes = self.snapshot_bytes()?;
-        std::fs::write(&self.snapshot_path, bytes)
+        persist_atomic_blocking(&self.snapshot_path, &bytes)
     }
 
     fn snapshot_bytes(&self) -> std::io::Result<Vec<u8>> {
@@ -199,6 +199,29 @@ impl TrafficTracker {
         serde_json::to_vec_pretty(&*state)
             .map_err(|e| std::io::Error::other(format!("encode traffic snapshot: {e}")))
     }
+}
+
+/// Atomically writes `bytes` to `path` via a temporary file + rename, so a
+/// concurrent reader (or a crash mid-write) never observes a truncated file.
+/// Mirrors the LKG persist pattern.
+async fn persist_atomic(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = temp_path(path);
+    tokio::fs::write(&temporary, bytes).await?;
+    tokio::fs::rename(&temporary, path).await
+}
+
+fn persist_atomic_blocking(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = temp_path(path);
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
+}
+
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "traffic-pending.json".to_string());
+    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
 }
 
 impl TrafficRecorder for TrafficTracker {
