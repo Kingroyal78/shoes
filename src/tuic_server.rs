@@ -1511,9 +1511,13 @@ async fn forward_udp_packet(
     cancel_token: &CancellationToken,
     connection_scope: &Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
-    let session = {
+    let (packet_tx, last_socket_addr, last_location) = {
         match udp_session_map.get(&assoc_id) {
-            Some(s) => s,
+            Some(s) => (
+                s.packet_tx.clone(),
+                s.last_socket_addr,
+                s.last_location.clone(),
+            ),
             None => {
                 if let Some(dispatcher) = outbound_dispatcher {
                     let sniffed_protocol = if dispatcher.requires_protocol_sniff() {
@@ -1563,10 +1567,21 @@ async fn forward_udp_packet(
 
                     match udp_session_map.entry(assoc_id) {
                         dashmap::mapref::entry::Entry::Occupied(entry) => {
-                            entry.into_ref().downgrade()
+                            let entry_ref = entry.into_ref().downgrade();
+
+                            (
+                                entry_ref.packet_tx.clone(),
+                                entry_ref.last_socket_addr,
+                                entry_ref.last_location.clone(),
+                            )
                         }
                         dashmap::mapref::entry::Entry::Vacant(entry) => {
-                            entry.insert_entry(session).into_ref().downgrade()
+                            let entry_ref = entry.insert_entry(session).into_ref().downgrade();
+                            (
+                                entry_ref.packet_tx.clone(),
+                                entry_ref.last_socket_addr,
+                                entry_ref.last_location.clone(),
+                            )
                         }
                     }
                 } else {
@@ -1641,10 +1656,21 @@ async fn forward_udp_packet(
 
                     match udp_session_map.entry(assoc_id) {
                         dashmap::mapref::entry::Entry::Occupied(entry) => {
-                            entry.into_ref().downgrade()
+                            let entry_ref = entry.into_ref().downgrade();
+
+                            (
+                                entry_ref.packet_tx.clone(),
+                                entry_ref.last_socket_addr,
+                                entry_ref.last_location.clone(),
+                            )
                         }
                         dashmap::mapref::entry::Entry::Vacant(entry) => {
-                            entry.insert_entry(session).into_ref().downgrade()
+                            let entry_ref = entry.insert_entry(session).into_ref().downgrade();
+                            (
+                                entry_ref.packet_tx.clone(),
+                                entry_ref.last_socket_addr,
+                                entry_ref.last_location.clone(),
+                            )
                         }
                     }
                 }
@@ -1653,11 +1679,11 @@ async fn forward_udp_packet(
     };
 
     let (socket_addr, is_updated) = if outbound_dispatcher.is_some() {
-        (session.last_socket_addr, false)
+        (last_socket_addr, false)
     } else {
-        let mut addr = session.last_socket_addr;
+        let mut addr = last_socket_addr;
         let mut updated = false;
-        if session.last_location != remote_location {
+        if last_location != remote_location {
             let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
                 sniff_udp_protocol(payload)
             } else {
@@ -1691,16 +1717,14 @@ async fn forward_udp_packet(
 
     connection_scope.throttle_upload_bytes(payload.len()).await;
     let payload_bytes = Bytes::copy_from_slice(payload);
-    if let Err(e) = session.packet_tx.send((payload_bytes, socket_addr)).await {
+    if let Err(e) = packet_tx.send((payload_bytes, socket_addr)).await {
         error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-        drop(session);
         udp_session_map.remove(&assoc_id);
         return Ok(());
     }
 
     connection_scope.record_upload_bytes(payload.len());
 
-    drop(session);
     if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
         session.last_activity = std::time::Instant::now();
         if is_updated {

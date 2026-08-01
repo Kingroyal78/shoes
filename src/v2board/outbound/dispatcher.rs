@@ -192,12 +192,14 @@ impl OutboundDispatcher {
         if mtimes == state.last_mtimes {
             return;
         }
-        match compile_route_rules(
-            &state.node_tag,
-            &state.config_lines,
-            &state.providers,
-            &state.rule_sets,
-        ) {
+        match tokio::task::block_in_place(|| {
+            compile_route_rules(
+                &state.node_tag,
+                &state.config_lines,
+                &state.providers,
+                &state.rule_sets,
+            )
+        }) {
             Ok(compiled) => {
                 state.last_mtimes = mtimes;
                 *self.rules.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(compiled));
