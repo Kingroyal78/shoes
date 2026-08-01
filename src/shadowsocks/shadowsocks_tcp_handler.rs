@@ -604,11 +604,13 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 ));
             }
 
-            let proxy_selector = self
-                .proxy_selector
+            let proxy_selector = self.proxy_selector.clone().ok_or_else(|| {
+                std::io::Error::other("proxy_selector required for server handler")
+            })?;
+            let resolver = self
+                .resolver
                 .clone()
-                .expect("proxy_selector required for server handler");
-            let resolver = self.resolver.clone().expect("resolver required for h2mux");
+                .ok_or_else(|| std::io::Error::other("resolver required for h2mux"))?;
             let udp_enabled = self.udp_enabled;
             let expected_padding = self.h2mux_padding;
 
@@ -662,10 +664,9 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 return Ok(TcpServerSetupResult::MultiDirectionalUdp {
                     stream: Box::new(uot_stream),
                     need_initial_flush: false,
-                    proxy_selector: self
-                        .proxy_selector
-                        .clone()
-                        .expect("proxy_selector required for server handler"),
+                    proxy_selector: self.proxy_selector.clone().ok_or_else(|| {
+                        std::io::Error::other("proxy_selector required for server handler")
+                    })?,
                     outbound_dispatcher: self.outbound_dispatcher.clone(),
                     authenticated_user: authenticated_user.clone(),
                 });
@@ -694,10 +695,9 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                         remote_location: destination,
                         stream: Box::new(uot_v2_stream),
                         need_initial_flush: false,
-                        proxy_selector: self
-                            .proxy_selector
-                            .clone()
-                            .expect("proxy_selector required for server handler"),
+                        proxy_selector: self.proxy_selector.clone().ok_or_else(|| {
+                            std::io::Error::other("proxy_selector required for server handler")
+                        })?,
                         outbound_dispatcher: self.outbound_dispatcher.clone(),
                         authenticated_user: authenticated_user.clone(),
                     });
@@ -716,10 +716,9 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     return Ok(TcpServerSetupResult::MultiDirectionalUdp {
                         stream: Box::new(uot_stream),
                         need_initial_flush: false,
-                        proxy_selector: self
-                            .proxy_selector
-                            .clone()
-                            .expect("proxy_selector required for server handler"),
+                        proxy_selector: self.proxy_selector.clone().ok_or_else(|| {
+                            std::io::Error::other("proxy_selector required for server handler")
+                        })?,
                         outbound_dispatcher: self.outbound_dispatcher.clone(),
                         authenticated_user: authenticated_user.clone(),
                     });
@@ -734,10 +733,9 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             need_initial_flush: false,
             connection_success_response: None,
             initial_remote_data: stream_reader.unparsed_data_owned(),
-            proxy_selector: self
-                .proxy_selector
-                .clone()
-                .expect("proxy_selector required for server handler"),
+            proxy_selector: self.proxy_selector.clone().ok_or_else(|| {
+                std::io::Error::other("proxy_selector required for server handler")
+            })?,
             outbound_dispatcher: self.outbound_dispatcher.clone(),
             authenticated_user,
         })

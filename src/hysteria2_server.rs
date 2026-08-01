@@ -1295,6 +1295,12 @@ async fn run_udp_local_to_remote_loop(
         };
 
         let socket_addr = if let Some(ref _dispatcher) = outbound_dispatcher {
+            if remote_location != session.last_location {
+                warn!(
+                    "Location changed during ongoing UDP session with dispatcher: {} (was {})",
+                    remote_location, session.last_location
+                );
+            }
             session.last_socket_addr
         } else {
             match session.override_remote_write_address {

@@ -235,8 +235,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
-        // TODO: don't unwrap
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
 
         let mut opening_key = OpeningKey::new(
             unbound_key,
@@ -271,8 +271,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .read_slice_into(&mut server_stream, &mut encrypted_header)
             .await?;
 
-        // TODO: don't unwrap
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
 
         let mut opening_key =
             OpeningKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
@@ -506,12 +506,15 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let response_header_key = truncated_key;
 
         let unbound_keys = match requested_data_cipher {
-            // TODO: stop unwrapping
             DataCipher::Aes128Gcm => {
                 // key is 16 bytes
                 Some((
-                    UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
-                    UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
+                    UnboundKey::new(&AES_128_GCM, data_encryption_key).map_err(|e| {
+                        std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                    })?,
+                    UnboundKey::new(&AES_128_GCM, &response_header_key).map_err(|e| {
+                        std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                    })?,
                 ))
             }
             DataCipher::ChaCha20Poly1305 => {
@@ -569,9 +572,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
         // we know the size of response_header already.
         encrypted_response_header[1] = 4;
 
-        // TODO: don't unwrap
-        let unbound_key =
-            UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
         let mut sealing_key = SealingKey::new(
             unbound_key,
             SingleUseNonce::new(&response_header_length_nonce[0..12]),
@@ -585,7 +587,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
         let response_header_nonce =
             super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header IV"]);
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
         let mut sealing_key = SealingKey::new(
             unbound_key,
             SingleUseNonce::new(&response_header_nonce[0..12]),
@@ -944,8 +947,12 @@ impl TcpClientHandler for VmessTcpClientHandler {
                 (
                     3u8,
                     Some((
-                        UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                        UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
+                        UnboundKey::new(&AES_128_GCM, &response_header_key).map_err(|e| {
+                            std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                        })?,
+                        UnboundKey::new(&AES_128_GCM, data_encryption_key).map_err(|e| {
+                            std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                        })?,
                     )),
                 )
             }
@@ -1053,7 +1060,8 @@ impl TcpClientHandler for VmessTcpClientHandler {
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
 
         let mut sealing_key = SealingKey::new(
             unbound_key,
@@ -1079,8 +1087,8 @@ impl TcpClientHandler for VmessTcpClientHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        // TODO: don't unwrap
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
         let mut sealing_key =
             SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
         let tag = sealing_key
@@ -1223,8 +1231,12 @@ impl VmessTcpClientHandler {
             DataCipher::Aes128Gcm => (
                 3u8,
                 Some((
-                    UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                    UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
+                    UnboundKey::new(&AES_128_GCM, &response_header_key).map_err(|e| {
+                        std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                    })?,
+                    UnboundKey::new(&AES_128_GCM, data_encryption_key).map_err(|e| {
+                        std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}"))
+                    })?,
                 )),
             ),
             DataCipher::ChaCha20Poly1305 | DataCipher::Any => (
@@ -1322,7 +1334,8 @@ impl VmessTcpClientHandler {
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
 
         let mut sealing_key = SealingKey::new(
             unbound_key,
@@ -1348,7 +1361,8 @@ impl VmessTcpClientHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16])
+            .map_err(|e| std::io::Error::other(format!("invalid VMess AES-128-GCM key: {e}")))?;
         let mut sealing_key =
             SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
         let tag = sealing_key

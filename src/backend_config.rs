@@ -713,7 +713,7 @@ impl AppConfig {
         }
 
         validate_outbounds(&self.outbounds, &self.default_out).await?;
-        validate_route_rules(&self.route_rules)?;
+        validate_route_rules(&self.route_rules, &self.outbounds)?;
         validate_rule_providers(&self.rule_providers)?;
 
         Ok(())
@@ -1040,16 +1040,30 @@ fn require_outbound_field(
     }
 }
 
-fn validate_route_rules(route_rules: &[String]) -> std::io::Result<()> {
+fn validate_route_rules(
+    route_rules: &[String],
+    outbounds: &[OutboundConfig],
+) -> std::io::Result<()> {
+    let tags: HashSet<&str> = outbounds.iter().map(|o| o.tag.as_str()).collect();
     for (index, line) in route_rules.iter().enumerate() {
-        crate::v2board::outbound::rules::parse_crs_line(line, index + 1, "config").map_err(
-            |e| {
+        let parsed = crate::v2board::outbound::rules::parse_crs_line(line, index + 1, "config")
+            .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("route_rules[{index}]: {e}"),
                 )
-            },
-        )?;
+            })?;
+        if let Some(rule) = parsed
+            && !tags.contains(rule.outbound.as_str())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "route_rules[{index}]: outbound tag `{}` is not a configured outbound tag",
+                    rule.outbound
+                ),
+            ));
+        }
     }
     Ok(())
 }
