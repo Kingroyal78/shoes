@@ -237,7 +237,13 @@ async fn abort_and_wait(handles: &mut Vec<JoinHandle<()>>) {
     for handle in &handles {
         handle.abort();
     }
-    let _ = futures::future::join_all(handles).await;
+    for result in futures::future::join_all(handles).await {
+        if let Err(e) = result
+            && !e.is_cancelled()
+        {
+            log::error!("task aborted with panic: {e}");
+        }
+    }
 }
 
 impl Drop for RuntimeGraphSlot {

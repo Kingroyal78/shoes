@@ -967,7 +967,9 @@ impl AsyncPing for WebsocketStream {
             WebsocketPingType::PingFrame => this.pack_write_ping_frame(),
             WebsocketPingType::EmptyFrame => this.pack_write_empty_frame(),
             _ => {
-                panic!("Unexpected ping type: {:?}", this.ping_type);
+                return Poll::Ready(Err(std::io::Error::other(
+                    "websocket ping disabled; poll_flush_write should not be reached",
+                )));
             }
         };
 

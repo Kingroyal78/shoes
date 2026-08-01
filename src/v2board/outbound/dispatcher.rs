@@ -91,7 +91,7 @@ struct RuleRefreshState {
 impl std::fmt::Debug for OutboundDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutboundDispatcher")
-            .field("has_routing", &self.rules.read().unwrap().is_some())
+            .field("has_routing", &self.rules_read().is_some())
             .field("chain_tags", &self.chains.keys().collect::<Vec<_>>())
             .field("default_out", &self.default_out)
             .field("hot_reload", &self.refresh.is_some())
@@ -128,6 +128,10 @@ async fn dial_via_group(
 }
 
 impl OutboundDispatcher {
+    fn rules_read(&self) -> std::sync::RwLockReadGuard<'_, Option<Arc<CompiledRules>>> {
+        self.rules.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn new(
         rules: Option<Arc<CompiledRules>>,
         chains: HashMap<String, Arc<ClientChainGroup>>,
@@ -196,7 +200,7 @@ impl OutboundDispatcher {
         ) {
             Ok(compiled) => {
                 state.last_mtimes = mtimes;
-                *self.rules.write().unwrap() = Some(Arc::new(compiled));
+                *self.rules.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(compiled));
                 log::info!("outbound rules reloaded: provider mtimes changed");
             }
             Err(err) => log::warn!("outbound rules reload failed: {err}"),
@@ -204,7 +208,7 @@ impl OutboundDispatcher {
     }
 
     pub fn has_routing(&self) -> bool {
-        self.rules.read().unwrap().is_some()
+        self.rules_read().is_some()
     }
 
     /// True when the compiled rules contain `PROTOCOL` matchers, requiring
@@ -226,7 +230,7 @@ impl OutboundDispatcher {
         sniffed: Option<SniffedProtocol>,
         resolver: &Arc<dyn Resolver>,
     ) -> Result<Option<String>, DialError> {
-        let Some(rules) = self.rules.read().unwrap().clone() else {
+        let Some(rules) = self.rules_read().clone() else {
             return Ok(None);
         };
         if rules.is_empty() {
@@ -313,7 +317,7 @@ impl OutboundDispatcher {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         self.maybe_refresh_rules();
-        let Some(rules) = self.rules.read().unwrap().clone() else {
+        let Some(rules) = self.rules_read().clone() else {
             log::debug!("outbound dispatch {target}: no routing configured, direct");
             return self
                 .direct
