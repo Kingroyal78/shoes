@@ -383,6 +383,7 @@ fn create_tls_server_target(
                 users: vec![(user_id_bytes, None)],
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
+                outbound_dispatcher: None,
             })
         } else {
             unreachable!("Vision requires VLESS (should be validated during config load)")
@@ -544,6 +545,7 @@ fn create_reality_server_target(
                 users: vec![(user_id_bytes, None)],
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
+                outbound_dispatcher: None,
             })
         } else {
             unreachable!("Vision requires VLESS (should be validated during config load)")

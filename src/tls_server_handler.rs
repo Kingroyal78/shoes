@@ -26,6 +26,7 @@ pub struct VisionVlessConfig {
     pub users: Vec<(Box<[u8]>, Option<AuthenticatedUser>)>,
     pub udp_enabled: bool,
     pub fallback: Option<NetLocation>,
+    pub outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 }
 
 /// Configuration for NaiveProxy inner protocol
@@ -199,7 +200,7 @@ impl TcpServerHandler for TlsServerHandler {
                             effective_selector.clone(),
                             &self.fallback_resolver,
                             vision_cfg.fallback.clone(),
-                            None,
+                            vision_cfg.outbound_dispatcher.clone(),
                         )
                         .await
                     }

@@ -1030,10 +1030,17 @@ fn build_runtime_node_with_shadowsocks_mux(
         resolver.clone(),
         max_legacy_shadowsocks_users,
         shadowsocks_mux_padding,
-        outbound_dispatcher,
+        outbound_dispatcher.clone(),
     )?;
     let transport = build_transport_handler(&spec, protocol, resolver.clone())?;
-    let mut handler = build_security_handler(&spec, transport, tracker, proxy_selector, resolver)?;
+    let mut handler = build_security_handler(
+        &spec,
+        transport,
+        tracker,
+        proxy_selector,
+        resolver,
+        outbound_dispatcher,
+    )?;
     if spec.accept_proxy_protocol {
         handler = Arc::new(ProxyProtocolServerHandler::new(handler));
     }
@@ -1966,6 +1973,7 @@ fn build_security_handler(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     match &spec.security {
         RuntimeSecurity::None => {
@@ -1984,7 +1992,8 @@ fn build_security_handler(
             Ok(inner)
         }
         RuntimeSecurity::Tls(tls) => {
-            let inner_protocol = secured_inner_protocol(spec, inner, tracker)?;
+            let inner_protocol =
+                secured_inner_protocol(spec, inner, tracker, outbound_dispatcher.clone())?;
             build_tls_handler(spec, tls, inner_protocol, proxy_selector, resolver)
         }
         RuntimeSecurity::Reality(reality) => {
@@ -1994,7 +2003,8 @@ fn build_security_handler(
                     spec.tag
                 ));
             }
-            let inner_protocol = secured_inner_protocol(spec, inner, tracker)?;
+            let inner_protocol =
+                secured_inner_protocol(spec, inner, tracker, outbound_dispatcher.clone())?;
             build_reality_handler(spec, reality, inner_protocol, proxy_selector, resolver)
         }
     }
@@ -2004,12 +2014,14 @@ fn secured_inner_protocol(
     spec: &RuntimeNodeSpec,
     inner: Arc<dyn TcpServerHandler>,
     tracker: Arc<TrafficTracker>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
 ) -> std::io::Result<InnerProtocol> {
     if vless_vision_flow(spec).is_some() {
         return Ok(InnerProtocol::VisionVless(VisionVlessConfig {
             users: vless_vision_users(spec, tracker)?,
             udp_enabled: true,
             fallback: None,
+            outbound_dispatcher,
         }));
     }
     Ok(InnerProtocol::Normal(boxed_handler(inner)))

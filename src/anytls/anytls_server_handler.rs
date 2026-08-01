@@ -298,12 +298,18 @@ impl AnyTlsServerHandler {
         // Get the unconsumed data from the reader (includes auth header)
         let unconsumed_data = reader.unparsed_data();
 
-        // Resolve and connect to the fallback destination
-        let dest_addr = crate::resolver::resolve_single_address(&self.resolver, fallback).await?;
-
-        log::debug!("AnyTLS FALLBACK: Resolved {} to {}", fallback, dest_addr);
-
-        let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+        // Use dispatcher when available, otherwise direct connect
+        let mut dest_stream: Box<dyn AsyncStream> =
+            if let Some(ref dispatcher) = self.outbound_dispatcher {
+                dispatcher
+                    .dial_tcp(fallback, None, &self.resolver)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("fallback dial failed: {e}")))?
+            } else {
+                let dest_addr =
+                    crate::resolver::resolve_single_address(&self.resolver, fallback).await?;
+                Box::new(TcpStream::connect(dest_addr).await?)
+            };
 
         log::debug!(
             "AnyTLS FALLBACK: Connected to fallback, forwarding {} bytes",

@@ -163,15 +163,21 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     reader: StreamReader,
     fallback: &NetLocation,
     resolver: &Arc<dyn Resolver>,
+    outbound_dispatcher: Option<&crate::v2board::outbound::dispatcher::OutboundDispatcher>,
 ) -> std::io::Result<TcpServerSetupResult> {
     debug!("VLESS FALLBACK: Connecting to fallback: {}", fallback);
 
     let unconsumed_data = reader.unparsed_data();
-    let dest_addr = crate::resolver::resolve_single_address(resolver, fallback).await?;
 
-    debug!("VLESS FALLBACK: Resolved {} to {}", fallback, dest_addr);
-
-    let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+    let mut dest_stream: Box<dyn AsyncStream> = if let Some(dispatcher) = outbound_dispatcher {
+        dispatcher
+            .dial_tcp(fallback, None, resolver)
+            .await
+            .map_err(|e| std::io::Error::other(format!("fallback dial failed: {e}")))?
+    } else {
+        let dest_addr = crate::resolver::resolve_single_address(resolver, fallback).await?;
+        Box::new(TcpStream::connect(dest_addr).await?)
+    };
 
     debug!(
         "VLESS FALLBACK: Connected to fallback, forwarding {} bytes",
@@ -181,7 +187,7 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     if !unconsumed_data.is_empty() {
         write_all(&mut dest_stream, unconsumed_data).await?;
         dest_stream.flush().await?;
-    }
+    };
 
     debug!("VLESS FALLBACK: Spawning bidirectional copy");
 
@@ -228,6 +234,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     stream_reader,
                     fallback,
                     &self.resolver,
+                    self.outbound_dispatcher.as_deref(),
                 )
                 .await;
             }
@@ -255,6 +262,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     stream_reader,
                     fallback,
                     &self.resolver,
+                    self.outbound_dispatcher.as_deref(),
                 )
                 .await;
             }
@@ -425,7 +433,14 @@ where
             client_version
         );
         if let Some(ref fb) = fallback {
-            return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
+            return vless_fallback_to_dest(
+                tls_stream,
+                stream_reader,
+                fb,
+                resolver,
+                outbound_dispatcher.as_deref(),
+            )
+            .await;
         }
         return Err(std::io::Error::other(format!(
             "invalid client protocol version, expected 0, got {client_version}"
@@ -440,7 +455,14 @@ where
         None => {
             debug!("VLESS/Vision UUID mismatch");
             if let Some(ref fb) = fallback {
-                return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
+                return vless_fallback_to_dest(
+                    tls_stream,
+                    stream_reader,
+                    fb,
+                    resolver,
+                    outbound_dispatcher.as_deref(),
+                )
+                .await;
             }
             return Err(std::io::Error::other("Unknown user id"));
         }
