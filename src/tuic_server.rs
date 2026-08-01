@@ -1652,7 +1652,42 @@ async fn forward_udp_packet(
         }
     };
 
-    let socket_addr = session.last_socket_addr;
+    let (socket_addr, is_updated) = if outbound_dispatcher.is_some() {
+        (session.last_socket_addr, false)
+    } else {
+        let mut addr = session.last_socket_addr;
+        let mut updated = false;
+        if session.last_location != remote_location {
+            let sniffed_protocol = if client_proxy_selector.requires_protocol_sniff() {
+                sniff_udp_protocol(payload)
+            } else {
+                None
+            };
+            let action = client_proxy_selector
+                .judge_with_protocol(remote_location.clone().into(), resolver, sniffed_protocol)
+                .await?;
+            let updated_location = match action {
+                ConnectDecision::Allow {
+                    chain_group: _,
+                    remote_location,
+                } => remote_location,
+                ConnectDecision::Block => {
+                    return Err(std::io::Error::other(format!(
+                        "Blocked UDP forward to {remote_location}"
+                    )));
+                }
+            };
+            addr = resolve_single_address(resolver, updated_location.location())
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "Failed to resolve updated remote location {remote_location}: {e}"
+                    ))
+                })?;
+            updated = true;
+        }
+        (addr, updated)
+    };
 
     connection_scope.throttle_upload_bytes(payload.len()).await;
     let payload_bytes = Bytes::copy_from_slice(payload);
@@ -1668,7 +1703,9 @@ async fn forward_udp_packet(
     drop(session);
     if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
         session.last_activity = std::time::Instant::now();
-        session.update_last_location(remote_location, socket_addr);
+        if is_updated {
+            session.update_last_location(remote_location, socket_addr);
+        }
     }
 
     Ok(())
