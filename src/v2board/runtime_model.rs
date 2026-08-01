@@ -232,6 +232,16 @@ pub fn normalize_node(
     validate_local_protocol_overrides(node, node_type, server)?;
     let users = normalize_users(node, users)?;
 
+    // A zero server_port would bind an ephemeral port (or a permanent
+    // port-0 retry loop on TCP); reject it so the node fails loudly during
+    // apply instead of silently serving on a random port.
+    if server.server_port == 0 {
+        return invalid(format!(
+            "node `{}` server_port is 0 (invalid listen port from panel)",
+            node.tag
+        ));
+    }
+
     let protocol = normalize_protocol(node, node_type, server)?;
     let transport = normalize_transport(node, node_type, server)?;
     let security = normalize_security(app_config, node, node_type, &transport, server)?;

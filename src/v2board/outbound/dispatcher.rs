@@ -340,7 +340,9 @@ impl OutboundDispatcher {
             outbound = rules.match_domain(domain).map(str::to_string);
         }
 
-        // 2. IP rules match the pre-resolved address directly.
+        // 2. IP rules match the pre-resolved address directly. For hostname
+        // targets, match against the pre-resolved address when available so
+        // IP-CIDR rules apply to UDP flows exactly as they do for TCP.
         if outbound.is_none() {
             outbound = match target.address() {
                 Address::Ipv4(ip) => rules
@@ -349,7 +351,14 @@ impl OutboundDispatcher {
                 Address::Ipv6(ip) => rules
                     .match_ip(IpAddr::V6(*ip), target.location().port())
                     .map(str::to_string),
-                Address::Hostname(_) => None,
+                Address::Hostname(_) => target.resolved_addr().and_then(|addr| match addr {
+                    std::net::SocketAddr::V4(addr) => rules
+                        .match_ip(IpAddr::V4(*addr.ip()), target.location().port())
+                        .map(str::to_string),
+                    std::net::SocketAddr::V6(addr) => rules
+                        .match_ip(IpAddr::V6(*addr.ip()), target.location().port())
+                        .map(str::to_string),
+                }),
             };
         }
 

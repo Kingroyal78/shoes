@@ -61,6 +61,10 @@ async fn run_tcp_server(
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e}");
+                // Back off briefly so a persistent failure (e.g. EMFILE from
+                // fd exhaustion) does not hot-spin the accept loop at 100% CPU
+                // while logging a continuous error storm.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -102,6 +106,7 @@ async fn run_unix_server(
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -366,14 +371,31 @@ pub async fn handle_server_setup_result(
                     } => {
                         let mut client_stream = match &outbound_dispatcher {
                             Some(dispatcher) => {
-                                dispatcher
-                                    .connect_udp_bidirectional(&remote_location, &resolver)
-                                    .await?
+                                let dial = dispatcher
+                                    .connect_udp_bidirectional(&remote_location, &resolver);
+                                tokio::time::timeout(Duration::from_secs(60), dial)
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            format!(
+                                                "timed out dispatching UDP to {remote_location}"
+                                            ),
+                                        )
+                                    })??
                             }
                             None => {
-                                chain_group
-                                    .connect_udp_bidirectional(&resolver, remote_location)
-                                    .await?
+                                let target_desc = remote_location.to_string();
+                                let dial = chain_group
+                                    .connect_udp_bidirectional(&resolver, remote_location);
+                                tokio::time::timeout(Duration::from_secs(60), dial)
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            format!("timed out dialing UDP chain to {target_desc}"),
+                                        )
+                                    })??
                             }
                         };
                         let client_need_initial_flush = match initial_udp_data {
