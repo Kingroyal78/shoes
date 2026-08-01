@@ -370,14 +370,35 @@ impl NodeController {
         // applied generation, not merely the most recently observed payload.
         // Commit them only after the whole runtime replacement succeeds so a
         // failed candidate is fetched and retried on the next pull.
+        let previous_server_etag = self.server_etag.clone();
+        let previous_server_config = self.server_config.clone();
+        let previous_user_etag = self.user_etag.clone();
+        let previous_users = self.users.clone();
+        let previous_plugin_candidate = self.plugin_candidate.clone();
+
         self.server_etag = next_server_etag;
         self.server_config = next_server_config;
         self.user_etag = next_user_etag;
         self.users = next_users;
         self.plugin_candidate = next_plugin_candidate;
 
-        if applied_generation || cache_updated {
-            self.persist_lkg().await?;
+        if (applied_generation || cache_updated)
+            && let Err(e) = self.persist_lkg().await
+        {
+            // LKG persist failed (e.g. disk full/permissions). Rolling back
+            // the committed validators forces the next pull to re-fetch the
+            // payloads and retry the persist, instead of seeing 304s and
+            // freezing the on-disk crash-recovery point indefinitely.
+            log::error!(
+                "node `{}` LKG persist failed; will retry on next sync: {e}",
+                self.node.tag
+            );
+            self.server_etag = previous_server_etag;
+            self.server_config = previous_server_config;
+            self.user_etag = previous_user_etag;
+            self.users = previous_users;
+            self.plugin_candidate = previous_plugin_candidate;
+            return Err(e);
         }
 
         Ok(())
