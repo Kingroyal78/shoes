@@ -1785,7 +1785,7 @@ pub async fn setup_client_tcp_stream(
                     .map_err(|e| {
                         let kind = match &e {
                             DialError::Blocked(_) => std::io::ErrorKind::ConnectionRefused,
-                            DialError::MissingOutbound => std::io::ErrorKind::NotFound,
+                            DialError::MissingOutbound(_) => std::io::ErrorKind::NotFound,
                             DialError::Io(io) => io.kind(),
                         };
                         std::io::Error::new(

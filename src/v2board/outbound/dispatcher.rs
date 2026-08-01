@@ -30,8 +30,8 @@ pub type DialedStream = Box<dyn AsyncStream>;
 pub enum DialError {
     /// Target rejected by routing rules.
     Blocked(NetLocation),
-    /// A rule referenced an outbound tag that has no chain group.
-    MissingOutbound,
+    /// A rule matched but the outbound tag is not present in `chains`.
+    MissingOutbound(String),
     /// Underlying I/O failure.
     Io(std::io::Error),
 }
@@ -40,7 +40,9 @@ impl std::fmt::Display for DialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DialError::Blocked(target) => write!(f, "target blocked by routing rules: {target}"),
-            DialError::MissingOutbound => write!(f, "no outbound configured for rule result"),
+            DialError::MissingOutbound(tag) => {
+                write!(f, "no outbound configured for rule result: `{tag}`")
+            }
             DialError::Io(err) => write!(f, "io error: {err}"),
         }
     }
@@ -305,7 +307,7 @@ impl OutboundDispatcher {
         let group = self
             .chains
             .get(&outbound)
-            .ok_or(DialError::MissingOutbound)?;
+            .ok_or_else(|| DialError::MissingOutbound(outbound.clone()))?;
         log::debug!("outbound dispatch {target}: outbound `{outbound}`");
         dial_via_group(group, target, resolver).await
     }
@@ -377,7 +379,7 @@ impl OutboundDispatcher {
         let group = self
             .chains
             .get(&outbound)
-            .ok_or_else(|| DialError::MissingOutbound.to_io_error())?;
+            .ok_or_else(|| DialError::MissingOutbound(outbound.clone()).to_io_error())?;
         log::debug!("outbound dispatch {target}: outbound `{outbound}` (udp)");
         group
             .connect_udp_bidirectional(resolver, target.clone())
@@ -392,9 +394,10 @@ impl DialError {
                 std::io::ErrorKind::PermissionDenied,
                 format!("target blocked by routing rules: {target}"),
             ),
-            DialError::MissingOutbound => {
-                std::io::Error::new(std::io::ErrorKind::NotFound, self.to_string())
-            }
+            DialError::MissingOutbound(tag) => std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no outbound configured for rule result: `{tag}`"),
+            ),
             DialError::Io(err) => std::io::Error::new(err.kind(), err.to_string()),
         }
     }
