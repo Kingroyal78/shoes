@@ -107,12 +107,10 @@ impl std::fmt::Debug for OutboundDispatcher {
 /// `PrependStream` usage), so no destination bytes are lost.
 async fn dial_via_group(
     group: &ClientChainGroup,
-    target: &NetLocation,
+    target: &ResolvedLocation,
     resolver: &Arc<dyn Resolver>,
 ) -> Result<DialedStream, DialError> {
-    let result = group
-        .connect_tcp(ResolvedLocation::new(target.clone()), resolver)
-        .await?;
+    let result = group.connect_tcp(target.clone(), resolver).await?;
     let client_stream = result.client_stream;
     Ok(match result.early_data {
         Some(data) => {
@@ -194,14 +192,16 @@ impl OutboundDispatcher {
         if mtimes == state.last_mtimes {
             return;
         }
-        match tokio::task::block_in_place(|| {
-            compile_route_rules(
-                &state.node_tag,
-                &state.config_lines,
-                &state.providers,
-                &state.rule_sets,
-            )
-        }) {
+        // Compile synchronously. The reload path is low-frequency (interval
+        // gate + mtime change) and compile_route_rules does bounded file I/O;
+        // block_in_place would panic on a current-thread Tokio runtime
+        // (e.g. `shoes -t 1`), so avoid it here.
+        match compile_route_rules(
+            &state.node_tag,
+            &state.config_lines,
+            &state.providers,
+            &state.rule_sets,
+        ) {
             Ok(compiled) => {
                 state.last_mtimes = mtimes;
                 *self.rules.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(compiled));
@@ -230,7 +230,7 @@ impl OutboundDispatcher {
     /// `sniffed` is `Some`.
     async fn select_outbound(
         &self,
-        target: &NetLocation,
+        target: &ResolvedLocation,
         sniffed: Option<SniffedProtocol>,
         resolver: &Arc<dyn Resolver>,
     ) -> Result<Option<String>, DialError> {
@@ -261,14 +261,20 @@ impl OutboundDispatcher {
         //    failure is fail-closed.
         if outbound.is_none() {
             outbound = match target.address() {
-                Address::Ipv4(ip) => rules.match_ip(IpAddr::V4(*ip), target.port()),
-                Address::Ipv6(ip) => rules.match_ip(IpAddr::V6(*ip), target.port()),
-                Address::Hostname(_) if rules.has_ip_rules() => {
-                    let addrs = resolve_addresses(resolver, target).await?;
-                    addrs
-                        .iter()
-                        .find_map(|addr| rules.match_ip(addr.ip(), target.port()))
-                }
+                Address::Ipv4(ip) => rules.match_ip(IpAddr::V4(*ip), target.location().port()),
+                Address::Ipv6(ip) => rules.match_ip(IpAddr::V6(*ip), target.location().port()),
+                // Use the pre-resolved address when available (dial_tcp
+                // resolves up front so selection and dialing share one
+                // address); resolve lazily otherwise.
+                Address::Hostname(_) if rules.has_ip_rules() => match target.resolved_addr() {
+                    Some(addr) => rules.match_ip(addr.ip(), target.location().port()),
+                    None => {
+                        let addrs = resolve_addresses(resolver, target.location()).await?;
+                        addrs
+                            .iter()
+                            .find_map(|addr| rules.match_ip(addr.ip(), target.location().port()))
+                    }
+                },
                 Address::Hostname(_) => None,
             };
         }
@@ -297,9 +303,30 @@ impl OutboundDispatcher {
         resolver: &Arc<dyn Resolver>,
     ) -> Result<DialedStream, DialError> {
         self.maybe_refresh_rules();
-        let Some(outbound) = self.select_outbound(target, sniffed, resolver).await? else {
+
+        // Resolve hostname targets up front when IP rules exist, so the
+        // address used for IP-rule selection is the same address the chain
+        // dials. Otherwise the chain would resolve independently and DNS
+        // round-robin/multi-answer could route by one address while dialing
+        // another.
+        let mut resolved_target = ResolvedLocation::new(target.clone());
+        let rules = self.rules_read().clone();
+        if let Some(rules) = &rules
+            && rules.has_ip_rules()
+            && matches!(target.address(), Address::Hostname(_))
+            && resolved_target.resolved_addr().is_none()
+            && let Ok(addrs) = resolve_addresses(resolver, target).await
+            && let Some(addr) = addrs.first()
+        {
+            resolved_target.set_resolved(*addr);
+        }
+
+        let Some(outbound) = self
+            .select_outbound(&resolved_target, sniffed, resolver)
+            .await?
+        else {
             log::debug!("outbound dispatch {target}: no rule matched, direct");
-            return dial_via_group(&self.direct, target, resolver).await;
+            return dial_via_group(&self.direct, &resolved_target, resolver).await;
         };
 
         // Dial through the matched outbound's chain group. A tag without a
@@ -309,7 +336,7 @@ impl OutboundDispatcher {
             .get(&outbound)
             .ok_or_else(|| DialError::MissingOutbound(outbound.clone()))?;
         log::debug!("outbound dispatch {target}: outbound `{outbound}`");
-        dial_via_group(group, target, resolver).await
+        dial_via_group(group, &resolved_target, resolver).await
     }
 
     /// Establishes a bidirectional UDP relay stream for `target` through the
