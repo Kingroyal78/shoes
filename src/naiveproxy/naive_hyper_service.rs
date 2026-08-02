@@ -547,7 +547,7 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
                         let client_stream = match &outbound_dispatcher {
                             Some(dispatcher) => {
                                 dispatcher
-                                    .connect_udp_bidirectional(&remote_location, &resolver)
+                                    .connect_udp_bidirectional(&remote_location, None, &resolver)
                                     .await?
                             }
                             None => {

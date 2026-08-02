@@ -341,10 +341,12 @@ impl OutboundDispatcher {
 
     /// Establishes a bidirectional UDP relay stream for `target` through the
     /// matched outbound's chain group. The target is pre-resolved (callers
-    /// resolve hostnames), so only domain/IP literals and fallbacks apply.
+    /// resolve hostnames), so only protocol/domain/IP literals and fallbacks
+    /// apply.
     pub async fn connect_udp_bidirectional(
         &self,
         target: &ResolvedLocation,
+        sniffed: Option<SniffedProtocol>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         self.maybe_refresh_rules();
@@ -363,13 +365,22 @@ impl OutboundDispatcher {
                 .await;
         }
 
-        // 1. Domain rules apply to hostname targets only.
+        // 1. Protocol rules, only consulted when a protocol was sniffed.
         let mut outbound: Option<String> = None;
-        if let Some(domain) = target.address().hostname() {
+        if let Some(protocol) = sniffed
+            && let Some(tag) = rules.match_protocol(protocol)
+        {
+            outbound = Some(tag.to_string());
+        }
+
+        // 2. Domain rules apply to hostname targets only.
+        if outbound.is_none()
+            && let Some(domain) = target.address().hostname()
+        {
             outbound = rules.match_domain(domain).map(str::to_string);
         }
 
-        // 2. IP rules match the pre-resolved address directly. For hostname
+        // 3. IP rules match the pre-resolved address directly. For hostname
         // targets, match against the pre-resolved address when available so
         // IP-CIDR rules apply to UDP flows exactly as they do for TCP.
         if outbound.is_none() {
@@ -676,7 +687,7 @@ mod tests {
             echo_addr,
         );
         let stream = dispatcher
-            .connect_udp_bidirectional(&resolved, &resolver)
+            .connect_udp_bidirectional(&resolved, None, &resolver)
             .await
             .expect("no-rules connect_udp_bidirectional must succeed");
 

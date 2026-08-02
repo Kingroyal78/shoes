@@ -1528,7 +1528,6 @@ async fn forward_udp_packet(
                     } else {
                         None
                     };
-                    let _ = sniffed_protocol;
 
                     let resolved_address = resolve_single_address(resolver, &remote_location)
                         .await
@@ -1548,7 +1547,7 @@ async fn forward_udp_packet(
                     let resolved_location =
                         ResolvedLocation::with_resolved(remote_location.clone(), resolved_address);
                     let client_stream = dispatcher
-                        .connect_udp_bidirectional(&resolved_location, resolver)
+                        .connect_udp_bidirectional(&resolved_location, sniffed_protocol, resolver)
                         .await
                         .map_err(|e| {
                             std::io::Error::other(format!(

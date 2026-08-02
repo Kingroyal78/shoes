@@ -371,8 +371,11 @@ pub async fn handle_server_setup_result(
                     } => {
                         let mut client_stream = match &outbound_dispatcher {
                             Some(dispatcher) => {
-                                let dial = dispatcher
-                                    .connect_udp_bidirectional(&remote_location, &resolver);
+                                let dial = dispatcher.connect_udp_bidirectional(
+                                    &remote_location,
+                                    sniffed_protocol,
+                                    &resolver,
+                                );
                                 tokio::time::timeout(Duration::from_secs(60), dial)
                                     .await
                                     .map_err(|_| {

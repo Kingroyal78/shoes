@@ -1075,7 +1075,11 @@ impl<'a> UdpRouter<'a> {
                     let client_stream = match &outbound_dispatcher {
                         Some(dispatcher) => {
                             dispatcher
-                                .connect_udp_bidirectional(&remote_location, &resolver)
+                                .connect_udp_bidirectional(
+                                    &remote_location,
+                                    sniffed_protocol,
+                                    &resolver,
+                                )
                                 .await?
                         }
                         None => {

@@ -987,7 +987,7 @@ impl AnyTlsSession {
                 let client_stream = match &self.outbound_dispatcher {
                     Some(dispatcher) => {
                         match dispatcher
-                            .connect_udp_bidirectional(&remote_location, &self.resolver)
+                            .connect_udp_bidirectional(&remote_location, None, &self.resolver)
                             .await
                         {
                             Ok(result) => result,

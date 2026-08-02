@@ -1168,7 +1168,6 @@ async fn run_udp_local_to_remote_loop(
                     } else {
                         None
                     };
-                    let _ = sniffed_protocol;
 
                     let resolved_address = match resolver_cache
                         .resolve_location(&remote_location)
@@ -1193,7 +1192,7 @@ async fn run_udp_local_to_remote_loop(
                     let resolved =
                         ResolvedLocation::with_resolved(remote_location.clone(), resolved_address);
                     let client_stream = match dispatcher
-                        .connect_udp_bidirectional(&resolved, &resolver)
+                        .connect_udp_bidirectional(&resolved, sniffed_protocol, &resolver)
                         .await
                     {
                         Ok(s) => s,
