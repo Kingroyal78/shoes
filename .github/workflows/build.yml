@@ -258,25 +258,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      # Download only the Linux tarballs. The artifact names are
+      # <repo>-<target> (e.g. shoes-x86_64-unknown-linux-gnu); the pattern
+      # excludes the internal dockerbuild artifacts (named
+      # <owner>~<repo>~<hash>.dockerbuild) produced by build-push-action.
+      - name: Download Linux artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: ${{ github.event.repository.name }}-*
           path: artifacts
+          merge-multiple: true
 
       - name: List artifacts
         run: |
           echo "Downloaded artifacts:"
-          find artifacts -type f -name "*.tar.gz" | sort
-
-      - name: Flatten artifacts
-        run: |
-          mkdir -p release-artifacts
-          find artifacts -type f -name "*.tar.gz" -exec cp {} release-artifacts/ \;
-          ls -la release-artifacts/
+          ls -la artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-artifacts/*
+          files: artifacts/*
           draft: true
           generate_release_notes: true
