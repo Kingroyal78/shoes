@@ -22,7 +22,7 @@ use log::{debug, warn};
 use lru::LruCache;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::io::ReadBuf;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 use tokio_util::time::{DelayQueue, delay_queue};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -40,6 +40,17 @@ use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 /// Timeout for inactive sessions
 const SESSION_TIMEOUT_SECS: u64 = 200;
+
+/// Grace period for flushing a removed session before dropping its transport.
+const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn session_shutdown_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(20)
+    } else {
+        SESSION_SHUTDOWN_TIMEOUT
+    }
+}
 
 /// Maximum UDP packet size
 const MAX_UDP_PACKET_SIZE: usize = 65535;
@@ -214,7 +225,7 @@ impl RoutingSession {
     /// Check if session should be removed.
     #[inline]
     fn should_remove(&self) -> bool {
-        self.remote_read_eof && self.remote_write_eof
+        (self.remote_read_eof || self.remote_write_eof) && self.in_server_write_queue == 0
     }
 
     /// Reset session expiry timer (skips if already reset this iteration)
@@ -243,6 +254,32 @@ struct PendingWrite {
     id: SessionKey,
     buf: Box<[u8]>,
     len: usize,
+}
+
+struct PendingShutdown {
+    stream: Box<dyn AsyncMessageStream>,
+    timeout: Pin<Box<Sleep>>,
+}
+
+impl PendingShutdown {
+    fn new(stream: Box<dyn AsyncMessageStream>) -> Self {
+        Self {
+            stream,
+            timeout: Box::pin(tokio::time::sleep(session_shutdown_timeout())),
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if Pin::new(&mut self.stream)
+            .poll_shutdown_message(cx)
+            .is_ready()
+            || self.timeout.as_mut().poll(cx).is_ready()
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 /// Server stream variants - unified via enum
@@ -393,7 +430,7 @@ pub struct UdpRouter<'a> {
     server_write_eof: bool,
 
     sessions_to_remove: HashSet<SessionKey>,
-    pending_shutdowns: VecDeque<Box<dyn AsyncMessageStream>>,
+    pending_shutdowns: VecDeque<PendingShutdown>,
 
     remote_write_pool: BufferPool,
     server_write_pool: BufferPool,
@@ -504,11 +541,10 @@ impl<'a> UdpRouter<'a> {
     fn drain_remote_shutdowns(&mut self, cx: &mut Context<'_>) {
         let count = self.pending_shutdowns.len();
         for _ in 0..count {
-            let mut stream = self.pending_shutdowns.pop_front().unwrap();
-            if Pin::new(&mut stream).poll_shutdown_message(cx).is_pending() {
-                self.pending_shutdowns.push_back(stream);
+            let mut shutdown = self.pending_shutdowns.pop_front().unwrap();
+            if shutdown.poll(cx).is_pending() {
+                self.pending_shutdowns.push_back(shutdown);
             }
-            // If Ready (success or error), stream is dropped
         }
     }
 
@@ -1138,7 +1174,8 @@ impl<'a> UdpRouter<'a> {
         }
 
         // Queue remote stream for graceful shutdown
-        self.pending_shutdowns.push_back(session.remote);
+        self.pending_shutdowns
+            .push_back(PendingShutdown::new(session.remote));
     }
 
     /// Process expired sessions
@@ -1369,6 +1406,106 @@ pub async fn run_udp_routing(
         need_initial_flush,
     )
     .await;
-    let _ = server.shutdown_message().await;
+    let _ = tokio::time::timeout(session_shutdown_timeout(), server.shutdown_message()).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
+    };
+
+    struct PendingMessageStream;
+
+    impl AsyncReadMessage for PendingMessageStream {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for PendingMessageStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncFlushMessage for PendingMessageStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncShutdownMessage for PendingMessageStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for PendingMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for PendingMessageStream {}
+
+    fn routing_session() -> RoutingSession {
+        let destination = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 53);
+        RoutingSession::new(
+            destination.clone(),
+            1,
+            "127.0.0.1:53".parse().unwrap(),
+            LookupKey::Destination(destination),
+            Box::new(PendingMessageStream),
+        )
+    }
+
+    #[test]
+    fn remote_read_eof_makes_a_message_session_removable() {
+        let mut session = routing_session();
+        session.remote_read_eof = true;
+
+        assert!(session.should_remove());
+    }
+
+    #[test]
+    fn remote_eof_waits_for_queued_responses_to_reach_the_server() {
+        let mut session = routing_session();
+        session.remote_read_eof = true;
+        session.in_server_write_queue = 1;
+
+        assert!(!session.should_remove());
+
+        session.in_server_write_queue = 0;
+        assert!(session.should_remove());
+    }
+
+    #[tokio::test]
+    async fn removed_session_shutdown_is_bounded() {
+        let mut shutdown = PendingShutdown::new(Box::new(PendingMessageStream));
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            futures::future::poll_fn(|cx| shutdown.poll(cx)),
+        )
+        .await
+        .expect("removed UDP session remained in graceful shutdown indefinitely");
+    }
 }

@@ -5,13 +5,30 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::async_stream::AsyncMessageStream;
 use crate::util::allocate_vec;
 
 // Informed by https://stackoverflow.com/questions/14856639/udp-hole-punching-timeout
 pub const DEFAULT_ASSOCIATION_TIMEOUT_SECS: u32 = 200;
+const DEFAULT_ASSOCIATION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn association_idle_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(20)
+    } else {
+        Duration::from_secs(DEFAULT_ASSOCIATION_TIMEOUT_SECS.into())
+    }
+}
+
+fn association_close_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(20)
+    } else {
+        DEFAULT_ASSOCIATION_CLOSE_TIMEOUT
+    }
+}
 
 struct CopyBuffer {
     read_done: bool,
@@ -142,6 +159,12 @@ enum TransferState {
     Done,
 }
 
+impl TransferState {
+    fn is_closing(&self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a: &'a mut A,
     b: &'a mut B,
@@ -149,8 +172,11 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_buf: CopyBuffer,
     a_to_b: TransferState,
     b_to_a: TransferState,
-    sleep_future: Pin<Box<tokio::time::Sleep>>,
-    last_active: Instant,
+    ping_sleep: Pin<Box<tokio::time::Sleep>>,
+    idle_sleep: Pin<Box<tokio::time::Sleep>>,
+    idle_timeout: Duration,
+    close_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    close_timeout: Duration,
 }
 
 fn transfer_one_direction<A, B>(
@@ -197,17 +223,20 @@ where
             b_buf,
             a_to_b,
             b_to_a,
-            sleep_future,
-            last_active,
+            ping_sleep,
+            idle_sleep,
+            idle_timeout,
+            close_sleep,
+            close_timeout,
         } = &mut *self;
 
-        let ping_fired = sleep_future.as_mut().poll(cx).is_ready();
+        let ping_fired = ping_sleep.as_mut().poll(cx).is_ready();
         if ping_fired {
             // a_buf writes to b - so we need to check if b supports ping, and similarly
             // for b_buf.
             a_buf.need_write_ping = b.supports_ping();
             b_buf.need_write_ping = a.supports_ping();
-            sleep_future
+            ping_sleep
                 .as_mut()
                 .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
         }
@@ -215,19 +244,31 @@ where
         let a_count = a_buf.read_count;
         let b_count = b_buf.read_count;
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+        let a_to_b_poll = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_to_a_poll = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
         if a_buf.read_count != a_count || b_buf.read_count != b_count {
-            *last_active = Instant::now();
-        } else if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+            idle_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + *idle_timeout);
+        } else if idle_sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Ok(()));
         }
 
-        if a_to_b.is_ready() {
-            return a_to_b;
-        } else if b_to_a.is_ready() {
-            return b_to_a;
+        if a_to_b_poll.is_ready() {
+            return a_to_b_poll;
+        } else if b_to_a_poll.is_ready() {
+            return b_to_a_poll;
+        }
+
+        if a_to_b.is_closing() || b_to_a.is_closing() {
+            let sleep =
+                close_sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(*close_timeout)));
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+        } else {
+            *close_sleep = None;
         }
 
         Poll::Pending
@@ -273,7 +314,9 @@ where
 {
     // Unlike tcp copy_bidirectional, we always run a sleep future so that we can expire
     // connections.
-    let sleep_future = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60)));
+    let ping_sleep = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60)));
+    let idle_timeout = association_idle_timeout();
+    let idle_sleep = Box::pin(tokio::time::sleep(idle_timeout));
 
     CopyBidirectional {
         a,
@@ -285,8 +328,146 @@ where
         b_buf: CopyBuffer::new(a_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
-        sleep_future,
-        last_active: Instant::now(),
+        ping_sleep,
+        idle_sleep,
+        idle_timeout,
+        close_sleep: None,
+        close_timeout: association_close_timeout(),
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
+    };
+    use tokio::io::ReadBuf;
+
+    struct PendingShutdownMessageStream;
+
+    impl AsyncReadMessage for PendingShutdownMessageStream {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for PendingShutdownMessageStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for PendingShutdownMessageStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for PendingShutdownMessageStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for PendingShutdownMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for PendingShutdownMessageStream {}
+
+    struct EofMessageStream;
+
+    impl AsyncReadMessage for EofMessageStream {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWriteMessage for EofMessageStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for EofMessageStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for EofMessageStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for EofMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for EofMessageStream {}
+
+    #[tokio::test]
+    async fn eof_does_not_wait_for_the_full_udp_association_idle_timeout() {
+        let mut stalled = PendingShutdownMessageStream;
+        let mut eof = EofMessageStream;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            copy_bidirectional_message(&mut stalled, &mut eof, false, false),
+        )
+        .await
+        .expect("message copy retained an EOF association until the general idle timeout")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_association_is_reclaimed_without_stream_wakeups() {
+        let mut a = PendingShutdownMessageStream;
+        let mut b = PendingShutdownMessageStream;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            copy_bidirectional_message(&mut a, &mut b, false, false),
+        )
+        .await
+        .expect("idle association outlived its reclamation deadline")
+        .unwrap();
+    }
 }
