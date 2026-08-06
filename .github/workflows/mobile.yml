@@ -137,5 +137,5 @@ jobs:
           files: |
             artifacts/Shoes.xcframework.zip
             artifacts/shoes-android/shoes-release.aar
-          draft: true
+          draft: false
           generate_release_notes: false
