@@ -163,7 +163,7 @@ tempfile = "*"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
-tikv-jemallocator = "*"
+tikv-jemallocator = { version = "*", features = ["background_threads"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "*"
