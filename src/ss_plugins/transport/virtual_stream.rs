@@ -8,13 +8,32 @@ use std::task::{Context, Poll};
 use futures::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Sleep;
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 
 pub(super) enum InboundEvent {
     Data(InboundData),
+}
+
+#[derive(Debug)]
+pub(super) enum InboundTerminal {
     Finished,
     Failed(String),
+}
+
+pub(super) struct InboundChannels {
+    data: mpsc::Receiver<InboundEvent>,
+    terminal: oneshot::Receiver<InboundTerminal>,
+}
+
+impl InboundChannels {
+    pub(super) fn new(
+        data: mpsc::Receiver<InboundEvent>,
+        terminal: oneshot::Receiver<InboundTerminal>,
+    ) -> Self {
+        Self { data, terminal }
+    }
 }
 
 pub(super) struct ReceiveBudget {
@@ -210,13 +229,17 @@ enum BarrierState {
         complete_tx: Option<oneshot::Sender<io::Result<()>>>,
         complete_rx: oneshot::Receiver<io::Result<()>>,
     },
-    Waiting(oneshot::Receiver<io::Result<()>>),
+    Waiting {
+        complete_rx: oneshot::Receiver<io::Result<()>>,
+        timeout: Pin<Box<Sleep>>,
+    },
 }
 
 /// Bounded logical byte stream shared by Mux.Cool and smux v1.
 pub(super) struct VirtualStream {
     stream_id: u32,
     inbound: mpsc::Receiver<InboundEvent>,
+    terminal: oneshot::Receiver<InboundTerminal>,
     inbound_chunk: Option<InboundData>,
     inbound_offset: usize,
     outbound: mpsc::Sender<OutboundCommand>,
@@ -233,13 +256,14 @@ pub(super) struct VirtualStream {
 impl VirtualStream {
     pub(super) fn new(
         stream_id: u32,
-        inbound: mpsc::Receiver<InboundEvent>,
+        inbound: InboundChannels,
         outbound: mpsc::Sender<OutboundCommand>,
         max_frame_payload: usize,
     ) -> Self {
         Self {
             stream_id,
-            inbound,
+            inbound: inbound.data,
+            terminal: inbound.terminal,
             inbound_chunk: None,
             inbound_offset: 0,
             outbound,
@@ -256,7 +280,7 @@ impl VirtualStream {
 
     pub(super) fn new_smux_v2(
         stream_id: u32,
-        inbound: mpsc::Receiver<InboundEvent>,
+        inbound: InboundChannels,
         outbound: mpsc::Sender<OutboundCommand>,
         max_frame_payload: usize,
         flow: Arc<SmuxV2FlowControl>,
@@ -335,22 +359,66 @@ impl VirtualStream {
                     else {
                         unreachable!()
                     };
-                    self.barrier = BarrierState::Waiting(complete_rx);
-                }
-                BarrierState::Waiting(receiver) => {
-                    let result = match Pin::new(receiver).poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(result)) => result,
-                        Poll::Ready(Err(_)) => Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "multiplexed session writer dropped a flush barrier",
-                        )),
+                    self.barrier = BarrierState::Waiting {
+                        complete_rx,
+                        timeout: Box::pin(tokio::time::sleep(barrier_timeout())),
                     };
-                    self.barrier = BarrierState::Idle;
-                    return Poll::Ready(result);
+                }
+                BarrierState::Waiting {
+                    complete_rx,
+                    timeout,
+                } => {
+                    match Pin::new(complete_rx).poll(cx) {
+                        Poll::Ready(Ok(result)) => {
+                            self.barrier = BarrierState::Idle;
+                            return Poll::Ready(result);
+                        }
+                        Poll::Ready(Err(_)) => {
+                            self.barrier = BarrierState::Idle;
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "multiplexed session writer dropped a flush barrier",
+                            )));
+                        }
+                        Poll::Pending => {}
+                    }
+                    if timeout.as_mut().poll(cx).is_ready() {
+                        self.barrier = BarrierState::Idle;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "multiplexed stream flush barrier timed out",
+                        )));
+                    }
+                    return Poll::Pending;
                 }
             }
         }
+    }
+
+    fn finish_read(&mut self, terminal: InboundTerminal) -> Poll<io::Result<()>> {
+        self.read_finished = true;
+        match terminal {
+            InboundTerminal::Finished => Poll::Ready(Ok(())),
+            InboundTerminal::Failed(message) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, message)))
+            }
+        }
+    }
+
+    fn poll_terminal(&mut self, cx: &mut Context<'_>) -> Poll<Option<InboundTerminal>> {
+        match Pin::new(&mut self.terminal).poll(cx) {
+            Poll::Ready(Ok(terminal)) => Poll::Ready(Some(terminal)),
+            Poll::Ready(Err(_)) => Poll::Ready(Some(InboundTerminal::Finished)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn barrier_timeout() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(20)
+    } else {
+        std::time::Duration::from_secs(5)
     }
 }
 
@@ -438,22 +506,25 @@ impl AsyncRead for VirtualStream {
             }
 
             match Pin::new(&mut self.inbound).poll_recv(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => match self.poll_terminal(cx) {
+                    Poll::Ready(Some(terminal)) => return self.finish_read(terminal),
+                    Poll::Ready(None) => {
+                        self.read_finished = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
                 Poll::Ready(Some(InboundEvent::Data(data))) if data.is_empty() => continue,
                 Poll::Ready(Some(InboundEvent::Data(data))) => {
                     self.inbound_chunk = Some(data);
                 }
-                Poll::Ready(Some(InboundEvent::Finished)) | Poll::Ready(None) => {
-                    self.read_finished = true;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(Some(InboundEvent::Failed(message))) => {
-                    self.read_finished = true;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        message,
-                    )));
-                }
+                Poll::Ready(None) => match self.poll_terminal(cx) {
+                    Poll::Ready(Some(terminal)) => return self.finish_read(terminal),
+                    Poll::Ready(None) | Poll::Pending => {
+                        self.read_finished = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                },
             }
         }
     }
@@ -579,10 +650,12 @@ impl Drop for VirtualStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn drop_uses_a_reserved_close_slot_when_the_outbound_queue_is_full() {
         let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
         let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
         outbound_tx
             .send(OutboundCommand::Data {
@@ -593,7 +666,12 @@ mod tests {
             .unwrap();
         let (close_tx, mut close_rx) = mpsc::channel(1);
         let close_permit = close_tx.clone().reserve_owned().await.unwrap();
-        let mut stream = VirtualStream::new(7, inbound_rx, outbound_tx, 1024);
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
         stream.set_drop_close_permit(close_permit);
 
         drop(stream);
@@ -602,6 +680,87 @@ mod tests {
         assert!(matches!(
             outbound_rx.recv().await,
             Some(OutboundCommand::Data { stream_id: 99, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_finished_bypasses_a_full_inbound_data_queue() {
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        inbound_tx
+            .send(InboundEvent::Data(InboundData::untracked(b"x".to_vec())))
+            .await
+            .unwrap();
+        terminal_tx.send(InboundTerminal::Finished).unwrap();
+
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [b'x']);
+
+        let mut eof = [0_u8; 1];
+        assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_preserves_queued_data_before_reset() {
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        inbound_tx
+            .send(InboundEvent::Data(InboundData::untracked(b"x".to_vec())))
+            .await
+            .unwrap();
+        terminal_tx
+            .send(InboundTerminal::Failed("physical closed".to_string()))
+            .unwrap();
+
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [b'x']);
+
+        let error = stream.read(&mut byte).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(error.to_string().contains("physical closed"));
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_times_out_when_writer_keeps_completion_open() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        let mut flush = Box::pin(stream.flush());
+        match futures::future::poll_fn(|cx| flush.as_mut().poll(cx)).await {
+            Ok(()) => panic!("flush barrier completed without a writer"),
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
+        }
+
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Barrier { .. })
         ));
     }
 }

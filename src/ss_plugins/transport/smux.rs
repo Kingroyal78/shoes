@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 
 use super::virtual_stream::{
-    InboundEvent, OutboundCommand, ReceiveBudget, SmuxV2FlowControl, VirtualStream, WindowUpdate,
+    InboundChannels, InboundEvent, InboundTerminal, OutboundCommand, ReceiveBudget,
+    SmuxV2FlowControl, VirtualStream, WindowUpdate,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -271,6 +272,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 
 struct StreamState {
     inbound: Option<mpsc::Sender<InboundEvent>>,
+    terminal: Option<oneshot::Sender<InboundTerminal>>,
     flow: Option<Arc<SmuxV2FlowControl>>,
 }
 
@@ -288,7 +290,7 @@ async fn serve_smux(
         mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
     let (drop_close_tx, mut drop_close_rx) = mpsc::channel::<u32>(limits.max_concurrent_streams);
     let close_outbound = outbound_tx.clone();
-    let close_forwarder = tokio::spawn(async move {
+    let mut close_forwarder = tokio::spawn(async move {
         while let Some(stream_id) = drop_close_rx.recv().await {
             close_outbound
                 .send(OutboundCommand::Finished { stream_id })
@@ -299,7 +301,7 @@ async fn serve_smux(
     });
     let (updates_tx, mut updates_rx) = mpsc::channel::<WindowUpdate>(limits.outbound_frame_queue);
     let receive_budget = Arc::new(ReceiveBudget::new(config.max_receive_buffer));
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut updates_open = true;
         let ping_period = config
             .keepalive_interval
@@ -311,7 +313,6 @@ async fn serve_smux(
         ping.tick().await;
         loop {
             tokio::select! {
-                biased;
                 update = updates_rx.recv(), if updates_open => {
                     match update {
                         Some(update) => {
@@ -339,7 +340,23 @@ async fn serve_smux(
                             write_frame(&mut writer, version, CMD_FIN, stream_id, &[]).await?;
                         }
                         OutboundCommand::Barrier { complete } => {
-                            let result = writer.flush().await;
+                            // Bound the flush: a half-open physical stream can
+                            // stall flush forever, which would hold the
+                            // barrier's oneshot open, wedge the logical
+                            // stream's shutdown, and leak the outbound
+                            // connection in CLOSE_WAIT. On timeout report the
+                            // error so the logical stream closes anyway.
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                writer.flush(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "smux barrier flush timed out",
+                                )
+                            })?;
                             let reported = result
                                 .as_ref()
                                 .map(|_| ())
@@ -389,18 +406,20 @@ async fn serve_smux(
                     Err(_) => break invalid(format!("smux v{version} close forwarder closed")),
                 };
                 let (inbound_tx, inbound_rx) = mpsc::channel(limits.inbound_frames_per_stream);
+                let (terminal_tx, terminal_rx) = oneshot::channel();
                 let flow = (version == VERSION_V2).then(|| Arc::new(SmuxV2FlowControl::new()));
                 streams.insert(
                     frame.stream_id,
                     StreamState {
                         inbound: Some(inbound_tx),
+                        terminal: Some(terminal_tx),
                         flow: flow.clone(),
                     },
                 );
                 let mut logical = if let Some(flow) = flow {
                     VirtualStream::new_smux_v2(
                         frame.stream_id,
-                        inbound_rx,
+                        InboundChannels::new(inbound_rx, terminal_rx),
                         outbound_tx.clone(),
                         limits.max_frame_payload,
                         flow,
@@ -410,7 +429,7 @@ async fn serve_smux(
                 } else {
                     VirtualStream::new(
                         frame.stream_id,
-                        inbound_rx,
+                        InboundChannels::new(inbound_rx, terminal_rx),
                         outbound_tx.clone(),
                         limits.max_frame_payload,
                     )
@@ -453,8 +472,8 @@ async fn serve_smux(
                 let Some(inbound) = streams.remove(&frame.stream_id) else {
                     break invalid(format!("smux v{version} FIN references an unknown stream"));
                 };
-                if let Some(inbound) = inbound.inbound {
-                    let _ = inbound.try_send(InboundEvent::Finished);
+                if let Some(terminal) = inbound.terminal {
+                    let _ = terminal.send(InboundTerminal::Finished);
                 }
             }
             CMD_NOP => {}
@@ -489,18 +508,44 @@ async fn serve_smux(
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("smux v{version} physical stream closed"));
     for (_, stream) in streams {
-        if let Some(stream) = stream.inbound {
-            let _ = stream.try_send(InboundEvent::Failed(failure.clone()));
+        if let Some(terminal) = stream.terminal {
+            let _ = terminal.send(InboundTerminal::Failed(failure.clone()));
         }
     }
     drop(drop_close_tx);
     drop(updates_tx);
     drop(outbound_tx);
-    let close_result = close_forwarder
+    // Bound the close forwarder wait. All logical-stream shutdown events were
+    // delivered above, so aborting the forwarder here cannot orphan copy
+    // tasks; it only releases the drop-close channel and its outbound sender
+    // clone so the writer drain below can complete.
+    let close_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut close_forwarder)
+            .await
+            .map_err(|_| {
+                close_forwarder.abort();
+                io::Error::other("smux close task timed out")
+            })
+            .and_then(|res| {
+                res.map_err(|error| io::Error::other(format!("smux close task failed: {error}")))
+            });
+    // If the close forwarder failed, still drain/abort the writer so no
+    // background task is orphaned (a leaked writer holds the write half of
+    // the physical stream and its fd).
+    if close_result.is_err() {
+        writer_task.abort();
+    }
+    let close_result = close_result?;
+    // Bound only the writer drain: the writer may be stuck behind a leaked
+    // outbound sender, and aborting it only releases the write half of the
+    // physical stream (the fd is owned by the reader side, which has already
+    // finished and delivered per-stream shutdown events above).
+    let writer_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer_task)
         .await
-        .map_err(|error| io::Error::other(format!("smux close task failed: {error}")))?;
-    let writer_result = writer_task
-        .await
+        .map_err(|_| {
+            writer_task.abort();
+            io::Error::other("smux writer task timed out")
+        })?
         .map_err(|error| io::Error::other(format!("smux writer task failed: {error}")))?;
     read_result.and(close_result).and(writer_result)
 }
@@ -727,6 +772,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_smux_config_does_not_enable_idle_read_timeout() {
+        let config = SmuxServerConfig::default();
+        assert!(config.keepalive_interval.is_none());
+        assert!(config.keepalive_timeout.is_none());
+    }
+
     #[tokio::test]
     async fn frame_reader_handles_one_byte_fragmentation() {
         let wire = [1, CMD_PSH, 3, 0, 7, 0, 0, 0, b'a', b'b', b'c'];
@@ -777,11 +829,19 @@ mod tests {
     #[tokio::test]
     async fn v2_stream_reports_initial_and_half_window_consumption() {
         let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
         let (outbound_tx, _outbound_rx) = mpsc::channel(4);
         let (updates_tx, mut updates_rx) = mpsc::channel(4);
         let flow = Arc::new(SmuxV2FlowControl::new());
-        let mut stream =
-            VirtualStream::new_smux_v2(7, inbound_rx, outbound_tx, 1024, flow, updates_tx, 8);
+        let mut stream = VirtualStream::new_smux_v2(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+            flow,
+            updates_tx,
+            8,
+        );
         inbound_tx
             .send(InboundEvent::Data(InboundData::untracked(
                 b"abcdefgh".to_vec(),
@@ -817,6 +877,7 @@ mod tests {
     #[tokio::test]
     async fn v2_reads_backpressure_when_the_bounded_update_queue_is_full() {
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
         let (updates_tx, mut updates_rx) = mpsc::channel(1);
         updates_tx
@@ -828,8 +889,15 @@ mod tests {
             .await
             .unwrap();
         let flow = Arc::new(SmuxV2FlowControl::new());
-        let mut stream =
-            VirtualStream::new_smux_v2(7, inbound_rx, outbound_tx, 1024, flow, updates_tx, 8);
+        let mut stream = VirtualStream::new_smux_v2(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+            flow,
+            updates_tx,
+            8,
+        );
         inbound_tx
             .send(InboundEvent::Data(InboundData::untracked(b"x".to_vec())))
             .await
@@ -907,6 +975,57 @@ mod tests {
             .unwrap()
             .expect_err("physical receive budget must reject excess queued bytes");
         assert!(error.to_string().contains("receive buffer"));
+    }
+
+    #[tokio::test]
+    async fn fin_does_not_block_the_physical_reader_when_inbound_queue_is_full() {
+        let (mut client, server) = tokio::io::duplex(512);
+        let handler = Arc::new(HoldingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig {
+                limits: SmuxLimits {
+                    inbound_frames_per_stream: 1,
+                    max_frame_payload: 4,
+                    ..SmuxLimits::default()
+                },
+                max_receive_buffer: 8,
+                max_stream_buffer: 4,
+                ..SmuxServerConfig::default()
+            },
+        ));
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        handler.ready.notified().await;
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"x")
+            .await
+            .unwrap();
+        write_frame(&mut client, VERSION_V1, CMD_FIN, 1, &[])
+            .await
+            .unwrap();
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 2, &[])
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handler.ready.notified(),
+        )
+        .await
+        .expect("smux reader must continue after FIN even when the logical queue is full");
+
+        handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        client.shutdown().await.unwrap();
+        session.await.unwrap().unwrap();
     }
 
     #[tokio::test]

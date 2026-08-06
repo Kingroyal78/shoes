@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 
-use super::virtual_stream::{InboundData, InboundEvent, OutboundCommand, VirtualStream};
+use super::virtual_stream::{
+    InboundChannels, InboundData, InboundEvent, InboundTerminal, OutboundCommand, VirtualStream,
+};
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -225,6 +227,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     writer.write_all(&frame).await
 }
 
+struct LogicalStreamState {
+    inbound: Option<mpsc::Sender<InboundEvent>>,
+    terminal: Option<oneshot::Sender<InboundTerminal>>,
+}
+
 async fn serve_mux_cool(
     stream: Box<dyn AsyncStream>,
     inner: Arc<dyn TcpServerHandler>,
@@ -273,7 +280,7 @@ async fn serve_mux_cool(
         writer.shutdown().await
     });
 
-    let mut streams: HashMap<u16, Option<mpsc::Sender<InboundEvent>>> = HashMap::new();
+    let mut streams: HashMap<u16, LogicalStreamState> = HashMap::new();
     let read_result = loop {
         let (metadata, data) = match read_frame(&mut reader, limits.max_metadata_bytes).await {
             Ok(Some(frame)) => frame,
@@ -293,6 +300,7 @@ async fn serve_mux_cool(
                     Err(_) => break invalid("Mux.Cool close forwarder closed"),
                 };
                 let (inbound_tx, inbound_rx) = mpsc::channel(limits.inbound_frames_per_stream);
+                let (terminal_tx, terminal_rx) = oneshot::channel();
                 if !data.is_empty()
                     && inbound_tx
                         .try_send(InboundEvent::Data(InboundData::untracked(data)))
@@ -300,10 +308,16 @@ async fn serve_mux_cool(
                 {
                     break invalid("Mux.Cool logical inbound queue rejected initial data");
                 }
-                streams.insert(metadata.stream_id, Some(inbound_tx));
+                streams.insert(
+                    metadata.stream_id,
+                    LogicalStreamState {
+                        inbound: Some(inbound_tx),
+                        terminal: Some(terminal_tx),
+                    },
+                );
                 let mut logical = VirtualStream::new(
                     u32::from(metadata.stream_id),
-                    inbound_rx,
+                    InboundChannels::new(inbound_rx, terminal_rx),
                     outbound_tx.clone(),
                     u16::MAX as usize,
                 );
@@ -321,14 +335,14 @@ async fn serve_mux_cool(
             }
             STATUS_KEEP => {
                 match streams.get_mut(&metadata.stream_id) {
-                    Some(inbound) => {
+                    Some(state) => {
                         if !data.is_empty()
-                            && let Some(sender) = inbound
+                            && let Some(sender) = &state.inbound
                         {
                             match sender.try_send(InboundEvent::Data(InboundData::untracked(data)))
                             {
                                 Ok(()) => {}
-                                Err(TrySendError::Closed(_)) => *inbound = None,
+                                Err(TrySendError::Closed(_)) => state.inbound = None,
                                 Err(TrySendError::Full(_)) => {
                                     break invalid("Mux.Cool logical inbound queue is full");
                                 }
@@ -356,8 +370,10 @@ async fn serve_mux_cool(
                 // Close is idempotent in the reference implementation.  In
                 // particular, Mihomo may emit End more than once while
                 // unwinding layered net.Conn wrappers.
-                if let Some(Some(inbound)) = streams.remove(&metadata.stream_id) {
-                    if !data.is_empty() {
+                if let Some(state) = streams.remove(&metadata.stream_id) {
+                    if !data.is_empty()
+                        && let Some(inbound) = state.inbound
+                    {
                         match inbound.try_send(InboundEvent::Data(InboundData::untracked(data))) {
                             Ok(()) => {}
                             Err(TrySendError::Closed(_)) => {}
@@ -366,16 +382,15 @@ async fn serve_mux_cool(
                             }
                         }
                     }
-                    let terminal = if metadata.has_error {
-                        InboundEvent::Failed("Mux.Cool peer closed the logical stream".to_string())
-                    } else {
-                        InboundEvent::Finished
-                    };
-                    match inbound.try_send(terminal) {
-                        Ok(()) | Err(TrySendError::Closed(_)) => {}
-                        Err(TrySendError::Full(_)) => {
-                            break invalid("Mux.Cool logical inbound queue is full");
-                        }
+                    if let Some(terminal_tx) = state.terminal {
+                        let terminal = if metadata.has_error {
+                            InboundTerminal::Failed(
+                                "Mux.Cool peer closed the logical stream".to_string(),
+                            )
+                        } else {
+                            InboundTerminal::Finished
+                        };
+                        let _ = terminal_tx.send(terminal);
                     }
                 }
             }
@@ -390,8 +405,8 @@ async fn serve_mux_cool(
         .map(ToString::to_string)
         .unwrap_or_else(|| "Mux.Cool physical stream closed".to_string());
     for (_, stream) in streams {
-        if let Some(stream) = stream {
-            let _ = stream.try_send(InboundEvent::Failed(failure.clone()));
+        if let Some(terminal) = stream.terminal {
+            let _ = terminal.send(InboundTerminal::Failed(failure.clone()));
         }
     }
     drop(drop_close_tx);
