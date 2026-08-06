@@ -55,12 +55,23 @@
 
 // Modules are declared here (mirroring main.rs) so the library crate can
 // expose them for FFI/mobile integration.
+#[cfg_attr(feature = "internal-bench", allow(clippy::should_implement_trait))]
+#[cfg(feature = "internal-bench")]
+pub mod address;
+#[cfg(not(feature = "internal-bench"))]
 mod address;
+#[cfg(feature = "internal-bench")]
+pub mod anytls;
+#[cfg(not(feature = "internal-bench"))]
 mod anytls;
 mod async_stream;
 mod backend_config;
 mod buf_reader;
 mod client_proxy_chain;
+#[cfg_attr(feature = "internal-bench", allow(private_interfaces))]
+#[cfg(feature = "internal-bench")]
+pub mod client_proxy_selector;
+#[cfg(not(feature = "internal-bench"))]
 mod client_proxy_selector;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
@@ -71,6 +82,9 @@ pub mod e2e_server;
 #[cfg(feature = "e2e-client")]
 pub mod e2e_support;
 mod h2mux;
+#[cfg(feature = "internal-bench")]
+pub mod http_handler;
+#[cfg(not(feature = "internal-bench"))]
 mod http_handler;
 mod hysteria2_obfs;
 mod hysteria2_server;
@@ -93,6 +107,9 @@ mod slide_buffer;
 mod snell;
 mod socket_util;
 mod socks5_udp_relay;
+#[cfg(feature = "internal-bench")]
+pub mod socks_handler;
+#[cfg(not(feature = "internal-bench"))]
 mod socks_handler;
 pub mod ss_plugins;
 mod stream_reader;
@@ -106,6 +123,9 @@ mod tuic_server;
 mod uot;
 mod util;
 mod uuid_util;
+#[cfg(feature = "internal-bench")]
+pub mod v2board;
+#[cfg(not(feature = "internal-bench"))]
 mod v2board;
 mod vless;
 mod vmess;

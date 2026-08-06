@@ -36,6 +36,15 @@ enum OutgoingMessage {
     Fin { stream_id: u32 },
 }
 
+#[cfg(feature = "internal-bench")]
+pub fn build_open_destination_frames_for_bench(destination: &NetLocation) -> io::Result<BytesMut> {
+    let dest_data = try_write_location_to_vec(destination)?;
+    let mut buf = BytesMut::with_capacity(256);
+    Frame::control(Command::Syn, 1).encode_into(&mut buf);
+    Frame::data(1, Bytes::from(dest_data)).encode_into(&mut buf);
+    Ok(buf)
+}
+
 /// AnyTLS client session - manages multiplexed streams over a connection
 ///
 /// Each session handles:
@@ -690,7 +699,7 @@ impl AnyTlsClientSession {
         };
 
         // Encode destination address
-        let dest_data = try_write_location_to_vec(&destination)?;
+        let mut dest_data = Some(try_write_location_to_vec(&destination)?);
 
         // Try to take the initial buffer (only first stream gets it)
         // If present, we send Settings + SYN + destination as single message
@@ -700,7 +709,8 @@ impl AnyTlsClientSession {
                 // First stream - add SYN and destination to buffer
                 // This creates: [Settings frame][SYN frame][PSH frame with destination]
                 Frame::control(Command::Syn, stream_id).encode_into(buf);
-                Frame::data(stream_id, Bytes::from(dest_data.clone())).encode_into(buf);
+                let dest_data = dest_data.take().expect("destination data is available");
+                Frame::data(stream_id, Bytes::from(dest_data)).encode_into(buf);
 
                 // Take the buffer (subsequent streams won't have it)
                 buf_guard.take().map(|b| b.freeze())
@@ -721,6 +731,7 @@ impl AnyTlsClientSession {
         } else {
             // Subsequent streams: send SYN and destination normally
             self.send_control_frame(Command::Syn, stream_id, Bytes::new())?;
+            let dest_data = dest_data.expect("destination data is available");
             self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))?;
         }
 

@@ -7,6 +7,7 @@
 //! smallest-order hit. Multi-matcher OR rules (rare) stay in a linear list
 //! scanned on every lookup; their order is included in the global ordering.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -193,24 +194,35 @@ impl CompiledRules {
     /// Returns the outbound tag of the first-matching domain rule, if any.
     pub fn match_domain(&self, domain: &str) -> Option<&str> {
         let inner = self.inner.as_ref()?;
-        let hostname = domain.to_ascii_lowercase();
+        let hostname = if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(domain.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(domain)
+        };
+        let hostname = hostname.as_ref();
         let mut best: Option<(usize, &str)> = None;
 
-        inner.suffix_trie.query(&hostname, &mut best);
+        inner.suffix_trie.query(hostname, &mut best);
 
-        if let Some((order, outbound)) = inner.full.get(&hostname)
+        if let Some((order, outbound)) = inner.full.get(hostname)
             && best.is_none_or(|(best_order, _)| *order < best_order)
         {
             best = Some((*order, outbound));
         }
         for (order, keyword, outbound) in &inner.keywords {
+            if best.is_some_and(|(best_order, _)| *order >= best_order) {
+                break;
+            }
             if hostname.contains(keyword) && best.is_none_or(|(best_order, _)| *order < best_order)
             {
                 best = Some((*order, outbound));
             }
         }
         for (order, outbound, regex) in &inner.regexes {
-            if regex.is_match(&hostname) && best.is_none_or(|(best_order, _)| *order < best_order) {
+            if best.is_some_and(|(best_order, _)| *order >= best_order) {
+                break;
+            }
+            if regex.is_match(hostname) && best.is_none_or(|(best_order, _)| *order < best_order) {
                 best = Some((*order, outbound));
             }
         }

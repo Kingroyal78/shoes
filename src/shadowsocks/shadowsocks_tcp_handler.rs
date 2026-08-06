@@ -20,7 +20,10 @@ use crate::h2mux::{
     MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, PrependStream, handle_h2mux_session_with_context,
 };
 use crate::resolver::Resolver;
-use crate::socks_handler::{read_location, try_write_location_to_vec, write_location_to_vec};
+use crate::socks_handler::{
+    read_location, socks_location_len, try_write_location_to_buf, try_write_location_to_vec,
+    write_location_to_vec,
+};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpClientHandler, TcpClientSetupResult, TcpServerHandler,
@@ -832,10 +835,9 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         write_all(&mut client_stream, &location_vec).await?;
 
         // Writes UoT V2 request header: isConnect(1) + SOCKS address
-        let mut uot_header = Vec::with_capacity(64);
+        let mut uot_header = Vec::with_capacity(1 + socks_location_len(target.location())?);
         uot_header.push(1u8); // isConnect = 1 (connect mode)
-        let target_bytes = try_write_location_to_vec(target.location())?;
-        uot_header.extend_from_slice(&target_bytes);
+        try_write_location_to_buf(target.location(), &mut uot_header)?;
         write_all(&mut client_stream, &uot_header).await?;
         client_stream.flush().await?;
 

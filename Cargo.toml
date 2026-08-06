@@ -56,10 +56,26 @@ name = "shoes-vless-xhttp-e2e-client"
 path = "src/bin/shoes-vless-xhttp-e2e-client.rs"
 required-features = ["e2e-client"]
 
+[[bin]]
+name = "shoes-basic-proxy-perf-client"
+path = "src/bin/shoes-basic-proxy-perf-client.rs"
+required-features = ["internal-bench"]
+
+[[bin]]
+name = "shoes-static-http-perf-server"
+path = "src/bin/shoes-static-http-perf-server.rs"
+required-features = ["internal-bench"]
+
 [features]
 default = []
 e2e-client = ["dep:rustls-pemfile", "dep:tokio-rustls"]
 ffi = []  # Enable FFI module for non-Android builds
+internal-bench = []
+
+[[bench]]
+name = "perf_baseline"
+harness = false
+required-features = ["internal-bench"]
 
 [dependencies]
 async-trait = "*"

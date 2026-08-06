@@ -27,7 +27,7 @@ use crate::slide_buffer::SlideBuffer;
 #[cfg(test)]
 use crate::socks_handler::write_location_to_vec;
 use crate::socks_handler::{
-    CMD_CONNECT, CMD_UDP_ASSOCIATE, read_location, try_write_location_to_vec,
+    CMD_CONNECT, CMD_UDP_ASSOCIATE, read_location, socks_location_len, try_write_location_to_buf,
 };
 use crate::stream_reader::StreamReader;
 use crate::tcp::chain_builder::build_direct_chain_group;
@@ -878,12 +878,19 @@ impl TcpClientHandler for TrojanTcpHandler {
         }
 
         let password_hash = &self.users[0].0;
-        write_all(&mut client_stream, password_hash).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        write_all(&mut client_stream, &[CMD_CONNECT]).await?;
-        let location_bytes = try_write_location_to_vec(remote_location.location())?;
-        write_all(&mut client_stream, &location_bytes).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
+        let mut request = Vec::with_capacity(
+            password_hash.len()
+                + CRLF_BYTES.len()
+                + 1
+                + socks_location_len(remote_location.location())?
+                + CRLF_BYTES.len(),
+        );
+        request.extend_from_slice(password_hash);
+        request.extend_from_slice(&CRLF_BYTES);
+        request.push(CMD_CONNECT);
+        try_write_location_to_buf(remote_location.location(), &mut request)?;
+        request.extend_from_slice(&CRLF_BYTES);
+        write_all(&mut client_stream, &request).await?;
         client_stream.flush().await?;
         Ok(TcpClientSetupResult {
             client_stream,
@@ -917,12 +924,19 @@ impl TcpClientHandler for TrojanTcpHandler {
 
         let target = target.into_location();
         let password_hash = &self.users[0].0;
-        write_all(&mut client_stream, password_hash).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        write_all(&mut client_stream, &[CMD_UDP_ASSOCIATE]).await?;
-        let location_bytes = try_write_location_to_vec(&target)?;
-        write_all(&mut client_stream, &location_bytes).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
+        let mut request = Vec::with_capacity(
+            password_hash.len()
+                + CRLF_BYTES.len()
+                + 1
+                + socks_location_len(&target)?
+                + CRLF_BYTES.len(),
+        );
+        request.extend_from_slice(password_hash);
+        request.extend_from_slice(&CRLF_BYTES);
+        request.push(CMD_UDP_ASSOCIATE);
+        try_write_location_to_buf(&target, &mut request)?;
+        request.extend_from_slice(&CRLF_BYTES);
+        write_all(&mut client_stream, &request).await?;
         client_stream.flush().await?;
 
         Ok(Box::new(TrojanPacketStream::new_fixed_target(

@@ -555,9 +555,12 @@ impl TcpClientHandler for SocksTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = try_write_location_to_vec(remote_location.location())?;
-        write_all(&mut client_stream, &location_bytes).await?;
+        let mut request = Vec::with_capacity(
+            self.prefix_data.len() + socks_location_len(remote_location.location())?,
+        );
+        request.extend_from_slice(&self.prefix_data);
+        try_write_location_to_buf(remote_location.location(), &mut request)?;
+        write_all(&mut client_stream, &request).await?;
         client_stream.flush().await?;
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
@@ -742,8 +745,9 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
             stream.read_exact(&mut len).await?;
             let domain_len = len[0] as usize;
 
-            let mut buf = vec![0u8; domain_len + 2];
-            stream.read_exact(&mut buf).await?;
+            let mut buf = [0u8; u8::MAX as usize + 2];
+            let payload_len = domain_len + 2;
+            stream.read_exact(&mut buf[..payload_len]).await?;
 
             let domain = std::str::from_utf8(&buf[..domain_len]).map_err(|e| {
                 std::io::Error::new(
@@ -764,42 +768,57 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
 }
 
 pub fn try_write_location_to_vec(location: &NetLocation) -> io::Result<Vec<u8>> {
+    let mut vec = Vec::with_capacity(socks_location_len(location)?);
+    write_location_to_buf_unchecked(location, &mut vec);
+    Ok(vec)
+}
+
+pub fn try_write_location_to_buf(location: &NetLocation, buf: &mut Vec<u8>) -> io::Result<()> {
+    let encoded_len = socks_location_len(location)?;
+    buf.reserve(encoded_len);
+    write_location_to_buf_unchecked(location, buf);
+    Ok(())
+}
+
+fn write_location_to_buf_unchecked(location: &NetLocation, buf: &mut Vec<u8>) {
     let (address, port) = location.components();
-    let mut vec = match address {
+    match address {
         Address::Ipv4(v4addr) => {
-            let mut vec = Vec::with_capacity(7);
-            vec.push(ADDR_TYPE_IPV4);
-            vec.extend_from_slice(&v4addr.octets());
-            vec
+            buf.push(ADDR_TYPE_IPV4);
+            buf.extend_from_slice(&v4addr.octets());
         }
         Address::Ipv6(v6addr) => {
-            let mut vec = Vec::with_capacity(19);
-            vec.push(ADDR_TYPE_IPV6);
-            vec.extend_from_slice(&v6addr.octets());
-            vec
+            buf.push(ADDR_TYPE_IPV6);
+            buf.extend_from_slice(&v6addr.octets());
         }
         Address::Hostname(domain_name) => {
             let domain_name_bytes = domain_name.as_bytes();
-            if domain_name_bytes.len() > u8::MAX as usize {
+            buf.push(ADDR_TYPE_DOMAIN_NAME);
+            buf.push(domain_name_bytes.len() as u8);
+            buf.extend_from_slice(domain_name_bytes);
+        }
+    }
+
+    buf.push((port >> 8) as u8);
+    buf.push((port & 0xff) as u8);
+}
+
+pub fn socks_location_len(location: &NetLocation) -> io::Result<usize> {
+    let (address, _) = location.components();
+    match address {
+        Address::Ipv4(_) => Ok(1 + 4 + 2),
+        Address::Ipv6(_) => Ok(1 + 16 + 2),
+        Address::Hostname(domain_name) => {
+            let domain_name_len = domain_name.len();
+            if domain_name_len > u8::MAX as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "SOCKS domain name is too long: {} bytes",
-                        domain_name_bytes.len()
-                    ),
+                    format!("SOCKS domain name is too long: {domain_name_len} bytes"),
                 ));
             }
-            let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
-            vec.push(ADDR_TYPE_DOMAIN_NAME);
-            vec.push(domain_name_bytes.len() as u8);
-            vec.extend_from_slice(domain_name_bytes);
-            vec
+            Ok(1 + 1 + domain_name_len + 2)
         }
-    };
-
-    vec.push((port >> 8) as u8);
-    vec.push((port & 0xff) as u8);
-    Ok(vec)
+    }
 }
 
 pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
@@ -824,5 +843,31 @@ mod tests {
         assert_eq!(encoded[0], ADDR_TYPE_DOMAIN_NAME);
         assert_eq!(encoded[1], 255);
         assert_eq!(encoded.len(), 1 + 1 + 255 + 2);
+    }
+
+    #[test]
+    fn try_write_location_to_buf_matches_vec_encoding() {
+        let locations = [
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), 443),
+            NetLocation::new(Address::Ipv6(std::net::Ipv6Addr::LOCALHOST), 443),
+            NetLocation::new(Address::Hostname("example.com".to_string()), 443),
+        ];
+
+        for location in locations {
+            let expected = try_write_location_to_vec(&location).unwrap();
+            let mut encoded = Vec::new();
+            try_write_location_to_buf(&location, &mut encoded).unwrap();
+            assert_eq!(encoded, expected);
+            assert_eq!(socks_location_len(&location).unwrap(), expected.len());
+        }
+    }
+
+    #[test]
+    fn try_write_location_to_buf_rejects_overlong_domain_without_mutating_buffer() {
+        let location = NetLocation::new(Address::Hostname("a".repeat(256)), 443);
+        let mut encoded = vec![1, 2, 3];
+        let err = try_write_location_to_buf(&location, &mut encoded).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(encoded, [1, 2, 3]);
     }
 }
