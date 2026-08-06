@@ -14,11 +14,15 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
 const DEFAULT_BUF_SIZE: usize = 16384;
+// Once one side reaches EOF, keep the opposite direction alive briefly for
+// protocol half-close semantics, then reclaim the whole proxy task.
+const DEFAULT_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct CopyBuffer {
@@ -183,6 +187,12 @@ enum TransferState {
     Done,
 }
 
+impl TransferState {
+    fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
+    }
+}
+
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a: &'a mut A,
     b: &'a mut B,
@@ -190,7 +200,9 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_buf: CopyBuffer,
     a_to_b: TransferState,
     b_to_a: TransferState,
-    sleep_future: Option<Pin<Box<tokio::time::Sleep>>>,
+    ping_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    half_close_timeout: Option<Duration>,
+    half_close_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 fn transfer_one_direction<A, B>(
@@ -237,10 +249,12 @@ where
             b_buf,
             a_to_b,
             b_to_a,
-            sleep_future,
+            ping_sleep,
+            half_close_timeout,
+            half_close_sleep,
         } = &mut *self;
 
-        if let Some(sleep) = sleep_future {
+        if let Some(sleep) = ping_sleep {
             let ping_fired = sleep.as_mut().poll(cx).is_ready();
             if ping_fired {
                 // a_buf writes to b - so we need to check if b supports ping, and similarly
@@ -253,10 +267,24 @@ where
             }
         }
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+        let a_to_b_poll = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_to_a_poll = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        match (a_to_b, b_to_a) {
+        let one_side_done = a_to_b.is_done() || b_to_a.is_done();
+        let both_sides_done = a_to_b.is_done() && b_to_a.is_done();
+        if one_side_done && !both_sides_done {
+            if let Some(timeout) = *half_close_timeout {
+                let sleep =
+                    half_close_sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                if sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        } else {
+            *half_close_sleep = None;
+        }
+
+        match (a_to_b_poll, b_to_a_poll) {
             (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
             (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
             _ => Poll::Pending,
@@ -274,7 +302,8 @@ where
 /// the other, and reading from that stream will stop. Copying of data in
 /// the other direction will continue.
 ///
-/// The future will complete successfully once both directions of communication has been shut down.
+/// The future will complete successfully once both directions of communication has been shut down
+/// or once the half-close grace period expires after one direction has shut down.
 /// A direction is shut down when the reader reports EOF,
 /// at which point [`shutdown()`] is called on the corresponding writer. When finished,
 /// it will return a tuple of the number of bytes copied from a to b
@@ -328,7 +357,32 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    let sleep_future = if a.supports_ping() || b.supports_ping() {
+    copy_bidirectional_with_half_close_timeout_and_sizes(
+        a,
+        b,
+        a_need_initial_flush,
+        b_need_initial_flush,
+        Some(DEFAULT_HALF_CLOSE_TIMEOUT),
+        a_to_b_buf_size,
+        b_to_a_buf_size,
+    )
+    .await
+}
+
+async fn copy_bidirectional_with_half_close_timeout_and_sizes<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+    half_close_timeout: Option<Duration>,
+    a_to_b_buf_size: usize,
+    b_to_a_buf_size: usize,
+) -> io::Result<()>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    let ping_sleep = if a.supports_ping() || b.supports_ping() {
         Some(Box::pin(tokio::time::sleep(
             std::time::Duration::from_secs(60),
         )))
@@ -346,7 +400,130 @@ where
         b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
-        sleep_future,
+        ping_sleep,
+        half_close_timeout,
+        half_close_sleep: None,
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use crate::async_stream::{AsyncPing, AsyncStream};
+
+    struct PendingReadStream {
+        shutdown_called: bool,
+    }
+
+    impl AsyncRead for PendingReadStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingReadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown_called = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for PendingReadStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingReadStream {}
+
+    struct EofReadStream;
+
+    impl AsyncRead for EofReadStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for EofReadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for EofReadStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for EofReadStream {}
+
+    #[tokio::test]
+    async fn copy_completes_when_peer_never_finishes_after_half_close_timeout() {
+        let mut stalled = PendingReadStream {
+            shutdown_called: false,
+        };
+        let mut eof = EofReadStream;
+
+        let result = super::copy_bidirectional_with_half_close_timeout_and_sizes(
+            &mut stalled,
+            &mut eof,
+            false,
+            false,
+            Some(Duration::from_millis(10)),
+            8,
+            8,
+        )
+        .await;
+
+        result.unwrap();
+        assert!(stalled.shutdown_called);
+    }
 }
