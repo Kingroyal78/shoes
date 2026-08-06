@@ -7,6 +7,7 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 RUN cargo build --release --bin shoes
 
 FROM debian:bookworm-slim
