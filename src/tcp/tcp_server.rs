@@ -48,6 +48,49 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 use crate::v2board::outbound::dispatcher::{DialError, OutboundDispatcher};
 
+const TCP_STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn stream_shutdown_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(20)
+    } else {
+        TCP_STREAM_SHUTDOWN_TIMEOUT
+    }
+}
+
+async fn shutdown_tcp_stream_pair(
+    server_stream: &mut dyn AsyncStream,
+    client_stream: &mut dyn AsyncStream,
+    shutdown_timeout: Duration,
+) {
+    if timeout(shutdown_timeout, async {
+        let _ = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+    })
+    .await
+    .is_err()
+    {
+        debug!("timed out shutting down completed TCP proxy streams");
+    }
+}
+
+async fn shutdown_message_stream_pair(
+    server_stream: &mut dyn AsyncMessageStream,
+    client_stream: &mut dyn AsyncMessageStream,
+    shutdown_timeout: Duration,
+) {
+    if timeout(shutdown_timeout, async {
+        let _ = futures::join!(
+            server_stream.shutdown_message(),
+            client_stream.shutdown_message()
+        );
+    })
+    .await
+    .is_err()
+    {
+        debug!("timed out shutting down completed message proxy streams");
+    }
+}
+
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
@@ -319,7 +362,12 @@ pub async fn handle_server_setup_result(
                 )
                 .await;
 
-                let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+                shutdown_tcp_stream_pair(
+                    &mut *server_stream,
+                    &mut *client_stream,
+                    stream_shutdown_timeout(),
+                )
+                .await;
 
                 copy_result?;
                 Ok(())
@@ -1915,10 +1963,12 @@ pub async fn run_udp_copy(
     )
     .await;
 
-    let (_, _) = futures::join!(
-        server_stream.shutdown_message(),
-        client_stream.shutdown_message()
-    );
+    shutdown_message_stream_pair(
+        &mut *server_stream,
+        &mut *client_stream,
+        stream_shutdown_timeout(),
+    )
+    .await;
 
     copy_result
 }
@@ -2233,6 +2283,119 @@ mod tests {
 
     impl AsyncStream for TestStream {}
 
+    struct PendingShutdownTestStream;
+
+    impl AsyncRead for PendingShutdownTestStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingShutdownTestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for PendingShutdownTestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingShutdownTestStream {}
+
+    #[tokio::test]
+    async fn tcp_stream_cleanup_is_bounded_when_shutdown_remains_pending() {
+        let mut server = PendingShutdownTestStream;
+        let mut client = PendingShutdownTestStream;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            shutdown_tcp_stream_pair(&mut server, &mut client, Duration::from_millis(10)),
+        )
+        .await
+        .expect("TCP stream cleanup exceeded its shutdown deadline");
+    }
+
+    struct PendingShutdownMessageTestStream;
+
+    impl AsyncReadMessage for PendingShutdownMessageTestStream {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for PendingShutdownMessageTestStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for PendingShutdownMessageTestStream {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for PendingShutdownMessageTestStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for PendingShutdownMessageTestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for PendingShutdownMessageTestStream {}
+
     struct TestMessageStream {
         read: Option<Vec<u8>>,
         written: Vec<Vec<u8>>,
@@ -2304,6 +2467,20 @@ mod tests {
     }
 
     impl AsyncMessageStream for TestMessageStream {}
+
+    #[tokio::test]
+    async fn udp_copy_cleanup_is_bounded_when_message_shutdown_remains_pending() {
+        let server: Box<dyn AsyncMessageStream> = Box::new(PendingShutdownMessageTestStream);
+        let client: Box<dyn AsyncMessageStream> = Box::new(TestMessageStream::new(Vec::new()));
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            run_udp_copy(server, client, false, false),
+        )
+        .await
+        .expect("UDP copy cleanup exceeded its shutdown deadline")
+        .unwrap();
+    }
 
     #[derive(Default, Debug)]
     struct TestRecorder {

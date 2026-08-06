@@ -188,6 +188,10 @@ enum TransferState {
 }
 
 impl TransferState {
+    fn has_seen_eof(&self) -> bool {
+        !matches!(self, Self::Running)
+    }
+
     fn is_done(&self) -> bool {
         matches!(self, Self::Done)
     }
@@ -270,9 +274,9 @@ where
         let a_to_b_poll = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
         let b_to_a_poll = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        let one_side_done = a_to_b.is_done() || b_to_a.is_done();
+        let one_side_half_closed = a_to_b.has_seen_eof() || b_to_a.has_seen_eof();
         let both_sides_done = a_to_b.is_done() && b_to_a.is_done();
-        if one_side_done && !both_sides_done {
+        if one_side_half_closed && !both_sides_done {
             if let Some(timeout) = *half_close_timeout {
                 let sleep =
                     half_close_sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
@@ -463,6 +467,51 @@ mod tests {
 
     impl AsyncStream for PendingReadStream {}
 
+    struct PendingShutdownStream {
+        shutdown_called: bool,
+    }
+
+    impl AsyncRead for PendingShutdownStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingShutdownStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown_called = true;
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for PendingShutdownStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingShutdownStream {}
+
     struct EofReadStream;
 
     impl AsyncRead for EofReadStream {
@@ -522,6 +571,32 @@ mod tests {
             8,
         )
         .await;
+
+        result.unwrap();
+        assert!(stalled.shutdown_called);
+    }
+
+    #[tokio::test]
+    async fn half_close_timeout_covers_a_shutdown_that_remains_pending() {
+        let mut stalled = PendingShutdownStream {
+            shutdown_called: false,
+        };
+        let mut eof = EofReadStream;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            super::copy_bidirectional_with_half_close_timeout_and_sizes(
+                &mut stalled,
+                &mut eof,
+                false,
+                false,
+                Some(Duration::from_millis(10)),
+                8,
+                8,
+            ),
+        )
+        .await
+        .expect("copy remained stuck in poll_shutdown after its half-close deadline");
 
         result.unwrap();
         assert!(stalled.shutdown_called);

@@ -228,6 +228,7 @@ enum BarrierState {
         permit: PermitFuture,
         complete_tx: Option<oneshot::Sender<io::Result<()>>>,
         complete_rx: oneshot::Receiver<io::Result<()>>,
+        timeout: Pin<Box<Sleep>>,
     },
     Waiting {
         complete_rx: oneshot::Receiver<io::Result<()>>,
@@ -244,7 +245,9 @@ pub(super) struct VirtualStream {
     inbound_offset: usize,
     outbound: mpsc::Sender<OutboundCommand>,
     write_permit: Option<PermitFuture>,
+    write_timeout: Option<Pin<Box<Sleep>>>,
     finish_permit: Option<PermitFuture>,
+    finish_timeout: Option<Pin<Box<Sleep>>>,
     barrier: BarrierState,
     max_frame_payload: usize,
     read_finished: bool,
@@ -268,7 +271,9 @@ impl VirtualStream {
             inbound_offset: 0,
             outbound,
             write_permit: None,
+            write_timeout: None,
             finish_permit: None,
+            finish_timeout: None,
             barrier: BarrierState::Idle,
             max_frame_payload,
             read_finished: false,
@@ -335,15 +340,26 @@ impl VirtualStream {
                         permit: Self::reserve(self.outbound.clone()),
                         complete_tx: Some(complete_tx),
                         complete_rx,
+                        timeout: Box::pin(tokio::time::sleep(barrier_timeout())),
                     };
                 }
                 BarrierState::Reserving {
                     permit,
                     complete_tx,
+                    timeout,
                     ..
                 } => {
                     let permit = match permit.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            if timeout.as_mut().poll(cx).is_ready() {
+                                self.barrier = BarrierState::Idle;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "multiplexed stream flush barrier queue timed out",
+                                )));
+                            }
+                            return Poll::Pending;
+                        }
                         Poll::Ready(Ok(permit)) => permit,
                         Poll::Ready(Err(error)) => {
                             self.barrier = BarrierState::Idle;
@@ -393,6 +409,22 @@ impl VirtualStream {
                 }
             }
         }
+    }
+
+    fn poll_stalled_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let timeout = self
+            .write_timeout
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(barrier_timeout())));
+        if timeout.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+
+        self.write_permit = None;
+        self.write_timeout = None;
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "multiplexed stream data write timed out",
+        )))
     }
 
     fn finish_read(&mut self, terminal: InboundTerminal) -> Poll<io::Result<()>> {
@@ -547,7 +579,7 @@ impl AsyncWrite for VirtualStream {
         }
         let flow_capacity = if let Some(v2) = &self.smux_v2 {
             match v2.flow.poll_available(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return self.poll_stalled_write(cx),
                 Poll::Ready(result) => Some(result?),
             }
         } else {
@@ -563,7 +595,7 @@ impl AsyncWrite for VirtualStream {
             .as_mut()
             .poll(cx)
         {
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => return self.poll_stalled_write(cx),
             Poll::Ready(result) => {
                 self.write_permit = None;
                 result?
@@ -574,7 +606,7 @@ impl AsyncWrite for VirtualStream {
             .min(self.max_frame_payload)
             .min(flow_capacity.unwrap_or(usize::MAX));
         if length == 0 {
-            return Poll::Pending;
+            return self.poll_stalled_write(cx);
         }
         permit.send(OutboundCommand::Data {
             stream_id: self.stream_id,
@@ -583,6 +615,7 @@ impl AsyncWrite for VirtualStream {
         if let Some(v2) = &self.smux_v2 {
             v2.flow.record_write(length);
         }
+        self.write_timeout = None;
         Poll::Ready(Ok(length))
     }
 
@@ -594,6 +627,7 @@ impl AsyncWrite for VirtualStream {
         if !self.write_finished {
             if self.finish_permit.is_none() {
                 self.finish_permit = Some(Self::reserve(self.outbound.clone()));
+                self.finish_timeout = Some(Box::pin(tokio::time::sleep(barrier_timeout())));
             }
             let permit = match self
                 .finish_permit
@@ -602,9 +636,27 @@ impl AsyncWrite for VirtualStream {
                 .as_mut()
                 .poll(cx)
             {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    let timed_out = self
+                        .finish_timeout
+                        .as_mut()
+                        .expect("finish timeout initialized with permit")
+                        .as_mut()
+                        .poll(cx)
+                        .is_ready();
+                    if timed_out {
+                        self.finish_permit = None;
+                        self.finish_timeout = None;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "multiplexed stream close queue timed out",
+                        )));
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(result) => {
                     self.finish_permit = None;
+                    self.finish_timeout = None;
                     result?
                 }
             };
@@ -762,5 +814,118 @@ mod tests {
             outbound_rx.recv().await,
             Some(OutboundCommand::Barrier { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_times_out_while_the_outbound_queue_is_full() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        outbound_tx
+            .send(OutboundCommand::Data {
+                stream_id: 99,
+                data: vec![1],
+            })
+            .await
+            .unwrap();
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        let error = tokio::time::timeout(std::time::Duration::from_millis(100), stream.flush())
+            .await
+            .expect("flush remained stuck while reserving an outbound queue slot")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn shutdown_times_out_while_the_outbound_queue_is_full() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        outbound_tx
+            .send(OutboundCommand::Data {
+                stream_id: 99,
+                data: vec![1],
+            })
+            .await
+            .unwrap();
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        let error = tokio::time::timeout(std::time::Duration::from_millis(100), stream.shutdown())
+            .await
+            .expect("shutdown remained stuck while reserving an outbound queue slot")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn write_times_out_while_the_outbound_queue_is_full() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        outbound_tx
+            .send(OutboundCommand::Data {
+                stream_id: 99,
+                data: vec![1],
+            })
+            .await
+            .unwrap();
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.write_all(b"blocked"),
+        )
+        .await
+        .expect("write remained stuck while reserving an outbound queue slot")
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn write_times_out_while_smux_v2_flow_control_is_stalled() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let (updates_tx, _updates_rx) = mpsc::channel(1);
+        let flow = Arc::new(SmuxV2FlowControl::new());
+        flow.update(0, 0).unwrap();
+        let mut stream = VirtualStream::new_smux_v2(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+            flow,
+            updates_tx,
+            1024,
+        );
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.write_all(b"blocked"),
+        )
+        .await
+        .expect("write remained stuck behind smux v2 flow control")
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
