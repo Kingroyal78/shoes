@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;
 
-use crate::address::{NetLocation, NetLocationPortRange};
+use crate::address::{NetLocation, NetLocationPortRange, ResolvedLocation};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{
     BindLocation, RuleConfig, ServerConfig, ServerProxyConfig, ServerQuicConfig, TcpConfig,
@@ -17,14 +17,14 @@ use crate::mixed_handler::MixedTcpServerHandler;
 use crate::option_util::NoneOrSome;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::quic_server::start_quic_servers;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::{CachingNativeResolver, Resolver};
 use crate::rustls_config_util::create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::{ShadowsocksCipher, ShadowsocksTcpHandler};
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server::start_tcp_handler_servers;
 use crate::tls_server_handler::{TlsServerHandler, TlsServerTarget};
 use crate::trojan_handler::TrojanTcpHandler;
@@ -43,7 +43,7 @@ pub async fn run_snell_server(
         )
     })?;
     let cipher = cipher.try_into()?;
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
     let selector = Arc::new(create_tcp_client_proxy_selector(
         vec![RuleConfig::default()],
         resolver.clone(),
@@ -98,7 +98,7 @@ pub async fn run_shadowtls_socks_server(
         )
     })?;
 
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
     let selector = Arc::new(create_tcp_client_proxy_selector(
         vec![RuleConfig::default()],
         resolver.clone(),
@@ -162,7 +162,7 @@ pub async fn run_basic_proxy_server(
             format!("invalid listen address `{listen}`: {err}"),
         )
     })?;
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
     let selector = Arc::new(create_tcp_client_proxy_selector(
         vec![RuleConfig::default()],
         resolver.clone(),
@@ -335,7 +335,7 @@ pub async fn run_quic_proxy_server(
         }
     };
 
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
     let config = ServerConfig {
         bind_location: BindLocation::Address(listen),
         protocol,
@@ -400,5 +400,153 @@ impl TcpServerHandler for RawH2MuxServerHandler {
         });
 
         Ok(TcpServerSetupResult::AlreadyHandled)
+    }
+}
+
+/// Open and hold `streams` concurrent Shadowsocks-2022 connections through a
+/// server.
+///
+/// Everything measured about this proxy so far came from watching production,
+/// which tops out in the hundreds of concurrent streams -- far below where the
+/// per-stream costs actually matter. This drives the same handler stack, accept
+/// path and copy loop as production so a change can be measured against a
+/// reproducible load instead of inferred from a quiet node.
+///
+/// Pair it with `SHOES_ALLOCATOR_STATS_DUMP_INTERVAL_SECS` on the server and
+/// diff the size classes with `scripts/jemalloc_size_classes.py`; divide by the
+/// `streams=` counter the server reports to get cost per stream.
+pub async fn run_ss2022_load_client(
+    server: &str,
+    target: &str,
+    streams: usize,
+    concurrency: usize,
+    hold: std::time::Duration,
+) -> io::Result<()> {
+    let server_addr = tokio::net::lookup_host(server)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("could not resolve server `{server}`"),
+            )
+        })?;
+    let target = NetLocation::from_str(target, None).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid target `{target}`: {err}"),
+        )
+    })?;
+
+    let cipher: ShadowsocksCipher = "aes-128-gcm".try_into()?;
+    let handler = Arc::new(ShadowsocksTcpHandler::new_aead2022_client(
+        cipher,
+        &SHADOWSOCKS_2022_AES128_KEY,
+        false,
+    ));
+
+    // Bound only the handshakes in flight. The whole point is to end up with
+    // `streams` connections open at once, so nothing here limits the total.
+    let gate = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let established = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let reporter = {
+        let established = established.clone();
+        let failed = failed.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                log::info!(
+                    "load: established={} failed={}",
+                    established.load(std::sync::atomic::Ordering::Relaxed),
+                    failed.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        })
+    };
+
+    let mut tasks = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        let gate = gate.clone();
+        let handler = handler.clone();
+        let target = target.clone();
+        let established = established.clone();
+        let failed = failed.clone();
+        tasks.push(tokio::spawn(async move {
+            let permit = gate
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            let held = match open_ss2022_stream(&handler, server_addr, target).await {
+                Ok(stream) => {
+                    established.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stream
+                }
+                Err(error) => {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::debug!("load: stream failed: {error}");
+                    return;
+                }
+            };
+            // Release the handshake slot but keep the connection, so the server
+            // accumulates open streams rather than churning through them.
+            drop(permit);
+            tokio::time::sleep(hold).await;
+            drop(held);
+        }));
+    }
+
+    for task in tasks {
+        let _ = task.await;
+    }
+    reporter.abort();
+    log::info!(
+        "load finished: established={} failed={}",
+        established.load(std::sync::atomic::Ordering::Relaxed),
+        failed.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    Ok(())
+}
+
+async fn open_ss2022_stream(
+    handler: &ShadowsocksTcpHandler,
+    server_addr: std::net::SocketAddr,
+    target: NetLocation,
+) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+    let tcp = tokio::net::TcpStream::connect(server_addr).await?;
+    tcp.set_nodelay(true)?;
+    let setup = handler
+        .setup_client_tcp_stream(Box::new(tcp), ResolvedLocation::new(target))
+        .await?;
+    Ok(setup.client_stream)
+}
+
+/// A destination that accepts connections and holds them open.
+///
+/// The load client needs somewhere to be proxied *to*; without this the server
+/// would be measured against whatever the outbound happened to reach.
+pub async fn run_tcp_sink(listen: &str) -> io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    log::info!("sink listening on {}", listener.local_addr()?);
+    let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let held = held.clone();
+        tokio::spawn(async move {
+            held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Hold it open and consume anything sent, so the proxied stream
+            // stays established instead of completing immediately.
+            let mut stream = stream;
+            let mut buffer = vec![0_u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            held.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }

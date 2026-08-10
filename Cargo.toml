@@ -47,6 +47,11 @@ path = "src/bin/shoes-quic-e2e-server.rs"
 required-features = ["e2e-client"]
 
 [[bin]]
+name = "shoes-ss2022-load"
+path = "src/bin/shoes-ss2022-load.rs"
+required-features = ["e2e-client"]
+
+[[bin]]
 name = "shoes-ss-obfs-e2e-client"
 path = "src/bin/shoes-ss-obfs-e2e-client.rs"
 required-features = ["e2e-client"]
