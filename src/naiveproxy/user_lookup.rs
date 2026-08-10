@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_user_lookup_returns_authenticated_user() {
         let authenticated_user = AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
             uid: 42,
             user_key: "user-42".to_string(),
             speed_limit: Some(10),

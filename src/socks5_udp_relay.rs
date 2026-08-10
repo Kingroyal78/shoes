@@ -397,6 +397,18 @@ impl AsyncPing for Socks5UdpRelayStream {
 
 impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
 
+impl Drop for Socks5UdpRelayStream {
+    fn drop(&mut self) {
+        // Abort the socket reader task so it cannot block in recv_from forever
+        // holding the UDP socket and its port after the relay is dropped
+        // without an explicit shutdown (e.g. the TCP control connection
+        // closed first).
+        if let Some(handle) = self.reader_task.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +526,23 @@ mod tests {
         let result = parse_socks5_udp_packet(&packet);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("reserved"));
+    }
+
+    #[tokio::test]
+    async fn dropping_relay_releases_socket_and_reader_task() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let relay = Socks5UdpRelayStream::new(socket);
+
+        // Drop without any explicit shutdown: the reader task must be aborted
+        // and the socket released so the port can be rebound immediately.
+        drop(relay);
+
+        // A tiny yield lets the aborted task actually unwind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Rebinding the same port proves the socket was released.
+        let rebound = tokio::net::UdpSocket::bind(addr).await;
+        assert!(rebound.is_ok());
     }
 }

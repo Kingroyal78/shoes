@@ -160,7 +160,7 @@ impl OutboundDispatcher {
         last_mtimes: HashMap<String, u64>,
     ) -> Self {
         self.refresh = Some(RwLock::new(RuleRefreshState {
-            node_tag: node_tag.to_string(),
+            node_tag: node_tag.into(),
             config_lines: config_lines.to_vec(),
             providers,
             rule_sets,

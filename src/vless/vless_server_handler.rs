@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::debug;
+use rustc_hash::FxHashMap;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -12,6 +13,7 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
+use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpServerHandler, TcpServerSetupResult,
@@ -27,8 +29,58 @@ use super::vless_util::{
     parse_remote_location_from_reader,
 };
 
+/// The user set of a VLESS listener, indexed by the 16-byte user id the client
+/// sends in the clear. A linear scan would cost one comparison per user on
+/// every connection, which does not hold up at node sizes in the millions.
+#[derive(Debug, Default)]
+pub struct VlessUsers {
+    by_user_id: FxHashMap<[u8; 16], Option<AuthenticatedUser>>,
+}
+
+impl VlessUsers {
+    /// Rejects the whole list if any credential is not a valid user id, so a
+    /// malformed entry can never silently drop a user from the table.
+    pub fn new(users: Vec<ServerUser>) -> std::io::Result<Self> {
+        let mut by_user_id = FxHashMap::default();
+        for user in users {
+            let id: [u8; 16] = parse_uuid(&user.credential)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid VLESS uuid `{}`: {e}", user.credential),
+                    )
+                })?
+                .try_into()
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS user id must be 16 bytes",
+                    )
+                })?;
+            by_user_id.insert(id, Some(user.authenticated_user));
+        }
+        Ok(Self { by_user_id })
+    }
+
+    /// A single-user table, for the local-YAML listeners that configure one id.
+    pub fn single(user_id: [u8; 16]) -> Self {
+        Self {
+            by_user_id: std::iter::once((user_id, None)).collect(),
+        }
+    }
+
+    fn get(&self, user_id: &[u8]) -> Option<&Option<AuthenticatedUser>> {
+        let user_id: [u8; 16] = user_id.try_into().ok()?;
+        self.by_user_id.get(&user_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_user_id.len()
+    }
+}
+
 pub struct VlessTcpServerHandler {
-    users: Vec<(Box<[u8]>, Option<AuthenticatedUser>)>,
+    users: Arc<SharedUsers<VlessUsers>>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -68,34 +120,18 @@ impl VlessVisionUserLookup for &Box<[u8]> {
     }
 }
 
-impl VlessVisionUserLookup for &[(Box<[u8]>, Option<AuthenticatedUser>)] {
+impl VlessVisionUserLookup for &Arc<SharedUsers<VlessUsers>> {
     fn lookup_vless_vision_user(&self, target_id: &[u8]) -> Option<Option<AuthenticatedUser>> {
-        self.iter().find_map(|(user_id, authenticated_user)| {
-            if user_id.ct_eq(target_id).unwrap_u8() == 1 {
-                Some(authenticated_user.clone())
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl VlessVisionUserLookup for &Vec<(Box<[u8]>, Option<AuthenticatedUser>)> {
-    fn lookup_vless_vision_user(&self, target_id: &[u8]) -> Option<Option<AuthenticatedUser>> {
-        self.as_slice().lookup_vless_vision_user(target_id)
-    }
-}
-
-impl VlessVisionUserLookup for Vec<(Box<[u8]>, Option<AuthenticatedUser>)> {
-    fn lookup_vless_vision_user(&self, target_id: &[u8]) -> Option<Option<AuthenticatedUser>> {
-        self.as_slice().lookup_vless_vision_user(target_id)
+        // Borrowed for the lookup only, so a replaced table is not pinned by
+        // the connection this handshake admits.
+        self.load().get(target_id).cloned()
     }
 }
 
 impl std::fmt::Debug for VlessTcpServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VlessTcpServerHandler")
-            .field("user_count", &self.users.len())
+            .field("user_count", &self.users.load().len())
             .field("udp_enabled", &self.udp_enabled)
             .field("fallback", &self.fallback)
             .finish()
@@ -111,7 +147,9 @@ impl VlessTcpServerHandler {
         fallback: Option<NetLocation>,
     ) -> Self {
         Self {
-            users: vec![(parse_uuid(user_id).unwrap().into_boxed_slice(), None)],
+            users: SharedUsers::new(VlessUsers::single(
+                parse_uuid(user_id).unwrap().try_into().unwrap(),
+            )),
             udp_enabled,
             proxy_selector,
             resolver,
@@ -121,21 +159,12 @@ impl VlessTcpServerHandler {
     }
 
     pub fn new_multi(
-        users: Vec<ServerUser>,
+        users: Arc<SharedUsers<VlessUsers>>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         fallback: Option<NetLocation>,
     ) -> Self {
-        let users = users
-            .into_iter()
-            .map(|user| {
-                (
-                    parse_uuid(&user.credential).unwrap().into_boxed_slice(),
-                    Some(user.authenticated_user),
-                )
-            })
-            .collect();
         Self {
             users,
             udp_enabled,
@@ -246,13 +275,9 @@ impl TcpServerHandler for VlessTcpServerHandler {
         let header = stream_reader.peek_slice(&mut server_stream, 17).await?;
         let target_id = &header[1..17];
 
-        let matched_user = self.users.iter().find_map(|(user_id, auth)| {
-            if user_id.ct_eq(target_id).unwrap_u8() == 1 {
-                Some(auth.clone())
-            } else {
-                None
-            }
-        });
+        // Borrow the table only for the lookup; see `SharedUsers` for why it
+        // must not stay alive for the connection.
+        let matched_user = self.users.load().get(target_id).cloned();
 
         if matched_user.is_none() {
             debug!("VLESS UUID mismatch");
@@ -641,7 +666,7 @@ mod tests {
 
     fn auth_user(uid: u64) -> AuthenticatedUser {
         AuthenticatedUser {
-            node_tag: "vless-vision".to_string(),
+            node_tag: "vless-vision".into(),
             uid,
             user_key: format!("user-{uid}"),
             speed_limit: None,
@@ -752,14 +777,21 @@ mod tests {
         header
     }
 
+    /// Build the shared table the Vision entry point takes, from raw uuids.
+    fn shared_users(users: Vec<(Vec<u8>, u64)>) -> Arc<SharedUsers<VlessUsers>> {
+        let mut by_user_id = FxHashMap::default();
+        for (user_id, uid) in users {
+            let id: [u8; 16] = user_id.try_into().unwrap();
+            by_user_id.insert(id, Some(auth_user(uid)));
+        }
+        SharedUsers::new(VlessUsers { by_user_id })
+    }
+
     #[tokio::test]
     async fn custom_tls_vision_vless_returns_matched_authenticated_user_from_multi_user_lookup() {
         let user1 = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
         let user2 = parse_uuid("22222222-2222-4222-8222-222222222222").unwrap();
-        let users = vec![
-            (user1.into_boxed_slice(), Some(auth_user(101))),
-            (user2.clone().into_boxed_slice(), Some(auth_user(202))),
-        ];
+        let users = shared_users(vec![(user1.clone(), 101), (user2.clone(), 202)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;
         let remote = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 443);
@@ -770,7 +802,7 @@ mod tests {
 
         let result = setup_custom_tls_vision_vless_server_stream(
             server_tls,
-            users,
+            &users,
             true,
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,
@@ -796,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn custom_tls_vision_vless_rejects_command_udp() {
         let user = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
-        let users = vec![(user.clone().into_boxed_slice(), Some(auth_user(101)))];
+        let users = shared_users(vec![(user.clone(), 101)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;
         let header = vision_command_header(&user, COMMAND_UDP);
@@ -806,7 +838,7 @@ mod tests {
 
         let result = setup_custom_tls_vision_vless_server_stream(
             server_tls,
-            users,
+            &users,
             true,
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,
@@ -829,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn custom_tls_vision_vless_rejects_empty_flow_mux() {
         let user = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
-        let users = vec![(user.clone().into_boxed_slice(), Some(auth_user(101)))];
+        let users = shared_users(vec![(user.clone(), 101)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;
         let header = empty_flow_command_header(&user, COMMAND_MUX);
@@ -839,7 +871,7 @@ mod tests {
 
         let result = setup_custom_tls_vision_vless_server_stream(
             server_tls,
-            users,
+            &users,
             true,
             Arc::new(ClientProxySelector::new(Vec::new())),
             &resolver,

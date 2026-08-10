@@ -4,7 +4,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -31,6 +32,11 @@ const MAX_H2_WRITE_PAYLOAD_LEN: usize = 16 * 1024;
 const DEFAULT_MAX_EACH_POST_BYTES: usize = 1_000_000;
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 30;
 const SESSION_REAP_SECS: u64 = 30;
+/// Connected sessions idle longer than this are reaped so the client-controlled
+/// session registry cannot pin entries (and their buffers) forever.
+const SESSION_IDLE_REAP_SECS: u64 = 120;
+/// Interval of the session reaper loop.
+const SESSION_REAP_INTERVAL_SECS: u64 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XHttpConfig {
@@ -170,6 +176,16 @@ struct XHttpSession {
     tx: mpsc::Sender<XHttpPacket>,
     rx: Mutex<Option<mpsc::Receiver<XHttpPacket>>>,
     connected: AtomicBool,
+    /// Milliseconds since a process-global reference point of the last upload
+    /// or download activity. Uses tokio's monotonic clock so the idle-reap
+    /// logic is deterministic under `tokio::time::pause()` in tests.
+    last_activity: AtomicU64,
+}
+
+static ACTIVITY_EPOCH: LazyLock<tokio::time::Instant> = LazyLock::new(tokio::time::Instant::now);
+
+fn activity_millis() -> u64 {
+    ACTIVITY_EPOCH.elapsed().as_millis() as u64
 }
 
 #[derive(Debug)]
@@ -650,14 +666,40 @@ fn new_session(max_buffered_posts: usize) -> Arc<XHttpSession> {
         tx,
         rx: Mutex::new(Some(rx)),
         connected: AtomicBool::new(false),
+        last_activity: AtomicU64::new(activity_millis()),
     })
+}
+
+fn touch_session(session: &XHttpSession) {
+    session
+        .last_activity
+        .store(activity_millis(), Ordering::Relaxed);
 }
 
 fn spawn_session_reaper(sessions: SessionMap, session_id: String, session: Arc<XHttpSession>) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(SESSION_REAP_SECS)).await;
-        if !session.connected.load(Ordering::SeqCst) {
-            remove_session_if_current(&sessions, &session_id, &session);
+        let mut interval = tokio::time::interval(Duration::from_secs(SESSION_REAP_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let idle_millis =
+                activity_millis().saturating_sub(session.last_activity.load(Ordering::Relaxed));
+            let stale = if session.connected.load(Ordering::SeqCst) {
+                idle_millis > SESSION_IDLE_REAP_SECS * 1000
+            } else {
+                idle_millis > SESSION_REAP_SECS * 1000
+            };
+            if stale {
+                remove_session_if_current(&sessions, &session_id, &session);
+                break;
+            }
+            // Stop when the session was removed some other way (e.g. the
+            // upload reader dropped) so the reaper task does not linger.
+            let current = sessions.lock().get(&session_id).cloned();
+            if current.is_none_or(|current| !Arc::ptr_eq(&current, &session)) {
+                break;
+            }
         }
     });
 }
@@ -673,6 +715,7 @@ fn remove_session_if_current(sessions: &SessionMap, session_id: &str, session: &
 }
 
 async fn push_packet(session: &XHttpSession, seq: u64, payload: Bytes) -> io::Result<()> {
+    touch_session(session);
     session
         .tx
         .send(XHttpPacket { seq, payload })
@@ -728,6 +771,8 @@ impl AsyncRead for XHttpUploadReader {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+
+        touch_session(&self.session);
 
         loop {
             if !self.current.is_empty() {
@@ -1608,5 +1653,59 @@ mod tests {
         headers.insert("x-data-1".to_string(), "bG8".to_string());
         let payload = header_payload(&headers, "X-Data").unwrap();
         assert_eq!(payload.as_ref(), b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_removes_never_connected_session() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let session = get_or_create_session(&sessions, "s", DEFAULT_MAX_BUFFERED_POSTS);
+        assert_eq!(sessions.lock().len(), 1);
+
+        // Step time so the reaper task gets polled between advances. The
+        // session never gets activity, so it becomes stale after 30s.
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(20)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(sessions.lock().len(), 0);
+        assert!(!session.connected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_removes_idle_connected_session() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let session = get_or_create_session(&sessions, "s", DEFAULT_MAX_BUFFERED_POSTS);
+        session.connected.store(true, Ordering::SeqCst);
+        assert_eq!(sessions.lock().len(), 1);
+
+        // Jump past the idle threshold, then mark the session idle since the
+        // paused-clock epoch: the next reaper tick sees idle > 120s.
+        tokio::time::advance(Duration::from_secs(SESSION_IDLE_REAP_SECS + 60)).await;
+        session.last_activity.store(0, Ordering::Relaxed);
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(SESSION_REAP_INTERVAL_SECS)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(sessions.lock().len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_keeps_active_connected_session() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let session = get_or_create_session(&sessions, "s", DEFAULT_MAX_BUFFERED_POSTS);
+        session.connected.store(true, Ordering::SeqCst);
+        // Touch activity so the session looks live.
+        touch_session(&session);
+        assert_eq!(sessions.lock().len(), 1);
+
+        // Several reap intervals pass while the session stays active.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(SESSION_REAP_INTERVAL_SECS)).await;
+            touch_session(&session);
+            tokio::task::yield_now().await;
+            assert_eq!(sessions.lock().len(), 1);
+        }
     }
 }

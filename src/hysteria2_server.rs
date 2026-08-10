@@ -54,6 +54,7 @@ use crate::hysteria2_obfs::Hysteria2Obfs;
 use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
+use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::AuthenticatedUser;
 use crate::tcp::tcp_server::{
@@ -78,11 +79,11 @@ impl Hysteria2ServerUser {
 }
 
 #[derive(Clone, Debug)]
-pub struct Hysteria2ServerUsers {
-    users_by_password: Arc<HashMap<String, Hysteria2ServerUser>>,
+pub struct Hysteria2UserTable {
+    users_by_password: HashMap<String, Hysteria2ServerUser>,
 }
 
-impl Hysteria2ServerUsers {
+impl Hysteria2UserTable {
     pub fn new(users: Vec<Hysteria2ServerUser>) -> std::io::Result<Self> {
         if users.is_empty() {
             return Err(std::io::Error::new(
@@ -110,13 +111,36 @@ impl Hysteria2ServerUsers {
             }
         }
 
+        Ok(Self { users_by_password })
+    }
+
+    pub fn len(&self) -> usize {
+        self.users_by_password.len()
+    }
+}
+
+/// The user set of a Hysteria2 listener, replaceable while the listener keeps
+/// running so a user-list change does not rebuild it.
+#[derive(Clone)]
+pub struct Hysteria2ServerUsers {
+    users: Arc<SharedUsers<Hysteria2UserTable>>,
+}
+
+impl Hysteria2ServerUsers {
+    pub fn new(users: Vec<Hysteria2ServerUser>) -> std::io::Result<Self> {
         Ok(Self {
-            users_by_password: Arc::new(users_by_password),
+            users: SharedUsers::new(Hysteria2UserTable::new(users)?),
         })
     }
 
-    fn get(&self, password: &str) -> Option<&Hysteria2ServerUser> {
-        self.users_by_password.get(password)
+    pub fn from_shared(users: Arc<SharedUsers<Hysteria2UserTable>>) -> Self {
+        Self { users }
+    }
+
+    /// Returns the matched user by value: the table borrow must not outlive
+    /// the lookup, or a replaced table would stay pinned by the connection.
+    fn get(&self, password: &str) -> Option<Hysteria2ServerUser> {
+        self.users.load().users_by_password.get(password).cloned()
     }
 }
 
@@ -756,12 +780,25 @@ async fn run_udp_session_loop(
             packet = rx.recv() => {
                 match packet {
                     Some((payload, _socket_addr)) => {
-                        poll_fn(|cx| Pin::new(&mut client_stream).poll_write_message(cx, &payload))
-                            .await
-                            .map_err(|e| std::io::Error::other(format!("UDP session write failed: {e}")))?;
-                        poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
-                            .await
-                            .map_err(|e| std::io::Error::other(format!("UDP session flush failed: {e}")))?;
+                        // Cancellation-aware write: a stalled upstream write
+                        // must not wedge the session loop (and with it the
+                        // whole connection's datagram forwarding) forever.
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                return Ok(());
+                            }
+                            result = async {
+                                poll_fn(|cx| Pin::new(&mut client_stream).poll_write_message(cx, &payload))
+                                    .await
+                                    .map_err(|e| std::io::Error::other(format!("UDP session write failed: {e}")))?;
+                                poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
+                                    .await
+                                    .map_err(|e| std::io::Error::other(format!("UDP session flush failed: {e}")))?;
+                                Ok::<(), std::io::Error>(())
+                            } => {
+                                result?;
+                            }
+                        }
                     }
                     None => return Ok(()),
                 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -9,10 +10,31 @@ use crate::tcp::tcp_handler::TrafficRecorder;
 
 use super::types::{AlivePayload, TrafficPayload};
 
+/// Minimum spacing between synchronous per-connection-close persists. Without
+/// a throttle, every authenticated connection close writes the whole pending
+/// traffic map to disk synchronously, which serializes connection teardown on
+/// file IO under high churn. The push loop (`TrafficTracker::persist`) still
+/// persists every push interval regardless, so this only bounds the crash-loss
+/// window to at most this interval of unreported traffic.
+const FLUSH_THROTTLE_MILLIS: u64 = 2000;
+
+/// Number of independent locks the per-user state is split across.
+///
+/// Every connection open, close and traffic report has to take one of these,
+/// so a single lock makes the whole node's accounting a queue. Users are spread
+/// across shards by id, which is exactly the axis these operations are
+/// independent along. A power of two so the shard is a mask, not a division.
+const SHARD_COUNT: usize = 32;
+
 #[derive(Debug)]
 pub struct TrafficTracker {
     snapshot_path: PathBuf,
-    state: Mutex<TrackerState>,
+    shards: Box<[Mutex<TrackerState>]>,
+    /// Millis (unix) of the last synchronous close-flush, for throttling.
+    last_flush: AtomicU64,
+    /// Test-only count of synchronous persists.
+    #[cfg(test)]
+    flush_count: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -42,76 +64,121 @@ struct TrackerState {
     panel_alive: HashMap<String, HashMap<u64, u64>>,
 }
 
+/// The on-disk shape, which predates sharding and stays independent of it.
+#[derive(Serialize)]
+struct TrafficSnapshot<'a> {
+    traffic: &'a HashMap<&'a str, HashMap<u64, TrafficCounter>>,
+}
+
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 struct TrafficCounter {
     upload: u64,
     download: u64,
 }
 
+/// Borrow a node's map, creating it only when the node is genuinely new.
+///
+/// `entry()` requires an owned key on every call, so the obvious spelling heap
+/// allocates and copies the node tag even on the overwhelming majority of calls
+/// that find a node already there -- and these run inside the one global lock,
+/// on every connection open, every close, and every traffic flush. Two hash
+/// lookups on the hit path cost far less than an allocation.
+fn node_map<'a, V: Default>(map: &'a mut HashMap<String, V>, node_tag: &str) -> &'a mut V {
+    if !map.contains_key(node_tag) {
+        map.insert(node_tag.to_string(), V::default());
+    }
+    map.get_mut(node_tag)
+        .expect("inserted above when it was missing")
+}
+
 impl TrafficTracker {
     pub async fn new(data_dir: PathBuf) -> std::io::Result<Self> {
         tokio::fs::create_dir_all(&data_dir).await?;
         let snapshot_path = data_dir.join("traffic-pending.json");
-        let state = match tokio::fs::read(&snapshot_path).await {
+        let state: TrackerState = match tokio::fs::read(&snapshot_path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => TrackerState::default(),
             Err(e) => return Err(e),
         };
-        Ok(Self {
+        let tracker = Self::empty(snapshot_path);
+        // The file keeps the whole node's pending traffic in one map; spread it
+        // back over the shards it will be updated through.
+        for (node_tag, users) in state.traffic {
+            for (uid, counter) in users {
+                let mut shard = tracker.shard(uid).lock();
+                node_map(&mut shard.traffic, &node_tag).insert(uid, counter);
+            }
+        }
+        Ok(tracker)
+    }
+
+    fn empty(snapshot_path: PathBuf) -> Self {
+        Self {
             snapshot_path,
-            state: Mutex::new(state),
-        })
+            shards: (0..SHARD_COUNT)
+                .map(|_| Mutex::new(TrackerState::default()))
+                .collect(),
+            last_flush: AtomicU64::new(0),
+            #[cfg(test)]
+            flush_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, uid: u64) -> &Mutex<TrackerState> {
+        &self.shards[uid as usize & (SHARD_COUNT - 1)]
     }
 
     pub fn snapshot_traffic(&self, node_tag: &str, min_traffic: u64) -> TrafficPayload {
-        let mut state = self.state.lock();
-        let Some(node) = state.traffic.get_mut(node_tag) else {
-            return TrafficPayload::default();
-        };
-
         let mut payload = TrafficPayload::default();
-        let mut remove = Vec::new();
-        for (uid, counter) in node.iter_mut() {
-            let total = counter.upload.saturating_add(counter.download);
-            if total >= min_traffic && total > 0 {
-                payload.insert(uid.to_string(), [counter.upload, counter.download]);
-                *counter = TrafficCounter::default();
+        for shard in &self.shards {
+            let mut state = shard.lock();
+            let Some(node) = state.traffic.get_mut(node_tag) else {
+                continue;
+            };
+            let mut remove = Vec::new();
+            for (uid, counter) in node.iter_mut() {
+                let total = counter.upload.saturating_add(counter.download);
+                if total >= min_traffic && total > 0 {
+                    payload.insert(uid.to_string(), [counter.upload, counter.download]);
+                    *counter = TrafficCounter::default();
+                }
+                if counter.upload == 0 && counter.download == 0 {
+                    remove.push(*uid);
+                }
             }
-            if counter.upload == 0 && counter.download == 0 {
-                remove.push(*uid);
+            for uid in remove {
+                node.remove(&uid);
             }
-        }
-        for uid in remove {
-            node.remove(&uid);
+            if node.is_empty() {
+                state.traffic.remove(node_tag);
+            }
         }
         payload
     }
 
     pub fn restore_traffic(&self, node_tag: &str, payload: &TrafficPayload) {
-        let mut state = self.state.lock();
-        let node = state.traffic.entry(node_tag.to_string()).or_default();
         for (uid, traffic) in payload {
             let Ok(uid) = uid.parse::<u64>() else {
                 continue;
             };
-            let counter = node.entry(uid).or_default();
+            let mut state = self.shard(uid).lock();
+            let counter = node_map(&mut state.traffic, node_tag)
+                .entry(uid)
+                .or_default();
             counter.upload = counter.upload.saturating_add(traffic[0]);
             counter.download = counter.download.saturating_add(traffic[1]);
         }
     }
 
     pub fn snapshot_alive(&self, node_tag: &str, node_id: u64, min_traffic: u64) -> AliveSnapshot {
-        let state = self.state.lock();
-        let Some(node) = state.alive.get(node_tag) else {
-            return AliveSnapshot {
-                payload: AlivePayload::default(),
-                consumed_traffic: HashMap::new(),
+        let mut collected = Vec::new();
+        for shard in &self.shards {
+            let state = shard.lock();
+            let Some(node) = state.alive.get(node_tag) else {
+                continue;
             };
-        };
-
-        let payload = node
-            .iter()
-            .filter_map(|(uid, ips)| {
+            collected.extend(node.iter().filter_map(|(uid, ips)| {
                 if ips.is_empty() {
                     return None;
                 }
@@ -131,8 +198,9 @@ impl TrafficTracker {
                         .map(|ip| format!("{}_{}", ip, node_id))
                         .collect::<Vec<_>>(),
                 ))
-            })
-            .collect::<Vec<_>>();
+            }));
+        }
+        let payload = collected;
 
         let consumed_traffic = payload
             .iter()
@@ -153,34 +221,70 @@ impl TrafficTracker {
         if snapshot.consumed_traffic.is_empty() {
             return;
         }
-        let mut state = self.state.lock();
-        let Some(node_traffic) = state.alive_traffic.get_mut(node_tag) else {
-            return;
-        };
-
-        let mut remove = Vec::new();
         for (uid, consumed) in &snapshot.consumed_traffic {
+            let mut state = self.shard(*uid).lock();
+            let Some(node_traffic) = state.alive_traffic.get_mut(node_tag) else {
+                continue;
+            };
             if let Some(current) = node_traffic.get_mut(uid) {
                 *current = current.saturating_sub(*consumed);
                 if *current == 0 {
-                    remove.push(*uid);
+                    node_traffic.remove(uid);
                 }
             }
-        }
-        for uid in remove {
-            node_traffic.remove(&uid);
-        }
-        if node_traffic.is_empty() {
-            state.alive_traffic.remove(node_tag);
+            if node_traffic.is_empty() {
+                state.alive_traffic.remove(node_tag);
+            }
         }
     }
 
     pub fn replace_panel_alive(&self, node_tag: &str, alive: HashMap<u64, u64>) {
-        let mut state = self.state.lock();
-        if alive.is_empty() {
-            state.panel_alive.remove(node_tag);
-        } else {
-            state.panel_alive.insert(node_tag.to_string(), alive);
+        // Split the panel's view along the same axis the admission checks read
+        // it back on, so a check only ever touches its own user's shard.
+        let mut by_shard: Vec<HashMap<u64, u64>> = vec![HashMap::new(); SHARD_COUNT];
+        for (uid, count) in alive {
+            by_shard[uid as usize & (SHARD_COUNT - 1)].insert(uid, count);
+        }
+        for (shard, subset) in self.shards.iter().zip(by_shard) {
+            let mut state = shard.lock();
+            if subset.is_empty() {
+                state.panel_alive.remove(node_tag);
+            } else {
+                state.panel_alive.insert(node_tag.to_string(), subset);
+            }
+        }
+    }
+
+    /// Drop per-user state for users that are no longer in the panel's user
+    /// list. Without this, counters for deleted/churned users (whose traffic
+    /// never reaches `min_traffic` and is therefore never reported) would
+    /// accumulate in memory and in `traffic-pending.json` forever. Users still
+    /// in the list are untouched, so pending sub-minimum traffic is preserved.
+    pub fn reconcile_users(&self, node_tag: &str, active_uids: &std::collections::HashSet<u64>) {
+        for shard in &self.shards {
+            let mut state = shard.lock();
+            let mut removed_traffic = false;
+            if let Some(node) = state.traffic.get_mut(node_tag) {
+                node.retain(|uid, _| active_uids.contains(uid));
+                removed_traffic = node.is_empty();
+            }
+            let mut removed_alive = false;
+            if let Some(node) = state.alive.get_mut(node_tag) {
+                node.retain(|uid, _| active_uids.contains(uid));
+                removed_alive = node.is_empty();
+            }
+            if let Some(node) = state.alive_traffic.get_mut(node_tag) {
+                node.retain(|uid, _| active_uids.contains(uid));
+                if node.is_empty() {
+                    state.alive_traffic.remove(node_tag);
+                }
+            }
+            if removed_traffic {
+                state.traffic.remove(node_tag);
+            }
+            if removed_alive {
+                state.alive.remove(node_tag);
+            }
         }
     }
 
@@ -189,14 +293,26 @@ impl TrafficTracker {
         persist_atomic(&self.snapshot_path, &bytes).await
     }
 
-    fn persist_blocking(&self) -> std::io::Result<()> {
-        let bytes = self.snapshot_bytes()?;
-        persist_atomic_blocking(&self.snapshot_path, &bytes)
-    }
-
     fn snapshot_bytes(&self) -> std::io::Result<Vec<u8>> {
-        let state = self.state.lock();
-        serde_json::to_vec_pretty(&*state)
+        // Merged back into one map so the file keeps its shape regardless of
+        // how many shards the process runs with.
+        let mut traffic: HashMap<&str, HashMap<u64, TrafficCounter>> = HashMap::new();
+        let guards = self
+            .shards
+            .iter()
+            .map(|shard| shard.lock())
+            .collect::<Vec<_>>();
+        for state in &guards {
+            for (node_tag, users) in &state.traffic {
+                traffic
+                    .entry(node_tag.as_str())
+                    .or_default()
+                    .extend(users.iter().map(|(uid, counter)| (*uid, *counter)));
+            }
+        }
+        // Not `to_vec_pretty`: nothing reads this by eye, and the indentation
+        // costs about a third again in bytes and encoding time.
+        serde_json::to_vec(&TrafficSnapshot { traffic: &traffic })
             .map_err(|e| std::io::Error::other(format!("encode traffic snapshot: {e}")))
     }
 }
@@ -221,7 +337,7 @@ fn temp_path(path: &std::path::Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "traffic-pending.json".to_string());
-    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
+    path.with_file_name(format!(".{file_name}.tmp-{}", super::writer_id()))
 }
 
 impl TrafficRecorder for TrafficTracker {
@@ -229,11 +345,8 @@ impl TrafficRecorder for TrafficTracker {
         if upload == 0 && download == 0 {
             return;
         }
-        let mut state = self.state.lock();
-        let counter = state
-            .traffic
-            .entry(node_tag.to_string())
-            .or_default()
+        let mut state = self.shard(uid).lock();
+        let counter = node_map(&mut state.traffic, node_tag)
             .entry(uid)
             .or_default();
         counter.upload = counter.upload.saturating_add(upload);
@@ -244,10 +357,7 @@ impl TrafficRecorder for TrafficTracker {
             .and_then(|node| node.get(&uid))
             .is_some_and(|ips| !ips.is_empty());
         if is_alive {
-            let alive_traffic = state
-                .alive_traffic
-                .entry(node_tag.to_string())
-                .or_default()
+            let alive_traffic = node_map(&mut state.alive_traffic, node_tag)
                 .entry(uid)
                 .or_default();
             *alive_traffic = alive_traffic.saturating_add(upload.saturating_add(download));
@@ -255,8 +365,51 @@ impl TrafficRecorder for TrafficTracker {
     }
 
     fn flush_pending_traffic(&self) {
-        if let Err(e) = self.persist_blocking() {
-            log::warn!("failed to persist pending V2Board traffic after connection flush: {e}");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_flush.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < FLUSH_THROTTLE_MILLIS {
+            return;
+        }
+        if self
+            .last_flush
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            // A concurrent close already flushed within this window.
+            return;
+        }
+        #[cfg(test)]
+        self.flush_count.fetch_add(1, Ordering::SeqCst);
+
+        let bytes = match self.snapshot_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("failed to encode pending V2Board traffic: {e}");
+                return;
+            }
+        };
+        let path = self.snapshot_path.clone();
+        let write = move || {
+            if let Err(e) = persist_atomic_blocking(&path, &bytes) {
+                log::warn!("failed to persist pending V2Board traffic after connection flush: {e}");
+            }
+        };
+
+        // This is reached from a connection's teardown, on a runtime worker. A
+        // synchronous write there stalls every other connection that worker is
+        // driving for as long as the filesystem takes. Nothing waits on it: the
+        // push loop persists unconditionally each cycle, so this copy only
+        // narrows the crash-loss window and may land after the connection has
+        // finished closing.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            // No runtime to hand it to (unit tests, shutdown): write inline.
+            Err(_) => write(),
         }
     }
 
@@ -267,7 +420,7 @@ impl TrafficRecorder for TrafficTracker {
         ip: IpAddr,
         device_limit: Option<u64>,
     ) -> bool {
-        let mut state = self.state.lock();
+        let mut state = self.shard(uid).lock();
         let already_local = state
             .alive
             .get(node_tag)
@@ -286,12 +439,7 @@ impl TrafficRecorder for TrafficTracker {
         {
             return false;
         }
-        let ips = state
-            .alive
-            .entry(node_tag.to_string())
-            .or_default()
-            .entry(uid)
-            .or_default();
+        let ips = node_map(&mut state.alive, node_tag).entry(uid).or_default();
 
         if !ips.contains_key(&ip)
             && let Some(limit) = device_limit
@@ -306,7 +454,7 @@ impl TrafficRecorder for TrafficTracker {
     }
 
     fn remove_alive_ip(&self, node_tag: &str, uid: u64, ip: IpAddr) {
-        let mut state = self.state.lock();
+        let mut state = self.shard(uid).lock();
         let mut remove_user = false;
         if let Some(node) = state.alive.get_mut(node_tag)
             && let Some(ips) = node.get_mut(&uid)
@@ -341,10 +489,7 @@ mod tests {
     use super::*;
 
     fn tracker() -> TrafficTracker {
-        TrafficTracker {
-            snapshot_path: PathBuf::from("/tmp/shoes-test-traffic-pending.json"),
-            state: Mutex::new(TrackerState::default()),
-        }
+        TrafficTracker::empty(PathBuf::from("/tmp/shoes-test-traffic-pending.json"))
     }
 
     #[test]
@@ -464,8 +609,105 @@ mod tests {
 
         tracker.flush_pending_traffic();
 
+        // The write is handed to the blocking pool, so wait for it instead of
+        // assuming it completed before the call returned.
+        let path = dir.path().join("traffic-pending.json");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tokio::fs::metadata(&path).await.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the close flush must reach disk");
+
         let reloaded = TrafficTracker::new(dir.path().to_path_buf()).await.unwrap();
         let payload = reloaded.snapshot_traffic("node-a", 0);
         assert_eq!(payload.get("10"), Some(&[7, 9]));
+    }
+
+    #[test]
+    fn state_spread_over_shards_still_reads_back_as_one_node() {
+        let tracker = tracker();
+        // Deliberately more users than shards, so every shard holds some and
+        // the whole-node operations have to visit all of them.
+        let uids: Vec<u64> = (0..(SHARD_COUNT as u64 * 3)).collect();
+        for &uid in &uids {
+            tracker.add_traffic("node-a", uid, 1, 2);
+        }
+
+        // The persisted shape must not depend on how the state is partitioned.
+        let bytes = tracker.snapshot_bytes().unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            encoded["traffic"]["node-a"].as_object().unwrap().len(),
+            uids.len()
+        );
+
+        // Reconcile has to reach across every shard, or deleted users survive
+        // in whichever shards the sweep missed.
+        let keep: std::collections::HashSet<u64> = uids.iter().copied().take(2).collect();
+        tracker.reconcile_users("node-a", &keep);
+
+        let payload = tracker.snapshot_traffic("node-a", 0);
+        assert_eq!(payload.len(), 2);
+        for uid in keep {
+            assert_eq!(payload.get(&uid.to_string()), Some(&[1, 2]));
+        }
+    }
+
+    #[test]
+    fn reconcile_users_drops_deleted_users_keeps_active_ones() {
+        let tracker = tracker();
+        tracker.add_traffic("node-a", 10, 1, 1);
+        tracker.add_traffic("node-a", 11, 1, 1);
+        tracker.add_traffic("node-b", 10, 1, 1);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert!(tracker.add_alive_ip_and_check_limit("node-a", 11, ip, None));
+
+        let active: std::collections::HashSet<u64> = [10u64].into_iter().collect();
+        tracker.reconcile_users("node-a", &active);
+
+        // User 11 (deleted from panel) is purged from traffic and alive state;
+        // user 10 survives; the other node is untouched.
+        assert_eq!(
+            tracker.snapshot_traffic("node-a", 0).get("10"),
+            Some(&[1, 1])
+        );
+        assert!(!tracker.snapshot_traffic("node-a", 0).contains_key("11"));
+        assert!(tracker.snapshot_alive("node-a", 7, 0).is_empty());
+        assert_eq!(
+            tracker.snapshot_traffic("node-b", 0).get("10"),
+            Some(&[1, 1])
+        );
+    }
+
+    #[test]
+    fn reconcile_users_removes_empty_node_buckets() {
+        let tracker = tracker();
+        tracker.add_traffic("node-a", 10, 1, 1);
+
+        tracker.reconcile_users("node-a", &std::collections::HashSet::new());
+
+        assert!(tracker.snapshot_traffic("node-a", 0).is_empty());
+        assert!(tracker.snapshot_alive("node-a", 7, 0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_flush_is_throttled() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = TrafficTracker::new(dir.path().to_path_buf()).await.unwrap();
+
+        tracker.add_traffic("node-a", 10, 5, 5);
+        tracker.flush_pending_traffic();
+        assert_eq!(tracker.flush_count.load(Ordering::SeqCst), 1);
+
+        // Second close within the throttle window must not hit disk.
+        tracker.flush_pending_traffic();
+        assert_eq!(tracker.flush_count.load(Ordering::SeqCst), 1);
+
+        // Once the throttle window has elapsed, the next close persists again.
+        tracker.last_flush.store(0, Ordering::Relaxed);
+        tracker.flush_pending_traffic();
+        assert_eq!(tracker.flush_count.load(Ordering::SeqCst), 2);
     }
 }

@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::config::WebsocketPingType;
-use crate::util::allocate_vec;
+use crate::util::{LazyBuffer, allocate_vec};
 
 const READ_BUFFER_SIZE: usize = 32 * 1024;
 const WRITE_BUFFER_SIZE: usize = 32 * 1024;
@@ -31,11 +31,11 @@ pub struct WebsocketStream {
     text_utf8_pending_len: usize,
     error_close_code: u16,
 
-    unprocessed_buf: Box<[u8]>,
+    unprocessed_buf: LazyBuffer,
     unprocessed_start_offset: usize,
     unprocessed_end_offset: usize,
 
-    write_frame: Box<[u8]>,
+    write_frame: LazyBuffer,
     write_frame_start_offset: usize,
     write_frame_end_offset: usize,
 
@@ -91,12 +91,13 @@ impl WebsocketStream {
         unprocessed_data: &[u8],
     ) -> Self {
         debug_assert!(unprocessed_data.len() <= READ_BUFFER_SIZE);
-        let mut unprocessed_buf = allocate_vec(READ_BUFFER_SIZE).into_boxed_slice();
+        let mut unprocessed_buf = LazyBuffer::new(READ_BUFFER_SIZE);
         let mut unprocessed_end_offset = 0;
-        let write_frame = allocate_vec(WRITE_BUFFER_SIZE).into_boxed_slice();
+        let write_frame = LazyBuffer::new(WRITE_BUFFER_SIZE);
         let control_data = allocate_vec(MAX_CONTROL_PAYLOAD_SIZE).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
+            unprocessed_buf.ensure();
             unprocessed_buf[0..unprocessed_data.len()].copy_from_slice(unprocessed_data);
             unprocessed_end_offset = unprocessed_data.len();
             true
@@ -523,6 +524,7 @@ impl WebsocketStream {
     }
 
     fn pack_write_ping_frame(&mut self) -> bool {
+        self.write_frame.ensure();
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
         if available_space < 6 {
             return false;
@@ -540,6 +542,7 @@ impl WebsocketStream {
     }
 
     fn pack_write_empty_frame(&mut self) -> bool {
+        self.write_frame.ensure();
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
         if available_space < 6 {
             return false;
@@ -561,6 +564,7 @@ impl WebsocketStream {
         let Some(opcode) = self.pending_control else {
             return true;
         };
+        self.write_frame.ensure();
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
 
         // up to 14 bytes for header and mask
@@ -589,6 +593,7 @@ impl WebsocketStream {
     }
 
     fn pack_write_frame(&mut self, input: &[u8]) -> usize {
+        self.write_frame.ensure();
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
 
         // we need up to 14 bytes just for the header and mask.
@@ -640,6 +645,10 @@ impl WebsocketStream {
             }
         }
 
+        if self.write_frame_end_offset == 0 {
+            self.write_frame.release();
+        }
+
         Ok(())
     }
 
@@ -668,6 +677,16 @@ impl WebsocketStream {
                 other => other,
             };
         }
+    }
+
+    #[cfg(test)]
+    fn held_read_bytes(&self) -> usize {
+        self.unprocessed_buf.held_bytes()
+    }
+
+    #[cfg(test)]
+    fn held_write_bytes(&self) -> usize {
+        self.write_frame.held_bytes()
     }
 
     fn reset_unprocessed_buf_offset(&mut self) {
@@ -808,6 +827,9 @@ impl AsyncRead for WebsocketStream {
             {
                 this.reset_unprocessed_buf_offset();
             }
+            // The only place the read buffer is written into, so the only place
+            // it has to exist.
+            this.unprocessed_buf.ensure();
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
                 this.control_data[..2].copy_from_slice(&1002u16.to_be_bytes());
                 this.control_data_size = 2;
@@ -825,11 +847,20 @@ impl AsyncRead for WebsocketStream {
                     let len = read_buf.filled().len();
                     if len == 0 {
                         this.read_closed = true;
+                        this.unprocessed_buf.release();
                         return Poll::Ready(Ok(()));
                     }
                     this.unprocessed_end_offset += len;
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Parked on a peer with nothing to say. Every step_* resets
+                    // both offsets together, so a zero end offset means nothing
+                    // is half-parsed and the buffer can go back.
+                    if this.unprocessed_end_offset == 0 {
+                        this.unprocessed_buf.release();
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1354,6 +1385,55 @@ mod tests {
         assert_eq!(&first, b"first");
         let err = stream.read_u8().await.unwrap_err();
         assert!(err.to_string().contains("fragmented message"));
+    }
+
+    #[tokio::test]
+    async fn parked_stream_gives_back_its_frame_buffers() {
+        let (mut peer_io, server_io) = duplex(4096);
+        let mut stream = server_stream(server_io);
+        let mut out = [0u8; 64];
+
+        // Park on a peer that has not said anything. This is the state almost
+        // every connection is in at any given instant, and it is the state that
+        // used to cost 32 KiB of read buffer apiece.
+        assert!(
+            timeout(Duration::from_millis(50), stream.read(&mut out))
+                .await
+                .is_err(),
+            "the read must park, otherwise this is not testing the idle path"
+        );
+        assert_eq!(
+            stream.held_read_bytes(),
+            0,
+            "a parked stream must not hold a read buffer"
+        );
+
+        // Re-acquiring it must be invisible to the parser.
+        peer_io
+            .write_all(&masked_frame(0x82, b"hello"))
+            .await
+            .unwrap();
+        let read = timeout(Duration::from_secs(1), stream.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..read], b"hello");
+
+        // Same on the write side: taken to build the frame, given back once it
+        // has all reached the transport.
+        stream.write_all(b"reply").await.unwrap();
+        stream.flush().await.unwrap();
+        assert_eq!(
+            stream.held_write_bytes(),
+            0,
+            "a fully flushed stream must not hold a write buffer"
+        );
+        let mut echoed = [0u8; 7];
+        timeout(Duration::from_secs(1), peer_io.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"\x82\x05reply");
     }
 
     #[tokio::test]

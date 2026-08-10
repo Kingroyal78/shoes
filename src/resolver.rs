@@ -327,9 +327,22 @@ pub async fn resolve_location(
 /// Native resolver with application-level caching.
 /// Uses tokio::net::lookup_host (OS resolver) with TTL-based cache.
 /// This is used as the default resolver when no DNS config is specified.
+/// Number of independent locks the DNS cache is split across.
+///
+/// Every outbound connection to a hostname consults this, so a single lock puts
+/// all of them in a queue -- and the eviction sweep runs while it is held.
+const RESOLVER_SHARD_COUNT: usize = 16;
+
 pub struct CachingNativeResolver {
-    cache: Arc<parking_lot::Mutex<FxHashMap<NetLocation, CachedResolveResult>>>,
+    shards: Arc<[parking_lot::Mutex<FxHashMap<NetLocation, CachedResolveResult>>]>,
     result_timeout_secs: u64,
+    /// Per shard, so the total stays what the caller asked for.
+    max_entries_per_shard: usize,
+}
+
+fn resolver_shard_index(location: &NetLocation) -> usize {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(location) as usize & (RESOLVER_SHARD_COUNT - 1)
 }
 
 struct CachedResolveResult {
@@ -348,15 +361,49 @@ impl std::fmt::Debug for CachingNativeResolver {
 impl CachingNativeResolver {
     pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
 
+    /// Upper bound on cached entries. Keeps the cache bounded even when the
+    /// node resolves a large number of distinct destinations.
+    pub const DEFAULT_MAX_ENTRIES: usize = 4096;
+
     pub fn new() -> Self {
         Self::with_timeout(Self::DEFAULT_RESULT_TIMEOUT_SECS)
     }
 
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(FxHashMap::default())),
+            shards: (0..RESOLVER_SHARD_COUNT)
+                .map(|_| parking_lot::Mutex::new(FxHashMap::default()))
+                .collect(),
             result_timeout_secs,
+            max_entries_per_shard: Self::DEFAULT_MAX_ENTRIES.div_ceil(RESOLVER_SHARD_COUNT),
         }
+    }
+}
+
+/// Drop expired entries and, if the cache is still over capacity, evict the
+/// oldest entry. Callers must hold the cache lock. A pure function so the
+/// eviction policy is directly unit-testable without DNS.
+fn evict_for_insert(
+    cache: &mut FxHashMap<NetLocation, CachedResolveResult>,
+    now: Instant,
+    timeout: Duration,
+    max_entries: usize,
+) {
+    let max_entries = max_entries.max(1);
+    cache.retain(|_, result| now.duration_since(result.timestamp) <= timeout);
+    while cache.len() >= max_entries {
+        let mut oldest_key: Option<NetLocation> = None;
+        let mut oldest_timestamp = now;
+        for (key, result) in cache.iter() {
+            if result.timestamp < oldest_timestamp {
+                oldest_timestamp = result.timestamp;
+                oldest_key = Some(key.clone());
+            }
+        }
+        match oldest_key {
+            Some(key) => cache.remove(&key),
+            None => break,
+        };
     }
 }
 
@@ -368,9 +415,11 @@ impl Default for CachingNativeResolver {
 
 impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
-        // Check cache first
+        // Check cache first. Only this name's shard is touched, so concurrent
+        // lookups of other names are not held up behind it.
+        let shard_index = resolver_shard_index(location);
         {
-            let cache = self.cache.lock();
+            let cache = self.shards[shard_index].lock();
             if let Some(cached) = cache.get(location)
                 && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
@@ -381,7 +430,9 @@ impl Resolver for CachingNativeResolver {
         }
 
         let location = location.clone();
-        let cache = self.cache.clone();
+        let shards = self.shards.clone();
+        let result_timeout_secs = self.result_timeout_secs;
+        let max_entries = self.max_entries_per_shard;
 
         Box::pin(async move {
             let address = location.address().to_string();
@@ -398,13 +449,22 @@ impl Resolver for CachingNativeResolver {
             }
 
             // Cache the first result
-            cache.lock().insert(
-                location,
-                CachedResolveResult {
-                    timestamp: Instant::now(),
-                    addr: addrs[0],
-                },
-            );
+            {
+                let mut cache = shards[shard_index].lock();
+                evict_for_insert(
+                    &mut cache,
+                    Instant::now(),
+                    Duration::from_secs(result_timeout_secs),
+                    max_entries,
+                );
+                cache.insert(
+                    location,
+                    CachedResolveResult {
+                        timestamp: Instant::now(),
+                        addr: addrs[0],
+                    },
+                );
+            }
 
             debug!("CachingNativeResolver resolved {address}:{port} -> {addrs:?}");
             Ok(addrs)
@@ -423,7 +483,7 @@ type SharedResolveFuture =
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     /// Completed resolution results with timestamps
-    cache: FxHashMap<NetLocation, (Instant, SocketAddr)>,
+    cache: FxHashMap<NetLocation, CachedResolveResult>,
     /// In-flight resolutions using Shared futures for proper waker handling
     pending: FxHashMap<NetLocation, SharedResolveFuture>,
     result_timeout_secs: u64,
@@ -431,6 +491,15 @@ pub struct ResolverCache {
 
 impl ResolverCache {
     pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60;
+
+    /// Upper bound on cached entries.
+    ///
+    /// One of these lives per connection, and an entry is only ever removed by
+    /// looking the same name up again after it expired -- so a name resolved
+    /// once stays for the life of the connection. A long-lived association that
+    /// keeps naming new destinations would otherwise grow without limit, which
+    /// is exactly the traffic pattern a UDP relay sees.
+    pub const DEFAULT_MAX_ENTRIES: usize = 512;
 
     pub fn new(resolver: Arc<dyn Resolver>) -> Self {
         Self::new_with_timeout(resolver, Self::DEFAULT_RESULT_TIMEOUT_SECS)
@@ -445,6 +514,25 @@ impl ResolverCache {
         }
     }
 
+    /// Cache one result, evicting under the same policy the process-wide
+    /// resolver uses so a single connection cannot grow this without bound.
+    fn insert(&mut self, target: &NetLocation, addr: SocketAddr) {
+        let now = Instant::now();
+        evict_for_insert(
+            &mut self.cache,
+            now,
+            Duration::from_secs(self.result_timeout_secs),
+            Self::DEFAULT_MAX_ENTRIES,
+        );
+        self.cache.insert(
+            target.clone(),
+            CachedResolveResult {
+                timestamp: now,
+                addr,
+            },
+        );
+    }
+
     /// Async resolve method for convenience.
     pub async fn resolve_location(&mut self, target: &NetLocation) -> std::io::Result<SocketAddr> {
         // Fast path: IP address
@@ -453,9 +541,11 @@ impl ResolverCache {
         }
 
         // Check cache
-        if let Some((ts, addr)) = self.cache.get(target) {
-            if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
-                return Ok(*addr);
+        if let Some(cached) = self.cache.get(target) {
+            if Instant::now().duration_since(cached.timestamp)
+                <= Duration::from_secs(self.result_timeout_secs)
+            {
+                return Ok(cached.addr);
             }
             self.cache.remove(target);
         }
@@ -468,7 +558,7 @@ impl ResolverCache {
             )));
         }
         let addr = addrs[0];
-        self.cache.insert(target.clone(), (Instant::now(), addr));
+        self.insert(target, addr);
         Ok(addr)
     }
 
@@ -485,9 +575,11 @@ impl ResolverCache {
         }
 
         // Check completed cache
-        if let Some((ts, addr)) = self.cache.get(target) {
-            if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
-                return Poll::Ready(Ok(*addr));
+        if let Some(cached) = self.cache.get(target) {
+            if Instant::now().duration_since(cached.timestamp)
+                <= Duration::from_secs(self.result_timeout_secs)
+            {
+                return Poll::Ready(Ok(cached.addr));
             }
             self.cache.remove(target);
         }
@@ -514,7 +606,7 @@ impl ResolverCache {
                     ))));
                 }
                 let addr = addrs[0];
-                self.cache.insert(target.clone(), (Instant::now(), addr));
+                self.insert(target, addr);
                 Poll::Ready(Ok(addr))
             }
             Poll::Ready(Err(e)) => {
@@ -816,5 +908,111 @@ mod tests {
         let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 80);
         let result = resolver.resolve_location(&loc).await.unwrap();
         assert_eq!(result[0], "1.2.3.4:80".parse::<SocketAddr>().unwrap());
+    }
+
+    fn cached(_location: &NetLocation, age: Duration) -> CachedResolveResult {
+        CachedResolveResult {
+            timestamp: Instant::now() - age,
+            addr: "127.0.0.1:80".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn evict_for_insert_purges_expired_entries() {
+        let mut cache = FxHashMap::default();
+        let fresh = test_location();
+        let stale = NetLocation::new(Address::Hostname("stale.example".to_string()), 80);
+        cache.insert(fresh.clone(), cached(&fresh, Duration::from_secs(5)));
+        cache.insert(
+            stale.clone(),
+            cached(&stale, Duration::from_secs(2 * 60 * 60)),
+        );
+
+        evict_for_insert(&mut cache, Instant::now(), Duration::from_secs(60), 10);
+
+        assert!(cache.contains_key(&fresh));
+        assert!(!cache.contains_key(&stale));
+    }
+
+    #[test]
+    fn evict_for_insert_bounds_cache_size() {
+        let mut cache = FxHashMap::default();
+        let now = Instant::now();
+        let mut oldest: Option<NetLocation> = None;
+        for i in 0..100usize {
+            let location = NetLocation::new(Address::Hostname(format!("host-{i}.example")), 80);
+            // Larger index => older timestamp (eviction candidate).
+            let age = Duration::from_millis((i + 1) as u64 * 10);
+            if i == 99 {
+                oldest = Some(location.clone());
+            }
+            cache.insert(
+                location,
+                CachedResolveResult {
+                    timestamp: now - age,
+                    addr: "127.0.0.1:80".parse().unwrap(),
+                },
+            );
+        }
+
+        evict_for_insert(&mut cache, now, Duration::from_secs(3600), 64);
+
+        assert!(cache.len() < 64);
+        assert_eq!(cache.len() + 1, 64);
+        assert!(!cache.contains_key(oldest.as_ref().unwrap()));
+        // Newest entry (index 0) survives.
+        let newest = NetLocation::new(Address::Hostname("host-0.example".to_string()), 80);
+        assert!(cache.contains_key(&newest));
+    }
+
+    #[test]
+    fn evict_for_insert_does_not_grow_with_continuous_inserts() {
+        let mut cache = FxHashMap::default();
+        let now = Instant::now();
+        for i in 0..5000usize {
+            let location = NetLocation::new(Address::Hostname(format!("host-{i}.example")), 80);
+            evict_for_insert(&mut cache, now, Duration::from_secs(3600), 256);
+            cache.insert(
+                location,
+                CachedResolveResult {
+                    timestamp: now - Duration::from_millis((5000 - i) as u64),
+                    addr: "127.0.0.1:80".parse().unwrap(),
+                },
+            );
+        }
+        assert_eq!(cache.len(), 256);
+    }
+
+    #[test]
+    fn default_resolver_cache_is_bounded_across_all_shards() {
+        let resolver = CachingNativeResolver::new();
+        assert_eq!(resolver.shards.len(), RESOLVER_SHARD_COUNT);
+        // The bound is what the caller asked for; sharding must not multiply it.
+        assert!(
+            resolver.max_entries_per_shard * RESOLVER_SHARD_COUNT
+                >= CachingNativeResolver::DEFAULT_MAX_ENTRIES
+        );
+        assert!(
+            resolver.max_entries_per_shard * RESOLVER_SHARD_COUNT
+                < CachingNativeResolver::DEFAULT_MAX_ENTRIES + RESOLVER_SHARD_COUNT
+        );
+    }
+
+    #[test]
+    fn names_spread_across_resolver_shards() {
+        use std::collections::HashSet;
+        let occupied: HashSet<usize> = (0..500)
+            .map(|i| {
+                resolver_shard_index(&NetLocation::new(
+                    Address::Hostname(format!("host{i}.example")),
+                    443,
+                ))
+            })
+            .collect();
+        assert_eq!(
+            occupied.len(),
+            RESOLVER_SHARD_COUNT,
+            "a single occupied shard would put every lookup back behind one lock"
+        );
     }
 }

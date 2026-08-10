@@ -15,15 +15,17 @@ use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::shadow_tls::{
     ParsedClientHello, ShadowTlsServerTarget, read_client_hello, setup_shadowtls_server_stream,
 };
-use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 use crate::address::NetLocation;
+use crate::shared_users::SharedUsers;
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
+use crate::vless::vless_server_handler::VlessUsers;
 
 /// Configuration for Vision VLESS inner protocol
 #[derive(Debug, Clone)]
 pub struct VisionVlessConfig {
-    pub users: Vec<(Box<[u8]>, Option<AuthenticatedUser>)>,
+    pub users: Arc<SharedUsers<VlessUsers>>,
     pub udp_enabled: bool,
     pub fallback: Option<NetLocation>,
     pub outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
@@ -32,7 +34,7 @@ pub struct VisionVlessConfig {
 /// Configuration for NaiveProxy inner protocol
 #[derive(Debug, Clone)]
 pub struct NaiveConfig {
-    pub users: Arc<UserLookup>,
+    pub users: Arc<SharedUsers<UserLookup>>,
     pub fallback_path: Option<PathBuf>,
     pub udp_enabled: bool,
     pub padding_enabled: bool,

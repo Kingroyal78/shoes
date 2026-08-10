@@ -33,6 +33,14 @@ const MAX_ENCRYPTED_WRITE_DATA_SIZE: usize = 8192 + ENCRYPTION_TAG_LEN;
 // at most MAX_ENCRYPTED_WRITE_DATA_SIZE in a packet.
 const MAX_ENCRYPTED_READ_DATA_SIZE: usize = u16::MAX as usize;
 
+/// A full ciphertext packet plus its 2-byte length prefix.
+const MAX_READ_PACKET_SIZE: usize = MAX_ENCRYPTED_READ_DATA_SIZE + 2;
+
+/// Initial capacity of the read-side buffers. Grown on demand (doubling,
+/// capped at the protocol maximum) so TCP connections with small frames do
+/// not reserve two 64 KB buffers each.
+const INITIAL_READ_BUF_SIZE: usize = 4096;
+
 struct LengthMask {
     reader: VmessReader,
     mask: [u8; 2],
@@ -83,12 +91,12 @@ pub struct VmessStream {
     read_length_mask: Option<LengthMask>,
     write_length_mask: Option<LengthMask>,
 
-    unprocessed_buf: Box<[u8]>,
+    unprocessed_buf: Vec<u8>,
     unprocessed_start_offset: usize,
     unprocessed_end_offset: usize,
     unprocessed_pending_len: Option<(usize, usize)>,
 
-    processed_buf: Box<[u8]>,
+    processed_buf: Vec<u8>,
     processed_start_offset: usize,
     processed_end_offset: usize,
 
@@ -180,12 +188,14 @@ impl VmessStream {
             None => (0, None, None),
         };
 
-        let max_unencrypted_read_data_size = MAX_ENCRYPTED_READ_DATA_SIZE - tag_len;
         let max_unencrypted_write_data_size = MAX_ENCRYPTED_WRITE_DATA_SIZE - tag_len;
 
-        const MAX_READ_PACKET_SIZE: usize = MAX_ENCRYPTED_READ_DATA_SIZE + 2;
-        let unprocessed_buf = allocate_vec(MAX_READ_PACKET_SIZE).into_boxed_slice();
-        let processed_buf = allocate_vec(max_unencrypted_read_data_size).into_boxed_slice();
+        // Read-side buffers grow on demand up to their protocol maximum so
+        // TCP connections that only carry small frames do not hold two 64 KB
+        // buffers each. `unprocessed_pending_len`-driven growth preserves the
+        // framing invariant that a full frame always fits.
+        let unprocessed_buf = allocate_vec(INITIAL_READ_BUF_SIZE);
+        let processed_buf = allocate_vec(INITIAL_READ_BUF_SIZE);
 
         let (write_cache, write_packet) = if !is_udp {
             let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
@@ -247,10 +257,13 @@ impl VmessStream {
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         assert!(self.unprocessed_end_offset == 0);
 
-        if data.len() > self.unprocessed_buf.len() {
+        if data.len() > MAX_READ_PACKET_SIZE {
             return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
+        }
+        if data.len() > self.unprocessed_buf.len() {
+            self.unprocessed_buf.resize(data.len(), 0);
         }
 
         self.unprocessed_buf[0..data.len()].copy_from_slice(data);
@@ -468,12 +481,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_without_padding_len - self.tag_len;
-                if processed_data_len
-                    > self
-                        .processed_buf
-                        .len()
-                        .saturating_sub(self.processed_end_offset)
-                {
+                if !self.ensure_processed_room(processed_data_len) {
                     self.unprocessed_pending_len = Some((padding_len, data_len));
                     if self.unprocessed_start_offset == self.unprocessed_end_offset {
                         self.unprocessed_start_offset = 0;
@@ -509,12 +517,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_without_padding_len - self.tag_len;
-                if processed_data_len
-                    > self
-                        .processed_buf
-                        .len()
-                        .saturating_sub(self.processed_end_offset)
-                {
+                if !self.ensure_processed_room(processed_data_len) {
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -721,6 +724,43 @@ impl VmessStream {
         self.unprocessed_end_offset -= self.unprocessed_start_offset;
         self.unprocessed_start_offset = 0;
     }
+
+    /// Make sure `unprocessed_buf` has room for another read. Compacts
+    /// consumed bytes first, then grows the buffer (doubling, capped at the
+    /// maximum packet size). This preserves the framing invariant that a full
+    /// packet always fits while avoiding two fixed 64 KB reservations per
+    /// connection.
+    fn ensure_unprocessed_room(&mut self) {
+        if self.unprocessed_end_offset == self.unprocessed_buf.len()
+            && self.unprocessed_start_offset > 0
+        {
+            self.reset_unprocessed_buf_offset();
+        }
+        if self.unprocessed_end_offset == self.unprocessed_buf.len() {
+            let grown =
+                (self.unprocessed_buf.len() * 2).clamp(INITIAL_READ_BUF_SIZE, MAX_READ_PACKET_SIZE);
+            let target = grown.max(self.unprocessed_end_offset.saturating_add(1));
+            self.unprocessed_buf.resize(target, 0);
+        }
+    }
+
+    /// Grow `processed_buf` so it can hold `processed_data_len` more plaintext
+    /// bytes after whatever is already buffered, but never beyond the
+    /// protocol's maximum plaintext per decryption pass. Returns `false` when
+    /// the caller must pause with `DecryptState::BufferFull` (matching the
+    /// original fixed-size buffer semantics) so a burst of frames cannot
+    /// accumulate unbounded plaintext.
+    fn ensure_processed_room(&mut self, processed_data_len: usize) -> bool {
+        let needed = self.processed_end_offset.saturating_add(processed_data_len);
+        let max_plaintext = MAX_ENCRYPTED_READ_DATA_SIZE.saturating_sub(self.tag_len);
+        if needed > max_plaintext {
+            return false;
+        }
+        if self.processed_buf.len() < needed {
+            self.processed_buf.resize(needed, 0);
+        }
+        true
+    }
 }
 
 impl VmessRawStream {
@@ -837,6 +877,7 @@ impl AsyncRead for VmessStream {
 
         if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
             loop {
+                this.ensure_unprocessed_room();
                 let mut read_buf =
                     ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
                 ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
@@ -884,12 +925,9 @@ impl AsyncRead for VmessStream {
 
         loop {
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
-                // if we got here, there's no data in processed buf, and we don't have
-                // space in unprocessed buf to read more to decrypt.
-                // since we know we have enough space for 1 full-sized packet,
-                // this must be because start offset has moved forward too much.
-                this.reset_unprocessed_buf_offset();
-                assert!(this.unprocessed_end_offset < this.unprocessed_buf.len());
+                // Compact consumed bytes, growing the buffer if the remaining
+                // unprocessed data still fills it.
+                this.ensure_unprocessed_room();
             }
 
             let mut read_buf =
@@ -1079,6 +1117,7 @@ impl AsyncReadMessage for VmessStream {
 
         if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
             loop {
+                this.ensure_unprocessed_room();
                 let mut read_buf =
                     ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
                 ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
@@ -1144,12 +1183,9 @@ impl AsyncReadMessage for VmessStream {
 
         loop {
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
-                // if we got here, there's no data in processed buf, and we don't have
-                // space in unprocessed buf to read more to decrypt.
-                // since we know we have enough space for 1 full-sized packet,
-                // this must be because start offset has moved forward too much.
-                this.reset_unprocessed_buf_offset();
-                assert!(this.unprocessed_end_offset < this.unprocessed_buf.len());
+                // Compact consumed bytes, growing the buffer if the remaining
+                // unprocessed data still fills it.
+                this.ensure_unprocessed_room();
             }
 
             let mut read_buf =
@@ -1625,6 +1661,9 @@ mod tests {
     fn try_decrypt_accepts_chunk_that_exactly_fills_processed_buffer() {
         let mut stream = vmess_stream_without_encryption();
         let data_len = MAX_ENCRYPTED_READ_DATA_SIZE;
+        // Simulate the on-demand growth a real read path would have performed
+        // to accommodate a full-sized packet.
+        stream.unprocessed_buf.resize(MAX_READ_PACKET_SIZE, 0);
         stream.unprocessed_buf[0..2].copy_from_slice(&(data_len as u16).to_be_bytes());
         for (idx, byte) in stream.unprocessed_buf[2..2 + data_len]
             .iter_mut()
@@ -1638,6 +1677,29 @@ mod tests {
 
         assert!(matches!(state, DecryptState::Success));
         assert_eq!(stream.processed_end_offset, stream.processed_buf.len());
+    }
+
+    #[test]
+    fn read_buffers_start_small_and_grow_within_bounds() {
+        let mut stream = vmess_stream_without_encryption();
+
+        // Fresh streams must not reserve two 64 KB buffers each.
+        assert!(stream.unprocessed_buf.len() < MAX_READ_PACKET_SIZE);
+        assert!(stream.processed_buf.len() < MAX_ENCRYPTED_READ_DATA_SIZE);
+
+        // unprocessed_buf grows when it is full.
+        stream.unprocessed_end_offset = stream.unprocessed_buf.len();
+        stream.unprocessed_start_offset = 0;
+        stream.ensure_unprocessed_room();
+        assert!(stream.unprocessed_buf.len() > INITIAL_READ_BUF_SIZE);
+
+        // processed_buf grows to fit a full frame and refuses beyond the bound
+        // (the caller then falls back to BufferFull, as with a fixed buffer).
+        let max_plaintext = MAX_ENCRYPTED_READ_DATA_SIZE - stream.tag_len;
+        assert!(stream.ensure_processed_room(max_plaintext));
+        assert_eq!(stream.processed_buf.len(), max_plaintext);
+        stream.processed_end_offset = 100;
+        assert!(!stream.ensure_processed_room(max_plaintext));
     }
 
     #[test]

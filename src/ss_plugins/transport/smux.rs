@@ -16,6 +16,7 @@ use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server::process_stream;
+use crate::util::allocate_vec;
 
 const VERSION_V1: u8 = 1;
 const VERSION_V2: u8 = 2;
@@ -26,6 +27,39 @@ const CMD_NOP: u8 = 3;
 const CMD_UPD: u8 = 4;
 const HEADER_SIZE: usize = 8;
 const UPDATE_PAYLOAD_SIZE: usize = 8;
+
+/// Logical streams killed because their inbound queue overran.
+///
+/// smux v1 has no per-stream window, so a stream that cannot keep up has to be
+/// dropped rather than backpressured. Whether that is rare enough to live with
+/// or worth trading memory for is a question about the rate, and the rate was
+/// previously only visible at debug level -- which is off in production.
+pub static STREAMS_DROPPED_BY_BACKPRESSURE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Default ceiling on queued inbound bytes across a listener's sessions.
+/// Far above what healthy traffic queues -- data sits here only while a logical
+/// stream is slower than its peer -- but low enough to bound a listener that
+/// would otherwise scale with the connection count.
+const DEFAULT_LISTENER_RECEIVE_BUFFER: usize = 256 * 1024 * 1024;
+
+/// How often the server sends a NOP on an otherwise quiet v1 session.
+///
+/// Deliberately paired with no read timeout. A read timeout cannot tell an
+/// abandoned session from a merely idle one -- an idle client sends no smux
+/// frames either -- so it would drop live connections that happen to be quiet.
+/// The cases it would catch are already covered: a peer that has gone away
+/// fails these writes once TCP gives up, which tears the session down, and TCP
+/// keepalive (300s idle + probes) reaps an unreachable peer on its own. The
+/// NOPs also keep middleboxes from dropping the flow underneath a quiet
+/// session.
+const SMUX_V1_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn listener_budget(config: &SmuxServerConfig) -> Option<Arc<ReceiveBudget>> {
+    config
+        .max_listener_receive_buffer
+        .map(|max| Arc::new(ReceiveBudget::new(max)))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SmuxLimits {
@@ -54,6 +88,10 @@ pub struct SmuxServerConfig {
     pub max_stream_buffer: usize,
     pub keepalive_interval: Option<std::time::Duration>,
     pub keepalive_timeout: Option<std::time::Duration>,
+    /// Ceiling on queued inbound bytes across every session this handler
+    /// serves. `max_receive_buffer` is per session, so without this the
+    /// listener's exposure is that figure times the number of connections.
+    pub max_listener_receive_buffer: Option<usize>,
 }
 
 impl Default for SmuxServerConfig {
@@ -65,6 +103,7 @@ impl Default for SmuxServerConfig {
             max_stream_buffer: 2 * 1024 * 1024,
             keepalive_interval: None,
             keepalive_timeout: None,
+            max_listener_receive_buffer: Some(DEFAULT_LISTENER_RECEIVE_BUFFER),
         }
     }
 }
@@ -73,6 +112,7 @@ pub struct SmuxServerHandler {
     inner: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     config: SmuxServerConfig,
+    listener_budget: Option<Arc<ReceiveBudget>>,
 }
 
 impl fmt::Debug for SmuxServerHandler {
@@ -95,6 +135,7 @@ impl SmuxServerHandler {
             inner,
             resolver,
             config,
+            listener_budget: listener_budget(&config),
         }
     }
 }
@@ -117,8 +158,10 @@ impl TcpServerHandler for SmuxServerHandler {
         let inner = self.inner.clone();
         let resolver = self.resolver.clone();
         let config = self.config;
+        let budget = self.listener_budget.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config).await {
+            if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config, budget).await
+            {
                 log::debug!(
                     "smux v{} session finished with error: {error}",
                     config.version
@@ -132,7 +175,8 @@ impl TcpServerHandler for SmuxServerHandler {
 pub struct SmuxV1ServerHandler {
     inner: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
-    limits: SmuxLimits,
+    config: SmuxServerConfig,
+    listener_budget: Option<Arc<ReceiveBudget>>,
 }
 
 impl fmt::Debug for SmuxV1ServerHandler {
@@ -140,7 +184,7 @@ impl fmt::Debug for SmuxV1ServerHandler {
         f.debug_struct("SmuxV1ServerHandler")
             .field("inner", &self.inner)
             .field("resolver", &self.resolver)
-            .field("limits", &self.limits)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -151,10 +195,18 @@ impl SmuxV1ServerHandler {
         resolver: Arc<dyn Resolver>,
         limits: SmuxLimits,
     ) -> Self {
+        let config = SmuxServerConfig {
+            version: VERSION_V1,
+            limits,
+            keepalive_interval: Some(SMUX_V1_KEEPALIVE_INTERVAL),
+            keepalive_timeout: None,
+            ..SmuxServerConfig::default()
+        };
         Self {
             inner,
             resolver,
-            limits,
+            config,
+            listener_budget: listener_budget(&config),
         }
     }
 }
@@ -173,16 +225,14 @@ impl TcpServerHandler for SmuxV1ServerHandler {
         stream: Box<dyn AsyncStream>,
         peer_addr: Option<std::net::SocketAddr>,
     ) -> io::Result<TcpServerSetupResult> {
-        let config = SmuxServerConfig {
-            version: VERSION_V1,
-            limits: self.limits,
-            ..SmuxServerConfig::default()
-        };
+        let config = self.config;
         validate_config(config)?;
         let inner = self.inner.clone();
         let resolver = self.resolver.clone();
+        let budget = self.listener_budget.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config).await {
+            if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config, budget).await
+            {
                 log::debug!("smux v1 session finished with error: {error}");
             }
         });
@@ -243,7 +293,10 @@ async fn read_frame<R: AsyncRead + Unpin>(
     }
     reader.read_exact(&mut header[1..]).await?;
     let (command, stream_id, length) = parse_header(header, version, max_payload)?;
-    let mut payload = vec![0u8; length];
+    // Not `vec![0u8; length]`: `read_exact` overwrites every byte before anyone
+    // can observe one, so zeroing first is a memset per frame on the busiest
+    // path in the process.
+    let mut payload = allocate_vec(length);
     reader.read_exact(&mut payload).await?;
     Ok(Some(Frame {
         command,
@@ -282,6 +335,7 @@ async fn serve_smux(
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<std::net::SocketAddr>,
     config: SmuxServerConfig,
+    listener_budget: Option<Arc<ReceiveBudget>>,
 ) -> io::Result<()> {
     let version = config.version;
     let limits = config.limits;
@@ -300,7 +354,10 @@ async fn serve_smux(
         Ok::<(), io::Error>(())
     });
     let (updates_tx, mut updates_rx) = mpsc::channel::<WindowUpdate>(limits.outbound_frame_queue);
-    let receive_budget = Arc::new(ReceiveBudget::new(config.max_receive_buffer));
+    let receive_budget = Arc::new(ReceiveBudget::with_parent(
+        config.max_receive_buffer,
+        listener_budget,
+    ));
     let mut writer_task = tokio::spawn(async move {
         let mut updates_open = true;
         let ping_period = config
@@ -395,6 +452,20 @@ async fn serve_smux(
         };
         match frame.command {
             CMD_SYN => {
+                // Reclaim slots whose logical stream is gone. A server-initiated
+                // close sends FIN but leaves the entry behind, and only a FIN
+                // *from the peer* removes one, so without this a peer that never
+                // reciprocates walks the map up to the concurrency limit and
+                // trips it -- which tears down the physical session and every
+                // live logical stream sharing it. The inbound receiver lives
+                // exactly as long as its `VirtualStream`, so a closed sender is
+                // precisely the "this stream is finished" signal.
+                streams.retain(|_, state| {
+                    state
+                        .inbound
+                        .as_ref()
+                        .is_some_and(|inbound| !inbound.is_closed())
+                });
                 if streams.contains_key(&frame.stream_id) {
                     break invalid("smux v1 SYN reused an active stream ID");
                 }
@@ -447,10 +518,13 @@ async fn serve_smux(
                 });
             }
             CMD_PSH => {
-                let Some(inbound) = streams.get_mut(&frame.stream_id) else {
-                    break invalid(format!("smux v{version} PSH references an unknown stream"));
-                };
-                if !frame.payload.is_empty()
+                // An unknown stream id is an ordinary race, not an error: the
+                // server closed the logical stream and sent FIN while this frame
+                // was already on the wire. Discard the payload -- failing the
+                // session here would punish every other stream sharing it.
+                let mut overran_queue = false;
+                if let Some(inbound) = streams.get_mut(&frame.stream_id)
+                    && !frame.payload.is_empty()
                     && let Some(sender) = &inbound.inbound
                 {
                     let data = match receive_budget.track(frame.payload) {
@@ -460,27 +534,57 @@ async fn serve_smux(
                     match sender.try_send(InboundEvent::Data(data)) {
                         Ok(()) => {}
                         Err(TrySendError::Closed(_)) => inbound.inbound = None,
-                        Err(TrySendError::Full(_)) => {
-                            break invalid(format!(
-                                "smux v{version} logical inbound queue is full"
-                            ));
-                        }
+                        Err(TrySendError::Full(_)) => overran_queue = true,
+                    }
+                }
+                if overran_queue {
+                    STREAMS_DROPPED_BY_BACKPRESSURE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // This stream is not draining as fast as its peer is
+                    // sending, and smux v1 has no per-stream window to push
+                    // back with. Dropping the frame would leave a hole in the
+                    // stream's byte sequence, so the stream itself cannot
+                    // survive -- but only this one. Failing the session here
+                    // tore down every other logical stream multiplexed onto the
+                    // same connection over a condition caused by one of them,
+                    // and the collateral was invisible because those streams
+                    // report their failures at debug level.
+                    if let Some(state) = streams.remove(&frame.stream_id)
+                        && let Some(terminal) = state.terminal
+                    {
+                        let _ = terminal.send(InboundTerminal::Failed(format!(
+                            "smux v{version} logical inbound queue is full"
+                        )));
+                    }
+                    if outbound_tx
+                        .send(OutboundCommand::Finished {
+                            stream_id: frame.stream_id,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break invalid(format!("smux v{version} session writer closed"));
                     }
                 }
             }
             CMD_FIN => {
-                let Some(inbound) = streams.remove(&frame.stream_id) else {
-                    break invalid(format!("smux v{version} FIN references an unknown stream"));
-                };
-                if let Some(terminal) = inbound.terminal {
+                // With slots reclaimed on close, the peer FINning a stream the
+                // server already finished is the common case, not a violation.
+                if let Some(inbound) = streams.remove(&frame.stream_id)
+                    && let Some(terminal) = inbound.terminal
+                {
                     let _ = terminal.send(InboundTerminal::Finished);
                 }
             }
             CMD_NOP => {}
             CMD_UPD => {
+                // Same race as PSH; a window update for a finished stream is
+                // simply nothing to apply.
                 let Some(stream) = streams.get(&frame.stream_id) else {
-                    break invalid("smux v2 UPD references an unknown stream");
+                    continue;
                 };
+                // A v1 session receiving a v2 frame is a real protocol error,
+                // not a race, so it still fails the session.
                 let Some(flow) = &stream.flow else {
                     break invalid("smux v1 received a v2 window update");
                 };
@@ -570,6 +674,17 @@ fn validate_config(config: SmuxServerConfig) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid smux v1 resource limits",
+        ));
+    }
+    // No relation to `max_receive_buffer` is required: a listener ceiling below
+    // one session's is simply the constraint that binds first.
+    if config
+        .max_listener_receive_buffer
+        .is_some_and(|max| max == 0 || max > i32::MAX as usize)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid smux listener receive buffer limit",
         ));
     }
     if config.max_receive_buffer == 0
@@ -773,6 +888,23 @@ mod tests {
     }
 
     #[test]
+    fn v1_handler_sends_keepalives_without_imposing_a_read_timeout() {
+        let handler = SmuxV1ServerHandler::new(
+            Arc::new(UnusedHandler),
+            Arc::new(NativeResolver::new()),
+            SmuxLimits::default(),
+        );
+        assert_eq!(
+            handler.config.keepalive_interval,
+            Some(SMUX_V1_KEEPALIVE_INTERVAL)
+        );
+        // A read timeout would close idle-but-live sessions, which are
+        // indistinguishable from abandoned ones at this layer.
+        assert_eq!(handler.config.keepalive_timeout, None);
+        validate_config(handler.config).expect("the shipped v1 config must be valid");
+    }
+
+    #[test]
     fn default_smux_config_does_not_enable_idle_read_timeout() {
         let config = SmuxServerConfig::default();
         assert!(config.keepalive_interval.is_none());
@@ -946,6 +1078,7 @@ mod tests {
                 max_stream_buffer: 4,
                 ..SmuxServerConfig::default()
             },
+            None,
         ));
 
         write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
@@ -996,6 +1129,7 @@ mod tests {
                 max_stream_buffer: 4,
                 ..SmuxServerConfig::default()
             },
+            None,
         ));
 
         write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
@@ -1029,6 +1163,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_closed_streams_release_their_concurrency_slot() {
+        let (mut client, server) = tokio::io::duplex(512);
+        let handler = Arc::new(HoldingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig {
+                limits: SmuxLimits {
+                    max_concurrent_streams: 2,
+                    ..SmuxLimits::default()
+                },
+                ..SmuxServerConfig::default()
+            },
+            None,
+        ));
+
+        // Open more streams over the session's life than it may hold at once,
+        // closing each from the server side and never sending a FIN back. Every
+        // one of those slots used to be held until the peer reciprocated, so the
+        // third SYN tripped the concurrency limit and killed the session --
+        // taking any other logical stream on it down as well.
+        for stream_id in 1..=5_u32 {
+            write_frame(&mut client, VERSION_V1, CMD_SYN, stream_id, &[])
+                .await
+                .unwrap();
+            // Bounded: when a slot is not reclaimed the session dies at the
+            // limit check and this stream is never handed to the handler, so
+            // waiting unconditionally would hang the suite instead of failing.
+            tokio::time::timeout(std::time::Duration::from_secs(5), handler.ready.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("stream {stream_id} was refused: a closed stream did not free its slot")
+                });
+            handler
+                .held
+                .lock()
+                .expect("holding handler mutex poisoned")
+                .clear();
+            tokio::task::yield_now().await;
+        }
+
+        // Reclaiming slots makes a frame for an already-finished stream a normal
+        // race rather than a protocol error, so late frames must be discarded
+        // instead of failing the session.
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 5, b"late")
+            .await
+            .unwrap();
+        write_frame(&mut client, VERSION_V1, CMD_FIN, 5, &[])
+            .await
+            .unwrap();
+
+        client.shutdown().await.unwrap();
+        session
+            .await
+            .unwrap()
+            .expect("a server-closed stream must free its slot and tolerate late frames");
+    }
+
+    #[tokio::test]
+    async fn a_stream_overrunning_its_queue_does_not_take_the_session_with_it() {
+        let (mut client, server) = tokio::io::duplex(512);
+        let handler = Arc::new(HoldingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig {
+                limits: SmuxLimits {
+                    inbound_frames_per_stream: 1,
+                    max_frame_payload: 4,
+                    ..SmuxLimits::default()
+                },
+                max_receive_buffer: 64,
+                max_stream_buffer: 8,
+                ..SmuxServerConfig::default()
+            },
+            None,
+        ));
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        handler.ready.notified().await;
+
+        // The handler holds stream 1 without ever reading it, so its one-slot
+        // queue fills and the next frame has nowhere to go.
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"aa")
+            .await
+            .unwrap();
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"bb")
+            .await
+            .unwrap();
+
+        // The session must still serve everyone else on it.
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 2, &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler.ready.notified())
+            .await
+            .expect("one stream overrunning its queue must not tear down the session");
+
+        handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        client.shutdown().await.unwrap();
+        session
+            .await
+            .unwrap()
+            .expect("the session outlives a single stream's overflow");
+    }
+
+    #[tokio::test]
     async fn clean_physical_close_does_not_spin_after_update_channel_closes() {
         let (client, server) = tokio::io::duplex(64);
         drop(client);
@@ -1038,6 +1289,7 @@ mod tests {
             Arc::new(NativeResolver::new()),
             None,
             SmuxServerConfig::default(),
+            None,
         );
         tokio::time::timeout(std::time::Duration::from_millis(100), session)
             .await

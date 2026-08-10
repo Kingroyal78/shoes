@@ -6,8 +6,8 @@ use aws_lc_rs::cipher::{AES_128, AES_256, DecryptingKey, DecryptionContext, Unbo
 #[cfg(test)]
 use aws_lc_rs::cipher::{EncryptingKey, EncryptionContext};
 use log::debug;
-use parking_lot::Mutex;
 use rand::{Rng, RngExt};
+use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
 use super::salt_checker::SaltChecker;
@@ -20,6 +20,7 @@ use crate::h2mux::{
     MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, PrependStream, handle_h2mux_session_with_context,
 };
 use crate::resolver::Resolver;
+use crate::shared_users::SharedUsers;
 use crate::socks_handler::{
     read_location, socks_location_len, try_write_location_to_buf, try_write_location_to_vec,
     write_location_to_vec,
@@ -48,14 +49,14 @@ pub struct ShadowsocksTcpHandler {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
     aead2022: bool,
-    salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
+    salt_checker: Option<Arc<dyn SaltChecker>>,
     udp_enabled: bool,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
     /// DNS resolver for h2mux sessions. None when used as client handler.
     resolver: Option<Arc<dyn Resolver>>,
     authenticated_user: Option<AuthenticatedUser>,
-    multi_user_keys: Option<Vec<ShadowsocksUserKey>>,
+    multi_user_keys: Option<Arc<SharedUsers<ShadowsocksUsers>>>,
     aead2022_identity_psk: Option<Box<[u8]>>,
     http_obfs: Option<ShadowsocksHttpObfs>,
     h2mux_server_enabled: bool,
@@ -69,6 +70,86 @@ struct ShadowsocksUserKey {
     key: Arc<Box<dyn ShadowsocksKey>>,
     aead2022_user_hash: Option<[u8; AEAD2022_USER_HASH_LEN]>,
     authenticated_user: AuthenticatedUser,
+}
+
+/// The user set of a multi-user Shadowsocks listener.
+///
+/// AEAD2022 identifies the user from a hash carried in the identity header, so
+/// it is looked up directly. Nodes carry tens of thousands of users, and a
+/// linear scan there costs one comparison per user on every new connection.
+/// Legacy AEAD has no such identifier and must still probe each key in turn.
+///
+/// Built by the control plane and published through
+/// [`SharedUsers`](crate::shared_users::SharedUsers), so a user-list change
+/// never rebuilds the listener.
+#[derive(Debug)]
+pub struct ShadowsocksUsers {
+    keys: Vec<ShadowsocksUserKey>,
+    by_user_hash: FxHashMap<[u8; AEAD2022_USER_HASH_LEN], usize>,
+}
+
+impl ShadowsocksUsers {
+    /// Build the table for a legacy AEAD listener, which derives one key per
+    /// user password and has no per-user identifier to index on.
+    pub fn legacy(cipher: &ShadowsocksCipher, users: Vec<ServerUser>) -> Self {
+        Self::new(
+            users
+                .into_iter()
+                .map(|user| ShadowsocksUserKey {
+                    key: Arc::new(Box::new(DefaultKey::new(
+                        &user.credential,
+                        cipher.algorithm().key_len(),
+                    ))),
+                    aead2022_user_hash: None,
+                    authenticated_user: user.authenticated_user,
+                })
+                .collect(),
+        )
+    }
+
+    /// Build the table for an AEAD2022 listener, indexed by the identity-header
+    /// hash the client sends.
+    pub fn aead2022(cipher: &ShadowsocksCipher, users: Vec<(Vec<u8>, AuthenticatedUser)>) -> Self {
+        Self::new(
+            users
+                .into_iter()
+                .map(|(user_psk, authenticated_user)| ShadowsocksUserKey {
+                    aead2022_user_hash: Some(shadowsocks_2022_user_hash(&user_psk)),
+                    key: Arc::new(Box::new(Blake3Key::new(
+                        user_psk.into_boxed_slice(),
+                        cipher.algorithm().key_len(),
+                    ))),
+                    authenticated_user,
+                })
+                .collect(),
+        )
+    }
+
+    fn new(keys: Vec<ShadowsocksUserKey>) -> Self {
+        let by_user_hash = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, user)| user.aead2022_user_hash.map(|hash| (hash, index)))
+            .collect();
+        Self { keys, by_user_hash }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn find_by_user_hash(
+        &self,
+        user_hash: &[u8; AEAD2022_USER_HASH_LEN],
+    ) -> Option<&ShadowsocksUserKey> {
+        self.by_user_hash
+            .get(user_hash)
+            .map(|&index| &self.keys[index])
+    }
 }
 
 impl ShadowsocksTcpHandler {
@@ -144,31 +225,20 @@ impl ShadowsocksTcpHandler {
 
     pub fn new_v2board_multi_server(
         cipher: ShadowsocksCipher,
-        users: Vec<ServerUser>,
+        users: Arc<SharedUsers<ShadowsocksUsers>>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let multi_user_keys = users
-            .into_iter()
-            .map(|user| ShadowsocksUserKey {
-                key: Arc::new(Box::new(DefaultKey::new(
-                    &user.credential,
-                    cipher.algorithm().key_len(),
-                ))),
-                aead2022_user_hash: None,
-                authenticated_user: user.authenticated_user,
-            })
-            .collect();
         let mut handler = Self::new_server(cipher, "", udp_enabled, proxy_selector, resolver);
-        handler.multi_user_keys = Some(multi_user_keys);
+        handler.multi_user_keys = Some(users);
         handler
     }
 
     pub fn new_v2board_aead2022_multi_server(
         cipher: ShadowsocksCipher,
         server_psk: Vec<u8>,
-        users: Vec<(Vec<u8>, AuthenticatedUser)>,
+        users: Arc<SharedUsers<ShadowsocksUsers>>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
@@ -178,33 +248,34 @@ impl ShadowsocksTcpHandler {
             server_psk.into_boxed_slice(),
             cipher.algorithm().key_len(),
         )));
-        let multi_user_keys = users
-            .into_iter()
-            .map(|(user_psk, authenticated_user)| ShadowsocksUserKey {
-                aead2022_user_hash: Some(shadowsocks_2022_user_hash(&user_psk)),
-                key: Arc::new(Box::new(Blake3Key::new(
-                    user_psk.into_boxed_slice(),
-                    cipher.algorithm().key_len(),
-                ))),
-                authenticated_user,
-            })
-            .collect();
         Self {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
+            salt_checker: Some(super::salt_checker::new_shared_salt_checker()),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
             authenticated_user: None,
-            multi_user_keys: Some(multi_user_keys),
+            multi_user_keys: Some(users),
             aead2022_identity_psk: Some(identity_psk),
             http_obfs: None,
             h2mux_server_enabled: false,
             h2mux_padding: false,
             outbound_dispatcher: None,
         }
+    }
+
+    /// Use a caller-supplied replay checker instead of this handler's own.
+    ///
+    /// The control plane rebuilds listeners whenever the panel changes anything
+    /// other than the user list, and a fresh handler would start with an empty
+    /// salt set -- reopening the replay window for a full retention period on
+    /// every such rebuild. Passing a checker that lives with the node keeps the
+    /// memory across generations.
+    pub fn with_salt_checker(mut self, salt_checker: super::SharedSaltChecker) -> Self {
+        self.salt_checker = Some(salt_checker);
+        self
     }
 
     /// Create a new handler for client use (no proxy_selector needed)
@@ -247,7 +318,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
+            salt_checker: Some(Arc::new(TimedSaltChecker::new(60))),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
@@ -275,7 +346,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
+            salt_checker: Some(Arc::new(TimedSaltChecker::new(60))),
             udp_enabled,
             proxy_selector: None,
             resolver: None,
@@ -297,7 +368,7 @@ impl ShadowsocksTcpHandler {
         Box<dyn AsyncStream>,
         Arc<Box<dyn ShadowsocksKey>>,
         Option<AuthenticatedUser>,
-        Option<Arc<Mutex<dyn SaltChecker>>>,
+        Option<Arc<dyn SaltChecker>>,
     )> {
         let Some(users) = &self.multi_user_keys else {
             return Ok((
@@ -307,7 +378,7 @@ impl ShadowsocksTcpHandler {
                 self.salt_checker.clone(),
             ));
         };
-        if users.is_empty() {
+        if users.load().is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "multi-user Shadowsocks handler has no users",
@@ -334,7 +405,7 @@ impl ShadowsocksTcpHandler {
     async fn select_legacy_server_user(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-        users: &[ShadowsocksUserKey],
+        users: &SharedUsers<ShadowsocksUsers>,
         stream_type: ShadowsocksStreamType,
     ) -> std::io::Result<(
         Box<dyn AsyncStream>,
@@ -352,7 +423,10 @@ impl ShadowsocksTcpHandler {
         let salt = &probe[..salt_len];
         let encrypted_length = &probe[salt_len..];
 
-        for user in users {
+        // Borrow the table only for the lookup. Holding it for the lifetime of
+        // the connection would pin a superseded table until the connection ends.
+        let users = users.load();
+        for user in &users.keys {
             if try_decrypt_aead_length(
                 self.cipher.algorithm(),
                 user.key.as_ref().as_ref(),
@@ -362,12 +436,11 @@ impl ShadowsocksTcpHandler {
             )
             .is_ok()
             {
+                let key = user.key.clone();
+                let authenticated_user = user.authenticated_user.clone();
+                drop(users);
                 let stream = prepend_probe(server_stream, reader, probe);
-                return Ok((
-                    stream,
-                    user.key.clone(),
-                    Some(user.authenticated_user.clone()),
-                ));
+                return Ok((stream, key, Some(authenticated_user)));
             }
         }
 
@@ -380,12 +453,12 @@ impl ShadowsocksTcpHandler {
     async fn select_aead2022_server_user(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-        users: &[ShadowsocksUserKey],
+        users: &SharedUsers<ShadowsocksUsers>,
     ) -> std::io::Result<(
         Box<dyn AsyncStream>,
         Arc<Box<dyn ShadowsocksKey>>,
         Option<AuthenticatedUser>,
-        Option<Arc<Mutex<dyn SaltChecker>>>,
+        Option<Arc<dyn SaltChecker>>,
     )> {
         let salt_len = self.cipher.salt_len();
         let encrypted_identity_len = AEAD2022_USER_HASH_LEN;
@@ -399,7 +472,7 @@ impl ShadowsocksTcpHandler {
         let request_salt = &probe[..salt_len];
 
         if let Some(salt_checker) = &self.salt_checker
-            && !salt_checker.lock().insert_and_check(request_salt)
+            && !salt_checker.insert_and_check(request_salt)
         {
             return Err(std::io::Error::other("got duplicate salt"));
         }
@@ -417,31 +490,30 @@ impl ShadowsocksTcpHandler {
             encrypted_identity_header,
         )?;
 
-        for user in users {
-            if user.aead2022_user_hash == Some(user_hash) {
-                let mut initial_data = Vec::with_capacity(probe.len() - encrypted_identity_len);
-                initial_data.extend_from_slice(request_salt);
-                initial_data.extend_from_slice(&probe[salt_len + encrypted_identity_len..]);
-                if let Some(unparsed) = reader.unparsed_data_owned() {
-                    initial_data.extend_from_slice(&unparsed);
-                }
-                let stream: Box<dyn AsyncStream> = Box::new(PrependStream::new(
-                    server_stream,
-                    Some(initial_data.into_boxed_slice()),
+        // Borrow the table only for the lookup, then copy out this user's own
+        // credentials; see `SharedUsers` for why the borrow must not outlive it.
+        let (key, authenticated_user) = {
+            let users = users.load();
+            let Some(user) = users.find_by_user_hash(&user_hash) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "no matching Shadowsocks 2022 user",
                 ));
-                return Ok((
-                    stream,
-                    user.key.clone(),
-                    Some(user.authenticated_user.clone()),
-                    None,
-                ));
-            }
-        }
+            };
+            (user.key.clone(), user.authenticated_user.clone())
+        };
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "no matching Shadowsocks 2022 user",
-        ))
+        let mut initial_data = Vec::with_capacity(probe.len() - encrypted_identity_len);
+        initial_data.extend_from_slice(request_salt);
+        initial_data.extend_from_slice(&probe[salt_len + encrypted_identity_len..]);
+        if let Some(unparsed) = reader.unparsed_data_owned() {
+            initial_data.extend_from_slice(&unparsed);
+        }
+        let stream: Box<dyn AsyncStream> = Box::new(PrependStream::new(
+            server_stream,
+            Some(initial_data.into_boxed_slice()),
+        ));
+        Ok((stream, key, Some(authenticated_user), None))
     }
 }
 

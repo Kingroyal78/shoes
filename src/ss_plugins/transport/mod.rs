@@ -18,7 +18,10 @@ pub(crate) use http::host_matches_optional_port;
 pub use http::{HttpLimits, HttpRequest, normalize_path};
 pub use http_upgrade::{HttpUpgradeConfig, HttpUpgradeServerHandler};
 pub use mux_cool::{MuxCoolLimits, MuxCoolServerHandler};
-pub use smux::{SmuxLimits, SmuxServerConfig, SmuxServerHandler, SmuxV1ServerHandler};
+pub use smux::{
+    STREAMS_DROPPED_BY_BACKPRESSURE, SmuxLimits, SmuxServerConfig, SmuxServerHandler,
+    SmuxV1ServerHandler,
+};
 pub use tls::TlsTerminatingServerHandler;
 pub use websocket::{
     StrictWebsocketServerHandler, WebsocketServerConfig, websocket_server_handler,

@@ -160,9 +160,11 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde_json = "*"
 tempfile = "*"
+tokio = { version = "*", features = ["test-util"] }
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
+tikv-jemalloc-ctl = { version = "*", features = ["stats", "use_std"] }
 tikv-jemallocator = { version = "*", features = ["background_threads"] }
 
 [target.'cfg(target_os = "android")'.dependencies]

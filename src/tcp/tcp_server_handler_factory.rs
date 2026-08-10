@@ -22,6 +22,7 @@ use crate::resolver::Resolver;
 use crate::rustls_config_util::create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
+use crate::shared_users::SharedUsers;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
 use crate::tcp::chain_builder::build_client_proxy_chain;
@@ -33,6 +34,7 @@ use crate::tls_server_handler::{
 use crate::trojan_handler::TrojanTcpHandler;
 use crate::uuid_util::parse_uuid;
 use crate::vless::vless_server_handler::VlessTcpServerHandler;
+use crate::vless::vless_server_handler::VlessUsers;
 use crate::vmess::VmessTcpServerHandler;
 use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
@@ -362,7 +364,7 @@ fn create_tls_server_target(
             .collect();
 
         InnerProtocol::Naive(NaiveConfig {
-            users: Arc::new(UserLookup::new(users_vec)),
+            users: SharedUsers::new(UserLookup::new(users_vec)),
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,
@@ -376,11 +378,12 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
+            let user_id_bytes: [u8; 16] = parse_uuid(user_id)
                 .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+                .try_into()
+                .expect("VLESS user id must be 16 bytes");
             InnerProtocol::VisionVless(VisionVlessConfig {
-                users: vec![(user_id_bytes, None)],
+                users: SharedUsers::new(VlessUsers::single(user_id_bytes)),
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
                 outbound_dispatcher: None,
@@ -524,7 +527,7 @@ fn create_reality_server_target(
             .collect();
 
         InnerProtocol::Naive(NaiveConfig {
-            users: Arc::new(UserLookup::new(users_vec)),
+            users: SharedUsers::new(UserLookup::new(users_vec)),
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,
@@ -538,11 +541,12 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
+            let user_id_bytes: [u8; 16] = parse_uuid(user_id)
                 .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+                .try_into()
+                .expect("VLESS user id must be 16 bytes");
             InnerProtocol::VisionVless(VisionVlessConfig {
-                users: vec![(user_id_bytes, None)],
+                users: SharedUsers::new(VlessUsers::single(user_id_bytes)),
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
                 outbound_dispatcher: None,

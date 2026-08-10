@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod address;
+mod alloc_stats;
 mod anytls;
 mod app;
 mod async_stream;
@@ -33,6 +34,7 @@ mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;
 mod shadowsocks;
+mod shared_users;
 mod slide_buffer;
 mod snell;
 mod socket_util;
@@ -92,6 +94,13 @@ fn main() {
     let cli = parse_cli();
     init_logging(&cli);
 
+    if cli.command == Command::Run {
+        match socket_util::raise_open_file_limit() {
+            Some(limit) => log::info!("open file limit: {limit}"),
+            None => log::warn!("could not determine the open file limit"),
+        }
+    }
+
     let num_threads = if cli.threads == 0 {
         std::cmp::max(
             2,
@@ -119,6 +128,9 @@ fn main() {
         .expect("could not build tokio runtime");
 
     let result = runtime.block_on(async move {
+        if cli.command == Command::Run {
+            crate::alloc_stats::start_allocator_stats_logger();
+        }
         match cli.command {
             Command::Run => app::run(&cli.config_path, num_threads).await,
             Command::Validate => app::validate(&cli.config_path).await,

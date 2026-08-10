@@ -299,8 +299,11 @@ async fn handle_h3_connect(
 ) -> io::Result<()> {
     let has_padding = req.headers().get("padding").is_some();
 
+    // Borrow the table only for validation, copying out this user's identity;
+    // see `SharedUsers` for why the borrow must not outlive the handshake.
+    let users = config.users.load();
     let validated_user = match req.headers().get("proxy-authorization") {
-        Some(auth) => match auth.to_str().ok().and_then(|s| config.users.validate(s)) {
+        Some(auth) => match auth.to_str().ok().and_then(|s| users.validate(s)) {
             Some(user) => user,
             None => return send_h3_status(stream, StatusCode::BAD_REQUEST).await,
         },

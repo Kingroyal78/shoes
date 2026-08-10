@@ -21,6 +21,27 @@ pub enum FetchResult<T> {
     Updated { etag: Option<String>, value: T },
 }
 
+/// The user list gets its own result type because it is the one payload large
+/// enough that *decoding* it is a cost worth avoiding.
+///
+/// A panel that does not honour conditional requests re-sends the whole list
+/// every interval. The bytes come down the wire either way, but there is no
+/// reason to rebuild every user from them when they are the same bytes we
+/// decoded last time -- hashing the body is orders of magnitude cheaper than
+/// decoding it and allocating a struct per user.
+pub enum UserListFetch {
+    NotModified,
+    /// A body arrived, byte-for-byte identical to the one last decoded.
+    Unchanged {
+        etag: Option<String>,
+    },
+    Updated {
+        etag: Option<String>,
+        value: UserList,
+        body_hash: [u8; 32],
+    },
+}
+
 impl V2BoardClient {
     pub fn new(config: &AppConfig) -> std::io::Result<Self> {
         let http = reqwest::Client::builder()
@@ -63,7 +84,8 @@ impl V2BoardClient {
         app_config: &AppConfig,
         node: &V2BoardNodeConfig,
         etag: Option<&str>,
-    ) -> std::io::Result<FetchResult<UserList>> {
+        last_body_hash: Option<&[u8; 32]>,
+    ) -> std::io::Result<UserListFetch> {
         let request = self
             .http
             .get(Self::endpoint(app_config, node, "user"))
@@ -74,7 +96,7 @@ impl V2BoardClient {
         let response = request.send().await.map_err(http_error)?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
-            return Ok(FetchResult::NotModified);
+            return Ok(UserListFetch::NotModified);
         }
 
         let response = self.ensure_success(response).await?;
@@ -100,6 +122,11 @@ impl V2BoardClient {
             }
         })?;
 
+        let body_hash = *blake3::hash(&bytes).as_bytes();
+        if last_body_hash == Some(&body_hash) {
+            return Ok(UserListFetch::Unchanged { etag });
+        }
+
         let value = if content_type.contains("msgpack") {
             rmp_serde::from_slice::<UserList>(&bytes).map_err(|e| {
                 std::io::Error::new(
@@ -116,7 +143,11 @@ impl V2BoardClient {
             })?
         };
 
-        Ok(FetchResult::Updated { etag, value })
+        Ok(UserListFetch::Updated {
+            etag,
+            value,
+            body_hash,
+        })
     }
 
     pub async fn get_alive_list(
@@ -720,6 +751,51 @@ mod tests {
             status.canonical_reason().unwrap_or("Unknown"),
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn an_identical_user_list_body_is_not_decoded_twice() {
+        let users = r#"{"users":[{"id":1,"uuid":"aaaaaaaa-0000-0000-0000-000000000001"},{"id":2,"uuid":"aaaaaaaa-0000-0000-0000-000000000002"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            users.len(),
+            users
+        );
+
+        let (api_host, _request) = serve_once(response.clone()).await;
+        let (mut app, mut node) = app_and_node(NodeType::Shadowsocks);
+        app.v2board.api_host = api_host.clone();
+        node.api_host = Some(api_host);
+        let client = V2BoardClient::new(&app).unwrap();
+
+        let first = client.get_user_list(&app, &node, None, None).await.unwrap();
+        let (hash, decoded) = match first {
+            UserListFetch::Updated {
+                value, body_hash, ..
+            } => (body_hash, value.users.len()),
+            _ => panic!("the first fetch has nothing to compare against, so it must decode"),
+        };
+        assert_eq!(decoded, 2);
+
+        // The panel re-sends exactly the same list, as one that ignores
+        // conditional requests does on every interval.
+        let (api_host, _request) = serve_once(response).await;
+        let mut node = node.clone();
+        node.api_host = Some(api_host.clone());
+        app.v2board.api_host = api_host;
+        let client = V2BoardClient::new(&app).unwrap();
+
+        match client
+            .get_user_list(&app, &node, None, Some(&hash))
+            .await
+            .unwrap()
+        {
+            UserListFetch::Unchanged { .. } => {}
+            UserListFetch::Updated { .. } => {
+                panic!("an identical body must not be decoded a second time")
+            }
+            UserListFetch::NotModified => panic!("the server sent a body, not a 304"),
+        }
     }
 
     async fn serve_once(response: String) -> (String, tokio::task::JoinHandle<String>) {

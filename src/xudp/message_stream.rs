@@ -66,8 +66,8 @@ impl XudpMessageStream {
         let resolver = Arc::new(NativeResolver::new());
         Self {
             inner_stream,
-            read_buffer: BytesMut::with_capacity(65536),
-            write_buffer: BytesMut::with_capacity(65536),
+            read_buffer: BytesMut::new(),
+            write_buffer: BytesMut::new(),
             next_session_id: 1,
             destination_to_session: HashMap::new(),
             session_to_destination: HashMap::new(),
@@ -365,8 +365,8 @@ impl XudpFixedMessageStream {
         Self {
             inner_stream,
             target,
-            read_buffer: BytesMut::with_capacity(65536),
-            write_buffer: BytesMut::with_capacity(65536),
+            read_buffer: BytesMut::new(),
+            write_buffer: BytesMut::new(),
             pending_read_message: None,
             session_id: 1,
             request_written: false,

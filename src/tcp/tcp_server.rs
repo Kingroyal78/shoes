@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ use crate::protocol_sniff::sniff_udp_protocol;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
-use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
+use crate::socket_util::{accept_loop_count, new_tcp_listeners, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
     TrafficRecorder,
@@ -127,12 +127,14 @@ async fn run_tcp_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_resolver, Some(addr)).await
-            {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
-            } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
+            match process_stream(stream, cloned_handler, cloned_resolver, Some(addr)).await {
+                Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
+                Err(StreamFailure::Handshake(e)) => {
+                    debug!("{}:{} handshake rejected: {}", addr.ip(), addr.port(), e)
+                }
+                Err(StreamFailure::Proxy(e)) => {
+                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e)
+                }
             }
         });
     }
@@ -157,10 +159,10 @@ async fn run_unix_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver, None).await {
-                error!("{addr:?} finished with error: {e:?}");
-            } else {
-                debug!("{addr:?} finished successfully");
+            match process_stream(stream, cloned_handler, cloned_resolver, None).await {
+                Ok(()) => debug!("{addr:?} finished successfully"),
+                Err(StreamFailure::Handshake(e)) => debug!("{addr:?} handshake rejected: {e}"),
+                Err(StreamFailure::Proxy(e)) => error!("{addr:?} finished with error: {e:?}"),
             }
         });
     }
@@ -193,15 +195,113 @@ where
         .await
 }
 
+/// Why a connection ended, so the caller can pick a log level.
+///
+/// A public proxy port collects a constant stream of peers that never complete
+/// our inbound handshake: clients configured without the plugin, port scans,
+/// truncated headers, resets. That is the peer's problem, and logging each one
+/// as an error drowns out the failures that are actually ours.
+#[derive(Debug)]
+pub enum StreamFailure {
+    /// The peer never got through the inbound handshake.
+    Handshake(std::io::Error),
+    /// Failed after the handshake: outbound setup, routing, or the proxying
+    /// itself. These deserve an operator's attention.
+    Proxy(std::io::Error),
+}
+
+impl StreamFailure {
+    pub fn into_io_error(self) -> std::io::Error {
+        match self {
+            StreamFailure::Handshake(error) | StreamFailure::Proxy(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamFailure::Handshake(error) | StreamFailure::Proxy(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Streams currently being served, physical connections and multiplexed logical
+/// streams alike.
+///
+/// Per-connection memory scales with this rather than with the socket count: one
+/// physical connection can carry many logical streams, and it is the logical
+/// stream that holds the copy buffers. Reported next to the allocator counters
+/// so a capacity measurement can control for load directly instead of inferring
+/// it from a proxy like the UDP router count.
+pub static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Streams refused because [`max_concurrent_streams`] was already reached.
+pub static STREAMS_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Upper bound on concurrently served streams, or `None` for no bound.
+///
+/// Every change so far has lowered what a stream costs, but a lower cost is
+/// still a cost: past some number the node stops being able to serve anyone
+/// well. A cap turns that into a predictable refusal of *new* work instead of
+/// degrading every connection already being served.
+///
+/// Read from `SHOES_MAX_CONCURRENT_STREAMS`, and unset means unlimited -- the
+/// right number depends on the machine, and guessing one here would be a
+/// behaviour change nobody asked for.
+/// Whether a stream arriving now would exceed the cap.
+///
+/// Split out so the boundary is pinned by a test: the limit counts streams
+/// already being served, so admitting at `live == limit` would serve one more
+/// than configured.
+fn at_stream_limit(live: usize, limit: usize) -> bool {
+    live >= limit
+}
+
+fn max_concurrent_streams() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("SHOES_MAX_CONCURRENT_STREAMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+    })
+}
+
+struct LiveStreamGuard;
+
+impl LiveStreamGuard {
+    fn new() -> Self {
+        LIVE_STREAMS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LiveStreamGuard {
+    fn drop(&mut self) {
+        LIVE_STREAMS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<SocketAddr>,
-) -> std::io::Result<()>
+) -> Result<(), StreamFailure>
 where
     AS: AsyncStream + 'static,
 {
+    if let Some(limit) = max_concurrent_streams()
+        && at_stream_limit(LIVE_STREAMS.load(Ordering::Relaxed), limit)
+    {
+        STREAMS_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(StreamFailure::Handshake(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("refused: already serving the configured maximum of {limit} streams"),
+        )));
+    }
+    let _live = LiveStreamGuard::new();
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
         setup_server_stream(stream, server_handler, peer_addr),
@@ -210,20 +310,22 @@ where
     let setup_result = match setup_server_stream_future.await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Err(std::io::Error::new(
+            return Err(StreamFailure::Handshake(std::io::Error::new(
                 e.kind(),
                 format!("failed to setup server stream: {e}"),
-            ));
+            )));
         }
         Err(elapsed) => {
-            return Err(std::io::Error::new(
+            return Err(StreamFailure::Handshake(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("server setup timed out: {elapsed}"),
-            ));
+            )));
         }
     };
 
-    handle_server_setup_result(setup_result, resolver, peer_addr).await
+    handle_server_setup_result(setup_result, resolver, peer_addr)
+        .await
+        .map_err(StreamFailure::Proxy)
 }
 
 pub async fn handle_server_setup_result(
@@ -822,7 +924,7 @@ impl AuthenticatedConnectionScope {
 
 struct AliveIpGuard {
     recorder: Arc<dyn TrafficRecorder>,
-    node_tag: String,
+    node_tag: Arc<str>,
     uid: u64,
     ip: IpAddr,
 }
@@ -834,8 +936,45 @@ impl Drop for AliveIpGuard {
     }
 }
 
-struct TrafficFlushTask {
-    handle: Option<JoinHandle<()>>,
+/// A connection's byte counters, as seen by the periodic reporter.
+struct ActiveTraffic {
+    user: AuthenticatedUser,
+    upload: Arc<AtomicU64>,
+    download: Arc<AtomicU64>,
+}
+
+/// Every authenticated connection currently reporting traffic.
+///
+/// This used to be a task and a timer per connection. Both are per-connection
+/// costs that buy nothing: the work is two atomic swaps every ten seconds, and
+/// a million connections meant a million timer entries and a hundred thousand
+/// wakeups a second purely to perform them. One sweeper walking this map does
+/// the same work in a single task.
+static ACTIVE_TRAFFIC: LazyLock<DashMap<u64, ActiveTraffic>> = LazyLock::new(DashMap::new);
+static NEXT_ACTIVE_TRAFFIC_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Start the sweeper on first use, so a process with no authenticated traffic
+/// (and every unit test) never spawns it.
+fn ensure_traffic_sweeper() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ACTIVE_TRAFFIC_FLUSH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                for entry in ACTIVE_TRAFFIC.iter() {
+                    let active = entry.value();
+                    record_traffic_for(&active.user, &active.upload, &active.download);
+                }
+            }
+        });
+    });
+}
+
+pub(crate) struct TrafficFlushTask {
+    /// Key into [`ACTIVE_TRAFFIC`], absent when this connection has no recorder.
+    id: Option<u64>,
     authenticated_user: Option<AuthenticatedUser>,
     upload: Arc<AtomicU64>,
     download: Arc<AtomicU64>,
@@ -848,22 +987,24 @@ impl TrafficFlushTask {
         download: Arc<AtomicU64>,
     ) -> Self {
         let authenticated_user = authenticated_user.clone();
-        let handle = authenticated_user
+        let id = authenticated_user
             .as_ref()
-            .and_then(|user| user.recorder.as_ref())
-            .map(|_| {
-                let task_user = authenticated_user.clone();
-                let task_upload = upload.clone();
-                let task_download = download.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(ACTIVE_TRAFFIC_FLUSH_INTERVAL).await;
-                        record_user_traffic(&task_user, &task_upload, &task_download);
-                    }
-                })
+            .filter(|user| user.recorder.is_some())
+            .map(|user| {
+                ensure_traffic_sweeper();
+                let id = NEXT_ACTIVE_TRAFFIC_ID.fetch_add(1, Ordering::Relaxed);
+                ACTIVE_TRAFFIC.insert(
+                    id,
+                    ActiveTraffic {
+                        user: user.clone(),
+                        upload: upload.clone(),
+                        download: download.clone(),
+                    },
+                );
+                id
             });
         Self {
-            handle,
+            id,
             authenticated_user,
             upload,
             download,
@@ -873,8 +1014,11 @@ impl TrafficFlushTask {
 
 impl Drop for TrafficFlushTask {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        // Deregister before reporting. The sweeper holds a shard of this map
+        // while it reports, so taking the recorder's lock first here would
+        // invert the order the two paths acquire them in.
+        if let Some(id) = self.id.take() {
+            ACTIVE_TRAFFIC.remove(&id);
         }
         if record_user_traffic(&self.authenticated_user, &self.upload, &self.download) {
             flush_pending_traffic(&self.authenticated_user);
@@ -887,18 +1031,28 @@ fn record_user_traffic(
     upload: &AtomicU64,
     download: &AtomicU64,
 ) -> bool {
+    match authenticated_user {
+        Some(user) => record_traffic_for(user, upload, download),
+        None => false,
+    }
+}
+
+fn record_traffic_for(user: &AuthenticatedUser, upload: &AtomicU64, download: &AtomicU64) -> bool {
     let upload = upload.swap(0, Ordering::Relaxed);
     let download = download.swap(0, Ordering::Relaxed);
     if upload == 0 && download == 0 {
         return false;
     }
-    if let Some(user) = authenticated_user
-        && let Some(recorder) = &user.recorder
-    {
+    if let Some(recorder) = &user.recorder {
         recorder.add_traffic(&user.node_tag, user.uid, upload, download);
         return true;
     }
     false
+}
+
+#[cfg(test)]
+fn active_traffic_len() -> usize {
+    ACTIVE_TRAFFIC.len()
 }
 
 fn flush_pending_traffic(authenticated_user: &Option<AuthenticatedUser>) {
@@ -916,11 +1070,18 @@ fn speed_limiter_for(authenticated_user: &Option<AuthenticatedUser>) -> Option<A
         uid: user.uid,
     };
     let Some(speed_limit) = user.speed_limit else {
-        USER_SPEED_LIMITERS.remove(&key);
+        // Only take the shard write lock when an entry actually exists (the
+        // common case for a never-limited user is a cheap read). The per-sync
+        // reconcile also removes entries for users whose limits were cleared.
+        if USER_SPEED_LIMITERS.contains_key(&key) {
+            USER_SPEED_LIMITERS.remove(&key);
+        }
         return None;
     };
     let Some(bytes_per_sec) = panel_speed_limit_to_bytes_per_sec(speed_limit) else {
-        USER_SPEED_LIMITERS.remove(&key);
+        if USER_SPEED_LIMITERS.contains_key(&key) {
+            USER_SPEED_LIMITERS.remove(&key);
+        }
         return None;
     };
 
@@ -962,12 +1123,46 @@ fn panel_speed_limit_to_bytes_per_sec(speed_limit_mbps: u64) -> Option<u64> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UserSpeedLimitKey {
-    node_tag: String,
+    node_tag: Arc<str>,
     uid: u64,
 }
 
 static USER_SPEED_LIMITERS: LazyLock<DashMap<UserSpeedLimitKey, Arc<RateLimiter>>> =
     LazyLock::new(DashMap::new);
+
+/// Drop speed-limit entries for `node_tag` whose user is no longer in
+/// `active_uids`. Called after each successful user-list sync so the global
+/// map cannot grow with users deleted from the panel. Active connections keep
+/// their cloned `Arc<RateLimiter>` until they close; new connections simply
+/// create a fresh limiter.
+pub(crate) fn reconcile_speed_limiters(
+    node_tag: &str,
+    active_uids: &std::collections::HashSet<u64>,
+) {
+    USER_SPEED_LIMITERS
+        .retain(|key, _| &*key.node_tag != node_tag || active_uids.contains(&key.uid));
+}
+
+#[cfg(test)]
+fn speed_limiter_map_len() -> usize {
+    USER_SPEED_LIMITERS.len()
+}
+
+#[cfg(test)]
+fn speed_limiter_map_len_for(node_tag: &str) -> usize {
+    USER_SPEED_LIMITERS
+        .iter()
+        .filter(|entry| &*entry.key().node_tag == node_tag)
+        .count()
+}
+
+#[cfg(test)]
+fn speed_limiter_map_contains(node_tag: &str, uid: u64) -> bool {
+    USER_SPEED_LIMITERS.contains_key(&UserSpeedLimitKey {
+        node_tag: node_tag.into(),
+        uid,
+    })
+}
 
 #[derive(Debug)]
 struct RateLimiter {
@@ -983,6 +1178,10 @@ struct RateLimiterState {
 }
 
 const SPEED_LIMIT_BURST_SECONDS: f64 = 2.0;
+
+/// Smallest slice a rate-limited stream will read or write at once, so a
+/// nearly-empty token bucket cannot degrade a transfer into byte-at-a-time IO.
+const MIN_LIMITED_CHUNK_BYTES: usize = 4096;
 const ACTIVE_TRAFFIC_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl RateLimiter {
@@ -1018,10 +1217,20 @@ impl RateLimiter {
         let requested = requested.max(1);
         let mut state = self.state.lock();
         state.refill(Instant::now());
-        if state.tokens >= 1.0 {
+        // Never hand out a tiny slice just because a byte or two has trickled
+        // in. Doing so drives the transfer one poll (and one timer-wheel
+        // insertion) per handful of bytes, which costs far more CPU than the
+        // limit itself; waiting for a worthwhile chunk delivers the same
+        // throughput at a fraction of the wakeups. The floor is clamped by both
+        // the bucket capacity and the request, so it can never wait for tokens
+        // the bucket cannot hold or that the caller does not want.
+        let min_chunk = (MIN_LIMITED_CHUNK_BYTES as f64)
+            .min(state.burst_bytes)
+            .min(requested as f64);
+        if state.tokens >= min_chunk {
             return Ok(requested.min(state.tokens.floor() as usize).max(1));
         }
-        let wait_secs = (1.0 - state.tokens) / state.rate_bytes_per_sec;
+        let wait_secs = (min_chunk - state.tokens) / state.rate_bytes_per_sec;
         Err(Duration::from_secs_f64(wait_secs.max(0.001)))
     }
 
@@ -2003,23 +2212,26 @@ pub async fn start_tcp_handler_servers(
         BindLocation::Address(a) => {
             let socket_addrs = a.to_socket_addrs()?;
             for socket_addr in socket_addrs {
-                let listener = match new_tcp_listener(socket_addr, 4096, None) {
-                    Ok(listener) => listener,
-                    Err(e) => {
-                        abort_join_handles(handles);
-                        return Err(e);
-                    }
-                };
-                let tcp_config = tcp_config.clone();
-                let server_handler = server_handler.clone();
-                let resolver = resolver.clone();
-                handles.push(tokio::spawn(async move {
-                    if let Err(e) =
-                        run_tcp_server(listener, tcp_config, resolver, server_handler).await
-                    {
-                        log::error!("TCP server at {socket_addr} stopped with error: {e}");
-                    }
-                }));
+                let listeners =
+                    match new_tcp_listeners(socket_addr, 4096, None, accept_loop_count()) {
+                        Ok(listeners) => listeners,
+                        Err(e) => {
+                            abort_join_handles(handles);
+                            return Err(e);
+                        }
+                    };
+                for listener in listeners {
+                    let tcp_config = tcp_config.clone();
+                    let server_handler = server_handler.clone();
+                    let resolver = resolver.clone();
+                    handles.push(tokio::spawn(async move {
+                        if let Err(e) =
+                            run_tcp_server(listener, tcp_config, resolver, server_handler).await
+                        {
+                            log::error!("TCP server at {socket_addr} stopped with error: {e}");
+                        }
+                    }));
+                }
             }
         }
         BindLocation::Path(path_buf) => {
@@ -2154,22 +2366,24 @@ async fn start_tcp_servers(
         BindLocation::Address(a) => {
             let socket_addrs = a.to_socket_addrs()?;
             for socket_addr in socket_addrs {
-                let listener = match new_tcp_listener(socket_addr, 4096, None) {
-                    Ok(listener) => listener,
-                    Err(e) => {
-                        abort_join_handles(handles);
-                        return Err(e);
-                    }
-                };
-                let tcp_config = tcp_config.clone();
-                let tcp_handler = tcp_handler.clone();
-                let resolver = resolver.clone();
-                let handle = tokio::spawn(async move {
-                    run_tcp_server(listener, tcp_config, resolver, tcp_handler)
-                        .await
-                        .unwrap();
-                });
-                handles.push(handle);
+                let listeners =
+                    match new_tcp_listeners(socket_addr, 4096, None, accept_loop_count()) {
+                        Ok(listeners) => listeners,
+                        Err(e) => {
+                            abort_join_handles(handles);
+                            return Err(e);
+                        }
+                    };
+                for listener in listeners {
+                    let tcp_config = tcp_config.clone();
+                    let tcp_handler = tcp_handler.clone();
+                    let resolver = resolver.clone();
+                    handles.push(tokio::spawn(async move {
+                        run_tcp_server(listener, tcp_config, resolver, tcp_handler)
+                            .await
+                            .unwrap();
+                    }));
+                }
             }
         }
         BindLocation::Path(path_buf) => {
@@ -2531,7 +2745,65 @@ mod tests {
 
     fn authenticated_user(uid: u64, speed_limit: Option<u64>) -> Option<AuthenticatedUser> {
         Some(AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
+            uid,
+            user_key: format!("user-{uid}"),
+            speed_limit,
+            device_limit: None,
+            recorder: None,
+        })
+    }
+
+    #[test]
+    fn the_stream_limit_counts_streams_already_being_served() {
+        assert!(!at_stream_limit(0, 1));
+        assert!(!at_stream_limit(98, 99));
+        // At the limit the node is already serving as many as it was told to.
+        assert!(at_stream_limit(99, 99));
+        assert!(at_stream_limit(100, 99));
+    }
+
+    #[tokio::test]
+    async fn active_connections_register_with_the_sweeper_and_deregister_on_close() {
+        let recorder = Arc::new(TestRecorder::default());
+        let user = authenticated_user_with_recorder(9001, recorder.clone());
+        let upload = Arc::new(AtomicU64::new(0));
+        let download = Arc::new(AtomicU64::new(0));
+
+        let before = active_traffic_len();
+        let task = TrafficFlushTask::start(&user, upload.clone(), download.clone());
+        assert_eq!(
+            active_traffic_len(),
+            before + 1,
+            "an authenticated connection must be visible to the sweeper"
+        );
+
+        // Closing must take it back out, or the sweeper would keep reporting
+        // for a connection that no longer exists -- the leak the per-connection
+        // task could not have.
+        upload.store(11, Ordering::Relaxed);
+        download.store(22, Ordering::Relaxed);
+        drop(task);
+        assert_eq!(active_traffic_len(), before);
+        assert_eq!(*recorder.traffic.lock(), (11, 22));
+
+        // A connection with no recorder is not registered at all.
+        let anonymous = TrafficFlushTask::start(
+            &None,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(active_traffic_len(), before);
+        drop(anonymous);
+    }
+
+    fn authenticated_user_with_tag(
+        node_tag: &str,
+        uid: u64,
+        speed_limit: Option<u64>,
+    ) -> Option<AuthenticatedUser> {
+        Some(AuthenticatedUser {
+            node_tag: node_tag.into(),
             uid,
             user_key: format!("user-{uid}"),
             speed_limit,
@@ -2545,7 +2817,7 @@ mod tests {
         recorder: Arc<dyn TrafficRecorder>,
     ) -> Option<AuthenticatedUser> {
         Some(AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
             uid,
             user_key: format!("user-{uid}"),
             speed_limit: None,
@@ -2593,6 +2865,44 @@ mod tests {
         assert_eq!(panel_speed_limit_to_bytes_per_sec(0), None);
         assert_eq!(panel_speed_limit_to_bytes_per_sec(1), Some(125_000));
         assert_eq!(panel_speed_limit_to_bytes_per_sec(100), Some(12_500_000));
+    }
+
+    #[test]
+    fn available_or_delay_waits_for_a_chunk_instead_of_dribbling_bytes() {
+        // 1 Mbps is the common panel limit; the bucket starts full.
+        let limiter = RateLimiter::new(125_000);
+        limiter.consume(250_000);
+
+        // A bucket holding a few bytes must ask the caller to wait rather than
+        // authorise a tiny read, which would spin one poll per handful of bytes.
+        limiter.state.lock().tokens = 64.0;
+        let delay = limiter
+            .available_or_delay(65_536)
+            .expect_err("a nearly-empty bucket must delay");
+        // Waiting for the 4 KiB floor at 125 kB/s is ~32ms, not the 1ms minimum.
+        assert!(delay >= Duration::from_millis(30), "delay was {delay:?}");
+
+        // Once a full chunk has accumulated the read is authorised.
+        limiter.state.lock().tokens = MIN_LIMITED_CHUNK_BYTES as f64;
+        assert_eq!(
+            limiter.available_or_delay(65_536).unwrap(),
+            MIN_LIMITED_CHUNK_BYTES
+        );
+    }
+
+    #[test]
+    fn available_or_delay_never_waits_past_the_request_or_bucket() {
+        // A request smaller than the chunk floor must not block on tokens the
+        // caller never asked for.
+        let limiter = RateLimiter::new(125_000);
+        limiter.state.lock().tokens = 16.0;
+        assert_eq!(limiter.available_or_delay(8).unwrap(), 8);
+
+        // A bucket whose capacity is below the floor must still make progress
+        // rather than wait forever for tokens it can never hold.
+        let tiny = RateLimiter::new(1);
+        assert!(tiny.state.lock().burst_bytes < MIN_LIMITED_CHUNK_BYTES as f64);
+        assert!(tiny.available_or_delay(65_536).is_ok());
     }
 
     #[test]
@@ -2672,6 +2982,29 @@ mod tests {
         assert!(limiters.shares_buckets_with(&cloned));
     }
 
+    #[test]
+    fn reconcile_speed_limiters_drops_users_absent_from_panel_list() {
+        let node_tag = "reconcile-test-node";
+        let users = vec![
+            authenticated_user_with_tag(node_tag, 7001, Some(2)),
+            authenticated_user_with_tag(node_tag, 7002, Some(3)),
+        ];
+        for user in &users {
+            assert!(speed_limiter_for(user).is_some());
+        }
+        assert_eq!(speed_limiter_map_len_for(node_tag), 2);
+
+        // A user removed from the panel leaves; the survivor stays.
+        let active: std::collections::HashSet<u64> = [7001u64].into_iter().collect();
+        reconcile_speed_limiters(node_tag, &active);
+        assert!(speed_limiter_map_contains(node_tag, 7001));
+        assert!(!speed_limiter_map_contains(node_tag, 7002));
+
+        // Reconciling with an empty list drains the node entirely.
+        reconcile_speed_limiters(node_tag, &std::collections::HashSet::new());
+        assert_eq!(speed_limiter_map_len_for(node_tag), 0);
+    }
+
     #[tokio::test]
     async fn speed_limited_stream_read_advances_caller_buffer() {
         let payload = b"GET /fast.bin HTTP/1.1\r\n\r\n".to_vec();
@@ -2739,7 +3072,7 @@ mod tests {
         let upload = Arc::new(AtomicU64::new(11));
         let download = Arc::new(AtomicU64::new(22));
         let user = Some(AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
             uid: 1003,
             user_key: "user-1003".to_string(),
             speed_limit: None,
@@ -2763,7 +3096,7 @@ mod tests {
         let upload = Arc::new(AtomicU64::new(0));
         let download = Arc::new(AtomicU64::new(0));
         let user = Some(AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
             uid: 1004,
             user_key: "user-1004".to_string(),
             speed_limit: None,
@@ -2876,7 +3209,7 @@ mod tests {
         let proxied_peer = "198.18.0.41:42441".parse::<SocketAddr>().unwrap();
         let kernel_peer = "127.0.0.1:50000".parse::<SocketAddr>().unwrap();
         let authenticated_user = Some(AuthenticatedUser {
-            node_tag: "node-a".to_string(),
+            node_tag: "node-a".into(),
             uid: 1004,
             user_key: "user-1004".to_string(),
             speed_limit: None,

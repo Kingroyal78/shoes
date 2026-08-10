@@ -39,6 +39,13 @@ impl InboundChannels {
 pub(super) struct ReceiveBudget {
     used: AtomicUsize,
     max: usize,
+    /// A budget every session on the listener also draws from.
+    ///
+    /// The per-session limit alone bounds nothing in aggregate: it is charged
+    /// once per physical session, so N concurrent sessions may queue N times
+    /// `max` bytes. Charging a shared parent as well puts a ceiling on the
+    /// listener as a whole.
+    parent: Option<Arc<ReceiveBudget>>,
 }
 
 impl ReceiveBudget {
@@ -46,21 +53,51 @@ impl ReceiveBudget {
         Self {
             used: AtomicUsize::new(0),
             max,
+            parent: None,
+        }
+    }
+
+    pub(super) fn with_parent(max: usize, parent: Option<Arc<ReceiveBudget>>) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            max,
+            parent,
+        }
+    }
+
+    fn charge(&self, length: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(length).filter(|next| *next <= self.max)
+            })
+            .is_ok()
+    }
+
+    fn refund(&self, count: usize) {
+        self.used.fetch_sub(count, Ordering::AcqRel);
+        if let Some(parent) = &self.parent {
+            parent.used.fetch_sub(count, Ordering::AcqRel);
         }
     }
 
     pub(super) fn track(self: &Arc<Self>, bytes: Vec<u8>) -> io::Result<InboundData> {
         let length = bytes.len();
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(length).filter(|next| *next <= self.max)
-            })
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "smux physical receive buffer limit exceeded",
-                )
-            })?;
+        if !self.charge(length) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "smux physical receive buffer limit exceeded",
+            ));
+        }
+        if let Some(parent) = &self.parent
+            && !parent.charge(length)
+        {
+            // Undo this session's charge only: the parent never took one.
+            self.used.fetch_sub(length, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "smux listener receive buffer limit exceeded",
+            ));
+        }
         Ok(InboundData {
             bytes,
             budget: Some(ReceiveBudgetPermit {
@@ -80,13 +117,13 @@ impl ReceiveBudgetPermit {
     fn release(&mut self, count: usize) {
         debug_assert!(count <= self.remaining);
         self.remaining -= count;
-        self.budget.used.fetch_sub(count, Ordering::AcqRel);
+        self.budget.refund(count);
     }
 }
 
 impl Drop for ReceiveBudgetPermit {
     fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.remaining, Ordering::AcqRel);
+        self.budget.refund(self.remaining);
     }
 }
 
@@ -228,11 +265,9 @@ enum BarrierState {
         permit: PermitFuture,
         complete_tx: Option<oneshot::Sender<io::Result<()>>>,
         complete_rx: oneshot::Receiver<io::Result<()>>,
-        timeout: Pin<Box<Sleep>>,
     },
     Waiting {
         complete_rx: oneshot::Receiver<io::Result<()>>,
-        timeout: Pin<Box<Sleep>>,
     },
 }
 
@@ -249,6 +284,13 @@ pub(super) struct VirtualStream {
     finish_permit: Option<PermitFuture>,
     finish_timeout: Option<Pin<Box<Sleep>>>,
     barrier: BarrierState,
+    /// Deadline for the barrier currently in flight, reused across barriers so
+    /// each flush does not allocate and register fresh timer entries.
+    barrier_timeout: Option<Pin<Box<Sleep>>>,
+    /// Whether any payload has been queued since the last completed barrier.
+    /// A flush with nothing outstanding is a no-op, so it must not pay for a
+    /// round trip through the session writer.
+    write_dirty: bool,
     max_frame_payload: usize,
     read_finished: bool,
     write_finished: bool,
@@ -275,6 +317,8 @@ impl VirtualStream {
             finish_permit: None,
             finish_timeout: None,
             barrier: BarrierState::Idle,
+            barrier_timeout: None,
+            write_dirty: false,
             max_frame_payload,
             read_finished: false,
             write_finished: false,
@@ -331,7 +375,43 @@ impl VirtualStream {
         })
     }
 
+    /// Arm the shared barrier deadline, reusing the existing timer entry.
+    ///
+    /// `Sleep::reset` re-uses one registration where a fresh `sleep()` would
+    /// allocate and insert another; a flush-heavy session performs this on
+    /// every barrier, and the timer wheel is process-wide and lock-guarded.
+    fn arm_barrier_timeout(&mut self) {
+        let deadline = tokio::time::Instant::now() + barrier_timeout();
+        match &mut self.barrier_timeout {
+            Some(timeout) => timeout.as_mut().reset(deadline),
+            None => self.barrier_timeout = Some(Box::pin(tokio::time::sleep_until(deadline))),
+        }
+    }
+
+    /// Poll the shared barrier deadline. Absent means the barrier just started
+    /// within this call and cannot have expired yet.
+    fn poll_barrier_timeout(&mut self, cx: &mut Context<'_>) -> bool {
+        match &mut self.barrier_timeout {
+            Some(timeout) => timeout.as_mut().poll(cx).is_ready(),
+            None => false,
+        }
+    }
+
+    fn finish_barrier(&mut self) {
+        self.barrier = BarrierState::Idle;
+        // Release the timer entry so an idle stream holds no wheel slot.
+        self.barrier_timeout = None;
+    }
+
     fn poll_barrier(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Nothing has been queued since the last barrier completed, so there is
+        // nothing for the session writer to push out. Skipping the round trip
+        // here is what keeps a per-poll flush from costing a channel reservation
+        // and two timer registrations.
+        if matches!(self.barrier, BarrierState::Idle) && !self.write_dirty {
+            return Poll::Ready(Ok(()));
+        }
+
         loop {
             match &mut self.barrier {
                 BarrierState::Idle => {
@@ -340,19 +420,18 @@ impl VirtualStream {
                         permit: Self::reserve(self.outbound.clone()),
                         complete_tx: Some(complete_tx),
                         complete_rx,
-                        timeout: Box::pin(tokio::time::sleep(barrier_timeout())),
                     };
+                    self.arm_barrier_timeout();
                 }
                 BarrierState::Reserving {
                     permit,
                     complete_tx,
-                    timeout,
                     ..
                 } => {
                     let permit = match permit.as_mut().poll(cx) {
                         Poll::Pending => {
-                            if timeout.as_mut().poll(cx).is_ready() {
-                                self.barrier = BarrierState::Idle;
+                            if self.poll_barrier_timeout(cx) {
+                                self.finish_barrier();
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
                                     "multiplexed stream flush barrier queue timed out",
@@ -362,7 +441,7 @@ impl VirtualStream {
                         }
                         Poll::Ready(Ok(permit)) => permit,
                         Poll::Ready(Err(error)) => {
-                            self.barrier = BarrierState::Idle;
+                            self.finish_barrier();
                             return Poll::Ready(Err(error));
                         }
                     };
@@ -375,22 +454,21 @@ impl VirtualStream {
                     else {
                         unreachable!()
                     };
-                    self.barrier = BarrierState::Waiting {
-                        complete_rx,
-                        timeout: Box::pin(tokio::time::sleep(barrier_timeout())),
-                    };
+                    // The deadline stays armed across the transition so the two
+                    // phases share one bound rather than restarting the clock.
+                    self.barrier = BarrierState::Waiting { complete_rx };
                 }
-                BarrierState::Waiting {
-                    complete_rx,
-                    timeout,
-                } => {
+                BarrierState::Waiting { complete_rx } => {
                     match Pin::new(complete_rx).poll(cx) {
                         Poll::Ready(Ok(result)) => {
-                            self.barrier = BarrierState::Idle;
+                            self.finish_barrier();
+                            // Everything queued before this barrier has reached
+                            // the physical stream.
+                            self.write_dirty = false;
                             return Poll::Ready(result);
                         }
                         Poll::Ready(Err(_)) => {
-                            self.barrier = BarrierState::Idle;
+                            self.finish_barrier();
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::BrokenPipe,
                                 "multiplexed session writer dropped a flush barrier",
@@ -398,8 +476,8 @@ impl VirtualStream {
                         }
                         Poll::Pending => {}
                     }
-                    if timeout.as_mut().poll(cx).is_ready() {
-                        self.barrier = BarrierState::Idle;
+                    if self.poll_barrier_timeout(cx) {
+                        self.finish_barrier();
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "multiplexed stream flush barrier timed out",
@@ -616,6 +694,8 @@ impl AsyncWrite for VirtualStream {
             v2.flow.record_write(length);
         }
         self.write_timeout = None;
+        // A later flush now has real work to wait for.
+        self.write_dirty = true;
         Poll::Ready(Ok(length))
     }
 
@@ -665,6 +745,9 @@ impl AsyncWrite for VirtualStream {
             });
             self.write_finished = true;
             self.drop_close_permit = None;
+            // The FIN itself must reach the peer, so the barrier below has to
+            // run even when no payload was queued since the last flush.
+            self.write_dirty = true;
         }
         self.poll_barrier(cx)
     }
@@ -701,6 +784,32 @@ impl Drop for VirtualStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sessions_share_the_listener_receive_budget() {
+        let listener = Arc::new(ReceiveBudget::new(12));
+        let first = Arc::new(ReceiveBudget::with_parent(8, Some(listener.clone())));
+        let second = Arc::new(ReceiveBudget::with_parent(8, Some(listener.clone())));
+
+        let held = first.track(vec![0_u8; 8]).expect("within both limits");
+        // The second session is well inside its own limit but the listener has
+        // only 4 bytes left, which is the ceiling that did not exist before.
+        let Err(error) = second.track(vec![0_u8; 8]) else {
+            panic!("the shared ceiling must apply across sessions");
+        };
+        assert!(error.to_string().contains("listener receive buffer"));
+        // A rejected charge must not leave the session's own budget consumed.
+        assert!(
+            second.track(vec![0_u8; 4]).is_ok(),
+            "the refused charge must be refunded to the session budget"
+        );
+
+        drop(held);
+        assert!(
+            second.track(vec![0_u8; 8]).is_ok(),
+            "freeing one session must free the shared listener budget"
+        );
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -802,6 +911,14 @@ mod tests {
             1024,
         );
 
+        // Only a stream with queued payload raises a barrier, so write first
+        // and drain the resulting data command.
+        stream.write_all(b"payload").await.unwrap();
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Data { .. })
+        ));
+
         let mut flush = Box::pin(stream.flush());
         match futures::future::poll_fn(|cx| flush.as_mut().poll(cx)).await {
             Ok(()) => panic!("flush barrier completed without a writer"),
@@ -810,6 +927,47 @@ mod tests {
             }
         }
 
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Barrier { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn flush_without_queued_writes_skips_the_barrier() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_terminal_tx, terminal_rx) = oneshot::channel();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        let mut stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            1024,
+        );
+
+        // A flush with nothing outstanding must complete without a round trip
+        // through the session writer: the copy loop flushes on every poll, and
+        // paying a channel reservation plus timer registrations each time is
+        // what saturated the runtime's timer wheel.
+        tokio::time::timeout(std::time::Duration::from_millis(100), stream.flush())
+            .await
+            .expect("no-op flush must not block")
+            .expect("no-op flush must succeed");
+        assert!(outbound_rx.try_recv().is_err(), "no command should be sent");
+
+        // After a write, the flush does raise a barrier again.
+        stream.write_all(b"payload").await.unwrap();
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Data { .. })
+        ));
+        let mut flush = Box::pin(stream.flush());
+        let _ = futures::future::poll_fn(|cx| {
+            let poll = flush.as_mut().poll(cx);
+            // Drive it once; the barrier is queued but never completed here.
+            Poll::Ready(poll)
+        })
+        .await;
         assert!(matches!(
             outbound_rx.recv().await,
             Some(OutboundCommand::Barrier { .. })
@@ -834,6 +992,10 @@ mod tests {
             outbound_tx,
             1024,
         );
+        // The queue is already full, so a real write cannot be issued here;
+        // mark the stream as having queued payload so the flush raises a
+        // barrier and exercises the blocked-reservation timeout.
+        stream.write_dirty = true;
 
         let error = tokio::time::timeout(std::time::Duration::from_millis(100), stream.flush())
             .await

@@ -27,6 +27,7 @@ use crate::h2mux::PrependStream;
 use crate::protocol_sniff::sniff_tcp_protocol;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
+use crate::shared_users::SharedUsers;
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
 use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
@@ -104,7 +105,7 @@ impl AsyncStream for HyperUpgradedStream {}
 
 /// Service configuration for hyper NaiveProxy handler
 pub(super) struct NaiveServiceConfig {
-    pub(super) users: Arc<UserLookup>,
+    pub(super) users: Arc<SharedUsers<UserLookup>>,
     pub(super) fallback_path: Option<PathBuf>,
     pub(super) resolver: Arc<dyn Resolver>,
     pub(super) proxy_selector: Arc<ClientProxySelector>,
@@ -258,8 +259,11 @@ async fn naive_service(
 
     let has_padding = req.headers().get("padding").is_some();
 
+    // Borrow the table only for validation, copying out this user's identity;
+    // see `SharedUsers` for why the borrow must not outlive the handshake.
+    let users = config.users.load();
     let validated_user = match req.headers().get("proxy-authorization") {
-        Some(auth) => match auth.to_str().ok().and_then(|s| config.users.validate(s)) {
+        Some(auth) => match auth.to_str().ok().and_then(|s| users.validate(s)) {
             Some(user) => user,
             None => {
                 debug!("NaiveProxy: invalid credentials, returning 400");

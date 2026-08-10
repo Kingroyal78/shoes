@@ -241,6 +241,7 @@ pub fn smux_session_handler(
                 max_stream_buffer: config.stream_buffer as usize,
                 keepalive_interval: Some(keepalive_interval),
                 keepalive_timeout: Some(keepalive_interval.saturating_mul(3)),
+                ..SmuxServerConfig::default()
             },
         )),
     }))

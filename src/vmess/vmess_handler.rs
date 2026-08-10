@@ -25,6 +25,7 @@ use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
+use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpClientHandler, TcpClientSetupResult, TcpServerHandler,
@@ -63,9 +64,52 @@ impl From<&str> for DataCipher {
     }
 }
 
+/// The user set of a VMess listener.
+///
+/// VMess AEAD carries no user identifier the server can index on: the request
+/// id is encrypted with a key derived from the user's own uuid, so the server
+/// must try each user's key in turn. The table is therefore a plain list, and
+/// authentication cost grows with the user count -- a property of the protocol,
+/// not of this table.
+#[derive(Default)]
+pub struct VmessUsers {
+    users: Vec<VmessServerUser>,
+}
+
+impl VmessUsers {
+    pub fn new(users: Vec<ServerUser>) -> Self {
+        Self {
+            users: users
+                .into_iter()
+                .map(|user| {
+                    create_vmess_server_user(&user.credential, Some(user.authenticated_user))
+                })
+                .collect(),
+        }
+    }
+
+    fn single(user_id: &str) -> Self {
+        Self {
+            users: vec![create_vmess_server_user(user_id, None)],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.users.len()
+    }
+}
+
+impl std::fmt::Debug for VmessUsers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessUsers")
+            .field("user_count", &self.users.len())
+            .finish()
+    }
+}
+
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
-    users: Vec<VmessServerUser>,
+    users: Arc<SharedUsers<VmessUsers>>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -94,7 +138,7 @@ impl std::fmt::Debug for VmessTcpServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmessTcpServerHandler")
             .field("data_cipher", &self.data_cipher)
-            .field("user_count", &self.users.len())
+            .field("user_count", &self.users.load().len())
             .field("udp_enabled", &self.udp_enabled)
             .finish_non_exhaustive()
     }
@@ -110,7 +154,7 @@ impl VmessTcpServerHandler {
     ) -> Self {
         Self {
             data_cipher: cipher_name.into(),
-            users: vec![create_vmess_server_user(user_id, None)],
+            users: SharedUsers::new(VmessUsers::single(user_id)),
             udp_enabled,
             proxy_selector,
             resolver,
@@ -120,19 +164,14 @@ impl VmessTcpServerHandler {
 
     pub fn new_multi(
         cipher_name: &str,
-        users: Vec<ServerUser>,
+        users: Arc<SharedUsers<VmessUsers>>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         Self {
             data_cipher: cipher_name.into(),
-            users: users
-                .into_iter()
-                .map(|user| {
-                    create_vmess_server_user(&user.credential, Some(user.authenticated_user))
-                })
-                .collect(),
+            users,
             udp_enabled,
             proxy_selector,
             resolver,
@@ -179,7 +218,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
         aead_bytes.copy_from_slice(&cert_hash);
 
         let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        let matched_user = self.users.iter().find_map(|user| {
+        // Borrowed for the probe loop only; see `SharedUsers`.
+        let users = self.users.load();
+        let matched_user = users.users.iter().find_map(|user| {
             let mut candidate = aead_bytes;
             if user
                 .aead_decrypting_key

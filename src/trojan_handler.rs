@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
 use futures::ready;
 use log::debug;
-use subtle::ConstantTimeEq;
+use rustc_hash::FxHashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::address::{Address, NetLocationMask, ResolvedLocation};
@@ -23,6 +23,7 @@ use crate::resolver::Resolver;
 use crate::shadowsocks::{
     DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
+use crate::shared_users::SharedUsers;
 use crate::slide_buffer::SlideBuffer;
 #[cfg(test)]
 use crate::socks_handler::write_location_to_vec;
@@ -43,9 +44,45 @@ struct ShadowsocksData {
     key: Arc<Box<dyn ShadowsocksKey>>,
 }
 
+/// The user set of a Trojan listener, indexed by the password hash the client
+/// sends. A linear scan would cost one comparison per user on every
+/// connection, which does not hold at node sizes in the millions. Hashing the
+/// full 56-byte hash is not a timing oracle: the lookup either finds an exact
+/// entry or none.
+#[derive(Debug, Default)]
+pub struct TrojanUsers {
+    by_password_hash: FxHashMap<Box<[u8]>, Option<AuthenticatedUser>>,
+}
+
+impl TrojanUsers {
+    pub fn new(users: Vec<ServerUser>) -> Self {
+        Self {
+            by_password_hash: users
+                .into_iter()
+                .map(|user| {
+                    (
+                        create_password_hash(&user.credential),
+                        Some(user.authenticated_user),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn get(&self, password_hash: &[u8]) -> Option<&Option<AuthenticatedUser>> {
+        self.by_password_hash.get(password_hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_password_hash.len()
+    }
+}
+
 #[derive(Debug)]
 pub struct TrojanTcpHandler {
-    users: Vec<(Box<[u8]>, Option<AuthenticatedUser>)>,
+    users: Arc<SharedUsers<TrojanUsers>>,
+    /// The hash this handler sends when used as a client.
+    client_password_hash: Box<[u8]>,
     shadowsocks_data: Option<ShadowsocksData>,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
@@ -592,7 +629,7 @@ impl TrojanTcpHandler {
     }
 
     pub fn new_multi_server(
-        users: Vec<ServerUser>,
+        users: Arc<SharedUsers<TrojanUsers>>,
         shadowsocks_config: &Option<ShadowsocksConfig>,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
@@ -605,15 +642,7 @@ impl TrojanTcpHandler {
             Some(resolver),
             fallback,
         );
-        handler.users = users
-            .into_iter()
-            .map(|user| {
-                (
-                    create_password_hash(&user.credential),
-                    Some(user.authenticated_user),
-                )
-            })
-            .collect();
+        handler.users = users;
         handler
     }
 
@@ -655,7 +684,10 @@ impl TrojanTcpHandler {
         };
 
         Self {
-            users: vec![(password_hash, None)],
+            users: SharedUsers::new(TrojanUsers {
+                by_password_hash: std::iter::once((password_hash.clone(), None)).collect(),
+            }),
+            client_password_hash: password_hash,
             shadowsocks_data,
             proxy_selector,
             resolver,
@@ -682,14 +714,8 @@ impl TrojanTcpHandler {
             )));
         }
 
-        // Use constant-time comparison to prevent timing attacks.
-        let authenticated_user = self.users.iter().find_map(|(password_hash, auth)| {
-            if password_hash.ct_eq(received_hash).unwrap_u8() == 1 {
-                Some(auth.clone())
-            } else {
-                None
-            }
-        });
+        // Borrowed for the lookup only; see `SharedUsers`.
+        let authenticated_user = self.users.load().get(received_hash).cloned();
         if authenticated_user.is_none() {
             return Err(std::io::Error::other("Invalid password hash"));
         }
@@ -877,7 +903,7 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        let password_hash = &self.users[0].0;
+        let password_hash = &self.client_password_hash;
         let mut request = Vec::with_capacity(
             password_hash.len()
                 + CRLF_BYTES.len()
@@ -923,7 +949,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         }
 
         let target = target.into_location();
-        let password_hash = &self.users[0].0;
+        let password_hash = &self.client_password_hash;
         let mut request = Vec::with_capacity(
             password_hash.len()
                 + CRLF_BYTES.len()

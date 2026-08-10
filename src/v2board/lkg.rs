@@ -11,8 +11,6 @@ use super::plugin_api::{OpaqueEtag, PluginConfigCandidate};
 use super::types::{ServerConfig, UserInfo};
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
-const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLkgSnapshot {
@@ -106,13 +104,22 @@ pub async fn load(
     node: &V2BoardNodeConfig,
 ) -> std::io::Result<Option<NodeLkgSnapshot>> {
     let path = snapshot_path(data_dir, node);
-    match tokio::fs::metadata(&path).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let (path, legacy) = match tokio::fs::metadata(&path).await {
+        Ok(_) => (path, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Fall back to the pre-MessagePack file so an upgrade does not
+            // throw away the recovery point the previous build wrote.
+            let legacy = legacy_snapshot_path(data_dir, node);
+            match tokio::fs::metadata(&legacy).await {
+                Ok(_) => (legacy, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
         Err(error) => return Err(error),
-    }
+    };
     let node = node.clone();
-    tokio::task::spawn_blocking(move || load_blocking(&path, &node))
+    tokio::task::spawn_blocking(move || load_blocking(&path, &node, legacy))
         .await
         .map_err(|error| std::io::Error::other(format!("LKG load task failed: {error}")))?
         .map(Some)
@@ -121,32 +128,47 @@ pub async fn load(
 pub async fn persist(
     data_dir: &Path,
     node: &V2BoardNodeConfig,
-    snapshot: &NodeLkgSnapshot,
+    snapshot: NodeLkgSnapshot,
 ) -> std::io::Result<()> {
     tokio::fs::create_dir_all(data_dir).await?;
     let path = snapshot_path(data_dir, node);
-    let bytes = serde_json::to_vec(snapshot)
-        .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
-    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-        return Err(invalid_data("last-known-good snapshot exceeds size limit"));
-    }
-    tokio::task::spawn_blocking(move || persist_blocking(&path, &bytes))
-        .await
-        .map_err(|error| std::io::Error::other(format!("LKG persist task failed: {error}")))?
+    // Encode on the blocking pool alongside the write, not before it. On a node
+    // with a large user list this is a long stretch of pure CPU, and it used to
+    // run on whichever runtime worker was driving this node's sync -- stalling
+    // every connection that worker was also driving.
+    tokio::task::spawn_blocking(move || {
+        // Named MessagePack: markedly smaller and faster to encode than JSON on
+        // a payload that scales with the user count, without the brittleness of
+        // a positional encoding for a file a later build has to read back.
+        let bytes = rmp_serde::to_vec_named(&snapshot)
+            .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
+        persist_blocking(&path, &bytes)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("LKG persist task failed: {error}")))?
 }
 
-fn load_blocking(path: &Path, node: &V2BoardNodeConfig) -> std::io::Result<NodeLkgSnapshot> {
+fn load_blocking(
+    path: &Path,
+    node: &V2BoardNodeConfig,
+    legacy: bool,
+) -> std::io::Result<NodeLkgSnapshot> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_SNAPSHOT_BYTES {
+    // Deliberately unbounded in length. The snapshot is this process's own
+    // recovery point, and its size is whatever the panel's user list makes it;
+    // a fixed ceiling only ever rejects legitimate data, and rejecting it here
+    // rolls the ETags back and puts the node into a permanent full-refetch loop.
+    // The file-type check stays: a FIFO or directory at this path is a real
+    // problem, and reading one would block rather than fail.
+    if !metadata.is_file() {
         return Err(invalid_data(
-            "last-known-good snapshot is not a bounded regular file",
+            "last-known-good snapshot is not a regular file",
         ));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)?;
-    let snapshot = serde_json::from_slice::<NodeLkgSnapshot>(&bytes)
-        .map_err(|error| invalid_data(format!("failed to decode LKG snapshot: {error}")))?;
+    let snapshot = decode_snapshot(&bytes, legacy)?;
     snapshot.validate_for(node)?;
     Ok(snapshot)
 }
@@ -159,7 +181,7 @@ fn persist_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid_data("LKG snapshot path is not valid UTF-8"))?;
-    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", super::writer_id()));
     match std::fs::remove_file(&temporary) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -194,10 +216,37 @@ fn persist_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn snapshot_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
     data_dir.join(format!(
+        "v2board-lkg-{}-{}.mpk",
+        node.node_type.as_uniproxy(),
+        node.node_id
+    ))
+}
+
+/// Where snapshots were written before the encoding changed.
+///
+/// Read-only: a node that restarts onto this build still recovers from the file
+/// its previous build left behind, and writes the new one from then on.
+fn legacy_snapshot_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
+    data_dir.join(format!(
         "v2board-lkg-{}-{}.json",
         node.node_type.as_uniproxy(),
         node.node_id
     ))
+}
+
+/// Decode a snapshot, accepting either encoding.
+///
+/// MessagePack with field names kept (`to_vec_named`), not positional: the
+/// snapshot is a recovery point read back by a possibly newer build, and
+/// positional encoding would silently misread a struct whose fields moved.
+fn decode_snapshot(bytes: &[u8], legacy: bool) -> std::io::Result<NodeLkgSnapshot> {
+    if legacy {
+        serde_json::from_slice::<NodeLkgSnapshot>(bytes)
+            .map_err(|error| invalid_data(format!("failed to decode LKG snapshot: {error}")))
+    } else {
+        rmp_serde::from_slice::<NodeLkgSnapshot>(bytes)
+            .map_err(|error| invalid_data(format!("failed to decode LKG snapshot: {error}")))
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> std::io::Error {
@@ -226,7 +275,7 @@ mod tests {
         };
         assert_eq!(
             snapshot_path(Path::new("/state"), &node),
-            Path::new("/state/v2board-lkg-shadowsocks-42.json")
+            Path::new("/state/v2board-lkg-shadowsocks-42.mpk")
         );
     }
 
@@ -264,7 +313,7 @@ mod tests {
             None,
         )
         .unwrap();
-        persist(directory.path(), &node, &snapshot).await.unwrap();
+        persist(directory.path(), &node, snapshot).await.unwrap();
         let loaded = load(directory.path(), &node).await.unwrap().unwrap();
         assert_eq!(loaded.server_config.server_port, 8443);
         assert_eq!(loaded.users[0].id, 11);
@@ -279,6 +328,117 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_written_by_the_previous_encoding_is_still_recovered() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "legacy".to_string(),
+            node_id: 21,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let server_config =
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 8443})).unwrap();
+        let users = vec![
+            serde_json::from_value::<UserInfo>(json!({
+                "id": 5,
+                "uuid": "00000000-0000-0000-0000-000000000005"
+            }))
+            .unwrap(),
+        ];
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            Some("etag".to_string()),
+            Some("etag".to_string()),
+            server_config,
+            users,
+            None,
+        )
+        .unwrap();
+
+        // Write only the pre-MessagePack file, as an older build would have.
+        std::fs::write(
+            legacy_snapshot_path(directory.path(), &node),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(directory.path(), &node)
+            .await
+            .unwrap()
+            .expect("an upgrade must not discard the recovery point on disk");
+        assert_eq!(loaded.users[0].id, 5);
+        assert_eq!(loaded.server_config.server_port, 8443);
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_past_the_old_thirty_two_megabyte_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "big".to_string(),
+            node_id: 99,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let server_config =
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 8443})).unwrap();
+        // Comfortably past the ceiling this used to carry: at the ~262 bytes a
+        // user costs on the wire, a node this size is ordinary, and refusing to
+        // write its snapshot rolled the ETags back and put the node into a
+        // permanent full-refetch loop rather than merely being slow.
+        // Past 32 MiB at the ~59 bytes a user costs once empty fields are
+        // skipped. Cloned from one template rather than parsed individually,
+        // so the test spends its time on the persist path and not on serde.
+        let template = serde_json::from_value::<UserInfo>(json!({
+            "id": 0,
+            "uuid": "00000000-0000-0000-0000-000000000000",
+        }))
+        .unwrap();
+        let users = (0..700_000_u64)
+            .map(|id| UserInfo {
+                id,
+                uuid: Some(format!("00000000-0000-0000-0000-{id:012}")),
+                ..template.clone()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            Some("server-etag".to_string()),
+            Some("user-etag".to_string()),
+            server_config,
+            users,
+            None,
+        )
+        .unwrap();
+
+        persist(directory.path(), &node, snapshot).await.unwrap();
+        let written = std::fs::metadata(snapshot_path(directory.path(), &node))
+            .unwrap()
+            .len();
+        assert!(
+            written > 32 * 1024 * 1024,
+            "test must exercise a snapshot past the old limit, got {written} bytes"
+        );
+
+        let loaded = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(loaded.users.len(), 700_000);
+        assert_eq!(loaded.users[699_999].id, 699_999);
     }
 
     #[tokio::test]
@@ -357,7 +517,7 @@ mod tests {
             Some(&candidate),
         )
         .unwrap();
-        persist(directory.path(), &node, &snapshot).await.unwrap();
+        persist(directory.path(), &node, snapshot).await.unwrap();
 
         let restored = load(directory.path(), &node).await.unwrap().unwrap();
         let restored_candidate = restored.plugin_candidate(&node).unwrap().unwrap();

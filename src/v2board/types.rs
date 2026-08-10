@@ -133,35 +133,46 @@ impl<'de> Deserialize<'de> for UserList {
     }
 }
 
+/// One user as the panel publishes them.
+///
+/// The optional fields are skipped when empty rather than written as nulls.
+/// They are only ever serialized into the last-known-good snapshot, and a
+/// typical user sets two of the fifteen -- the nulls were four fifths of a
+/// snapshot that gets rewritten on every pull. Deserialization is unaffected:
+/// every one of them already defaults when absent.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct UserInfo {
     #[serde(alias = "uid")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
-    #[serde(default, alias = "link_secret")]
+    #[serde(
+        default,
+        alias = "link_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub secret: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_limit: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_limit: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_on: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ips: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
 }
 

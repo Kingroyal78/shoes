@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -41,6 +42,41 @@ use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 /// Timeout for inactive sessions
 const SESSION_TIMEOUT_SECS: u64 = 200;
 
+/// How long a router with nothing left to do waits before giving up.
+///
+/// Completion otherwise requires the server read side to end, so a peer that
+/// neither sends nor closes -- a backgrounded client, a multiplexed logical
+/// stream whose physical connection is kept alive by its siblings -- parks the
+/// router on `Poll::Pending` for the lifetime of the process. That retains the
+/// task, its 64 KiB buffer pools, the transport, and (because the router runs
+/// inside the connection task) the caller's `AliveIpGuard`, so the user's
+/// device-limit slot is never released either.
+///
+/// The timer only runs while [`UdpRouter::is_drained`] holds, which means no
+/// sessions, no in-flight creates and no queued work: a router that is actually
+/// relaying can never be terminated by it. Sessions expire first
+/// (`SESSION_TIMEOUT_SECS`), so a silent association is reclaimed after roughly
+/// the sum of the two -- comparable to an ordinary NAT mapping timeout.
+const DRAINED_IDLE_TIMEOUT_SECS: u64 = 120;
+
+fn drained_idle_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_secs(DRAINED_IDLE_TIMEOUT_SECS)
+    }
+}
+
+/// Upper bound on concurrent sessions in one router.
+///
+/// A session is one outbound UDP socket, held for up to `SESSION_TIMEOUT_SECS`.
+/// `MAX_PENDING_CREATES` only bounds how many may be created at once, not how
+/// many may exist, so without this a single association can accumulate sockets
+/// for as many distinct destinations as its peer cares to name. Eviction is
+/// least-recently-active, the same policy a NAT table uses when it runs out of
+/// room: the flows still carrying traffic are the ones that survive.
+const MAX_SESSIONS: usize = 1024;
+
 /// Grace period for flushing a removed session before dropping its transport.
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,11 +100,17 @@ const REMOTE_WRITE_POOL_SIZE: usize = 8;
 /// Buffer pool size for inbound (remote → server) - all go to same writer
 const SERVER_WRITE_POOL_SIZE: usize = 8;
 
+/// Keep one allocation hot after a backpressure burst instead of retaining the full pool.
+const IDLE_BUFFER_POOL_SIZE: usize = 1;
+
 /// Max pending remote writes per session (prevents one slow session from starving others)
 const MAX_PENDING_REMOTE_WRITES_PER_SESSION: usize = 4;
 
 /// Max pending server writes per session (prevents one chatty session from starving others)
 const MAX_PENDING_SERVER_WRITES_PER_SESSION: usize = 4;
+
+/// How long one session creation (resolve, route, dial) may take.
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max concurrent session creation attempts (limits resource usage under burst)
 const MAX_PENDING_CREATES: usize = 16;
@@ -81,6 +123,17 @@ const PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Session identifier - incrementing counter, never reused
 type SessionKey = usize;
+
+/// Live [`UdpRouter`] instances. Diagnostic counter: a UDP router owns a
+/// multiplexed logical stream that holds no file descriptor, so a router that
+/// never finishes is invisible in socket counts and only shows up as heap
+/// growth.
+pub static LIVE_UDP_ROUTERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Live [`UdpRouter`] instances whose server read side has already ended.
+/// A number that keeps climbing here means half-closed streams are not being
+/// reclaimed.
+pub static LIVE_UDP_ROUTERS_READ_EOF: AtomicUsize = AtomicUsize::new(0);
 
 /// Lazy buffer pool for backpressure management.
 ///
@@ -121,6 +174,13 @@ impl BufferPool {
     #[inline]
     fn release(&mut self, buf: Box<[u8]>) {
         self.buffers.push(buf);
+    }
+
+    #[inline]
+    fn trim_idle(&mut self, max_idle: usize) {
+        let released = self.buffers.len().saturating_sub(max_idle);
+        self.buffers.truncate(max_idle);
+        self.created_count -= released;
     }
 
     #[inline]
@@ -193,6 +253,10 @@ struct RoutingSession {
     /// Last time we wrote to the remote (for ping decisions)
     last_write: Instant,
 
+    /// Last traffic in either direction, maintained alongside the expiry timer.
+    /// Used to pick a victim when the session cap is reached.
+    last_active: Instant,
+
     /// Last iteration when expiry was reset (to avoid redundant resets)
     last_expiry_iteration: usize,
 }
@@ -218,6 +282,7 @@ impl RoutingSession {
             remote_read_eof: false,
             remote_write_eof: false,
             last_write: Instant::now(),
+            last_active: Instant::now(),
             last_expiry_iteration: 0,
         }
     }
@@ -240,6 +305,9 @@ impl RoutingSession {
             return; // Already reset this iteration
         }
         self.last_expiry_iteration = iteration;
+        // Same set of events that keeps the session alive also orders it for
+        // cap eviction, so the two can never disagree about what "idle" means.
+        self.last_active = Instant::now();
 
         // Use reset() which is more efficient than remove() + insert()
         // as it reuses the same slab entry and key
@@ -439,6 +507,9 @@ pub struct UdpRouter<'a> {
     ping_timer: tokio::time::Interval,
     expiry_iteration: usize,
 
+    /// Runs only while the router is drained; see [`DRAINED_IDLE_TIMEOUT_SECS`].
+    drained_since: Option<Pin<Box<Sleep>>>,
+
     last_server_write: Instant,
 
     selector: Arc<ClientProxySelector>,
@@ -455,6 +526,8 @@ impl<'a> UdpRouter<'a> {
         resolver: Arc<dyn Resolver>,
         need_initial_flush: bool,
     ) -> Self {
+        LIVE_UDP_ROUTERS.fetch_add(1, Ordering::Relaxed);
+
         let session_lookup = match server {
             ServerStream::Targeted(_) => SessionLookup::ByDestination(FxHashMap::default()),
             ServerStream::Session(_) => SessionLookup::BySessionId(FxHashMap::default()),
@@ -481,6 +554,7 @@ impl<'a> UdpRouter<'a> {
             expiry_queue: DelayQueue::new(),
             ping_timer: tokio::time::interval(PING_CHECK_INTERVAL),
             expiry_iteration: 0,
+            drained_since: None,
             last_server_write: Instant::now(),
             selector,
             outbound_dispatcher,
@@ -497,22 +571,45 @@ impl<'a> UdpRouter<'a> {
         }
 
         self.server_read_eof = true;
+        LIVE_UDP_ROUTERS_READ_EOF.fetch_add(1, Ordering::Relaxed);
 
-        // Clean up pending creates - remove lookup entries and drop futures
-        // TODO: is this correct? what if the user wanted to send a single packet and closed their
-        // connection?
-        for pending in self.pending_creates.drain(..) {
-            match (&mut self.session_lookup, pending.lookup_key) {
-                (SessionLookup::ByDestination(map), LookupKey::Destination(dest)) => {
-                    map.remove(&dest);
-                }
-                (SessionLookup::BySessionId(map), LookupKey::SessionId(id)) => {
-                    map.remove(&id);
-                }
-                _ => unreachable!(),
-            }
-            // Future and initial_data are dropped
-        }
+        // In-flight session creates are deliberately left alone.
+        //
+        // Dropping them here also dropped their `initial_data`, which loses the
+        // packet whenever a client sends one datagram and immediately half-closes
+        // -- a one-shot DNS query over UDP-over-TCP is exactly that shape, and
+        // the client sees a timeout rather than an answer. `poll_outbound` polls
+        // pending creates before it consults `server_read_eof`, so they still run
+        // to completion and deliver their first packet.
+        //
+        // Letting them survive is only safe because `is_drained` accounts for
+        // them: the router finishes once they have completed and their sessions
+        // have drained, instead of waiting on a read side that has already ended.
+    }
+
+    /// Whether anything is left that could still write to the server stream.
+    ///
+    /// Once the server read side is done, the only remaining source of server
+    /// writes is a live session relaying a remote response. When no sessions
+    /// (or in-flight creates) remain and every queue has drained, nothing can
+    /// ever write to the server again, so the router has finished.
+    ///
+    /// This is what actually reclaims a half-closed UDP stream.
+    /// `server_write_eof` is only ever set by a *failed* write or flush, so a
+    /// router whose sessions have all expired never sets it -- it has nothing
+    /// left to write, and therefore nothing left to fail. Without this check
+    /// such a router parks on `Poll::Pending` forever, leaking its task, its
+    /// transport (a multiplexed logical stream holds no fd, so the leak is
+    /// invisible in socket counts) and its 64 KiB packet buffers.
+    #[inline]
+    fn is_drained(&self) -> bool {
+        self.sessions.is_empty()
+            && self.pending_creates.is_empty()
+            && self.remote_write_queue.is_empty()
+            && self.remote_flush_queue.is_empty()
+            && self.server_write_queue.is_empty()
+            && self.pending_shutdowns.is_empty()
+            && !self.needs_server_flush
     }
 
     /// Set server write EOF and clean up server write queue.
@@ -1034,6 +1131,9 @@ impl<'a> UdpRouter<'a> {
                         }
                     }
                 }
+                if self.sessions.len() >= MAX_SESSIONS {
+                    self.evict_least_recently_active();
+                }
                 self.sessions.insert(id, session);
                 true
             }
@@ -1096,45 +1196,60 @@ impl<'a> UdpRouter<'a> {
         let outbound_dispatcher = self.outbound_dispatcher.clone();
 
         let future: SessionCreateFuture = Box::pin(async move {
-            let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
-            // Create ResolvedLocation with pre-resolved address
-            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
-            let decision = selector
-                .judge_with_protocol(resolved_location.clone(), &resolver, sniffed_protocol)
-                .await?;
+            let create = async move {
+                let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
+                // Create ResolvedLocation with pre-resolved address
+                let resolved_location =
+                    ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
+                let decision = selector
+                    .judge_with_protocol(resolved_location.clone(), &resolver, sniffed_protocol)
+                    .await?;
 
-            match decision {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location,
-                } => {
-                    let client_stream = match &outbound_dispatcher {
-                        Some(dispatcher) => {
-                            dispatcher
-                                .connect_udp_bidirectional(
-                                    &remote_location,
-                                    sniffed_protocol,
-                                    &resolver,
-                                )
-                                .await?
-                        }
-                        None => {
-                            chain_group
-                                .connect_udp_bidirectional(&resolver, remote_location)
-                                .await?
-                        }
-                    };
+                match decision {
+                    ConnectDecision::Allow {
+                        chain_group,
+                        remote_location,
+                    } => {
+                        let client_stream = match &outbound_dispatcher {
+                            Some(dispatcher) => {
+                                dispatcher
+                                    .connect_udp_bidirectional(
+                                        &remote_location,
+                                        sniffed_protocol,
+                                        &resolver,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                chain_group
+                                    .connect_udp_bidirectional(&resolver, remote_location)
+                                    .await?
+                            }
+                        };
 
-                    Ok(SessionCreateResult {
-                        remote: client_stream,
-                        resolved_addr,
-                    })
+                        Ok(SessionCreateResult {
+                            remote: client_stream,
+                            resolved_addr,
+                        })
+                    }
+                    ConnectDecision::Block => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Destination blocked by routing rules",
+                    )),
                 }
-                ConnectDecision::Block => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Destination blocked by routing rules",
-                )),
-            }
+            };
+            // A create holds the router open -- `is_drained` counts in-flight
+            // creates -- so an unbounded one would park it exactly the way a
+            // missing idle timeout does. Neither the DNS lookup nor a proxied
+            // dial is guaranteed to be bounded on its own.
+            tokio::time::timeout(SESSION_CREATE_TIMEOUT, create)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "UDP session creation timed out",
+                    ))
+                })
         });
 
         let index = self.pending_creates.len();
@@ -1176,6 +1291,26 @@ impl<'a> UdpRouter<'a> {
         // Queue remote stream for graceful shutdown
         self.pending_shutdowns
             .push_back(PendingShutdown::new(session.remote));
+    }
+
+    /// Drop the session that has gone longest without traffic, to make room
+    /// under [`MAX_SESSIONS`].
+    ///
+    /// Linear in the number of sessions, but only runs once the cap is already
+    /// reached, and the cap exists precisely to keep that number small.
+    fn evict_least_recently_active(&mut self) {
+        let Some((&victim, _)) = self
+            .sessions
+            .iter()
+            .min_by_key(|(_, session)| session.last_active)
+        else {
+            return;
+        };
+        debug!(
+            "Session cap reached, evicting least recently active: {}",
+            self.sessions[&victim].destination
+        );
+        self.remove_session(victim);
     }
 
     /// Process expired sessions
@@ -1258,6 +1393,15 @@ impl<'a> UdpRouter<'a> {
     }
 }
 
+impl Drop for UdpRouter<'_> {
+    fn drop(&mut self) {
+        LIVE_UDP_ROUTERS.fetch_sub(1, Ordering::Relaxed);
+        if self.server_read_eof {
+            LIVE_UDP_ROUTERS_READ_EOF.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl<'a> Future for UdpRouter<'a> {
     type Output = io::Result<()>;
 
@@ -1282,11 +1426,36 @@ impl<'a> Future for UdpRouter<'a> {
 
         this.drain_remote_shutdowns(cx);
 
-        if this.server_read_eof && this.server_write_eof {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+        if this.remote_write_queue.is_empty() {
+            this.remote_write_pool.trim_idle(IDLE_BUFFER_POOL_SIZE);
         }
+        if this.server_write_queue.is_empty() {
+            this.server_write_pool.trim_idle(IDLE_BUFFER_POOL_SIZE);
+        }
+
+        let drained = this.is_drained();
+
+        if this.server_read_eof && (this.server_write_eof || drained) {
+            return Poll::Ready(Ok(()));
+        }
+
+        // The peer has not closed, but there is nothing left that could produce
+        // work either. Give it a bounded grace period rather than parking
+        // forever; see `DRAINED_IDLE_TIMEOUT_SECS`. Anything that creates a
+        // session or queues a write clears the timer on the next poll.
+        if drained {
+            let idle = this
+                .drained_since
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(drained_idle_timeout())));
+            if idle.as_mut().poll(cx).is_ready() {
+                debug!("UDP router idle with no sessions, finishing");
+                return Poll::Ready(Ok(()));
+            }
+        } else {
+            this.drained_since = None;
+        }
+
+        Poll::Pending
     }
 }
 
@@ -1466,6 +1635,246 @@ mod tests {
 
     impl AsyncMessageStream for PendingMessageStream {}
 
+    /// A server stream that reports EOF immediately and never fails a write.
+    ///
+    /// This is the shape of a half-closed multiplexed UDP stream: the peer is
+    /// done sending, but writing still "succeeds", so nothing ever sets
+    /// `server_write_eof`.
+    struct HalfClosedTargetedStream;
+
+    impl AsyncReadTargetedMessage for HalfClosedTargetedStream {
+        fn poll_read_targeted_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<NetLocation>> {
+            // Zero bytes filled with an unspecified destination is the EOF
+            // signal for targeted streams.
+            Poll::Ready(Ok(NetLocation::UNSPECIFIED))
+        }
+    }
+
+    impl AsyncWriteSourcedMessage for HalfClosedTargetedStream {
+        fn poll_write_sourced_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+            _source: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for HalfClosedTargetedStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for HalfClosedTargetedStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for HalfClosedTargetedStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncTargetedMessageStream for HalfClosedTargetedStream {}
+
+    /// A server stream whose peer neither sends nor closes: reads park, writes
+    /// succeed. This is a backgrounded client, or a multiplexed logical stream
+    /// held open by its siblings on the physical connection.
+    struct SilentTargetedStream;
+
+    impl AsyncReadTargetedMessage for SilentTargetedStream {
+        fn poll_read_targeted_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<NetLocation>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteSourcedMessage for SilentTargetedStream {
+        fn poll_write_sourced_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+            _source: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for SilentTargetedStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for SilentTargetedStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for SilentTargetedStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncTargetedMessageStream for SilentTargetedStream {}
+
+    #[tokio::test]
+    async fn silent_peer_does_not_park_the_router_forever() {
+        let mut server = ServerStream::Targeted(Box::new(SilentTargetedStream));
+
+        // The peer never closes, so `server_read_eof` is never set and the
+        // completion condition above can never fire. Without the drained idle
+        // timeout this router -- and the connection task holding its
+        // `AliveIpGuard` -- would live for the lifetime of the process.
+        let router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            None,
+            Arc::new(crate::resolver::NativeResolver::new()),
+            false,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), router)
+            .await
+            .expect("a drained router must not wait on a peer that never closes")
+            .expect("draining is a clean finish, not an error");
+    }
+
+    #[tokio::test]
+    async fn read_eof_keeps_in_flight_session_creates() {
+        let mut server = ServerStream::Targeted(Box::new(SilentTargetedStream));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            None,
+            Arc::new(crate::resolver::NativeResolver::new()),
+            false,
+        );
+
+        let destination = NetLocation::new(Address::UNSPECIFIED, 53);
+        match &mut router.session_lookup {
+            SessionLookup::ByDestination(map) => {
+                map.insert(destination.clone(), KeyState::Pending);
+            }
+            SessionLookup::BySessionId(_) => unreachable!("targeted stream"),
+        }
+        router.pending_creates.push(PendingSessionCreate {
+            lookup_key: LookupKey::Destination(destination),
+            destination: NetLocation::new(Address::UNSPECIFIED, 53),
+            session_id: 0,
+            initial_data: b"a single DNS query".to_vec(),
+            future: Box::pin(std::future::pending()),
+        });
+
+        router.set_server_read_eof();
+
+        // Dropping the create here would drop its first packet with it, which
+        // is the whole payload of a one-shot query.
+        assert_eq!(router.pending_creates.len(), 1);
+        assert!(
+            !router.is_drained(),
+            "an in-flight create is outstanding work, so the router must not finish yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cap_evicts_the_least_recently_active() {
+        let mut server = ServerStream::Targeted(Box::new(SilentTargetedStream));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            None,
+            Arc::new(crate::resolver::NativeResolver::new()),
+            false,
+        );
+
+        let now = Instant::now();
+        // Oldest last, so eviction cannot be confused with insertion order.
+        for (id, age_secs) in [(0usize, 5u64), (1, 1), (2, 30)] {
+            let destination = NetLocation::new(Address::UNSPECIFIED, 1000 + id as u16);
+            let mut session = RoutingSession::new(
+                destination.clone(),
+                0,
+                "127.0.0.1:1".parse().unwrap(),
+                LookupKey::Destination(destination.clone()),
+                Box::new(PendingMessageStream),
+            );
+            session.last_active = now - Duration::from_secs(age_secs);
+            match &mut router.session_lookup {
+                SessionLookup::ByDestination(map) => {
+                    map.insert(destination, KeyState::Active(id));
+                }
+                SessionLookup::BySessionId(_) => unreachable!("targeted stream"),
+            }
+            router.sessions.insert(id, session);
+        }
+
+        router.evict_least_recently_active();
+
+        assert!(
+            !router.sessions.contains_key(&2),
+            "the session idle for 30s must be the one dropped"
+        );
+        assert!(router.sessions.contains_key(&0));
+        assert!(router.sessions.contains_key(&1));
+        // The lookup map must stay in step, or the destination would be
+        // permanently unroutable for the rest of the association.
+        match &router.session_lookup {
+            SessionLookup::ByDestination(map) => assert_eq!(map.len(), 2),
+            SessionLookup::BySessionId(_) => unreachable!("targeted stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn half_closed_server_stream_finishes_the_router() {
+        let mut server = ServerStream::Targeted(Box::new(HalfClosedTargetedStream));
+
+        // A router with no sessions has nothing left to write, so it never
+        // sees a write error and never sets `server_write_eof`. It must still
+        // finish: otherwise the task parks forever and leaks its transport and
+        // its 64 KiB packet buffers, which is invisible in fd counts because a
+        // multiplexed logical stream owns no socket.
+        let router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            None,
+            Arc::new(crate::resolver::NativeResolver::new()),
+            false,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), router)
+            .await
+            .expect("router must finish once the read side ends and it has drained")
+            .expect("router should finish cleanly");
+    }
+
     fn routing_session() -> RoutingSession {
         let destination = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 53);
         RoutingSession::new(
@@ -1495,6 +1904,22 @@ mod tests {
 
         session.in_server_write_queue = 0;
         assert!(session.should_remove());
+    }
+
+    #[test]
+    fn idle_buffer_pool_releases_burst_capacity() {
+        let mut pool = BufferPool::new(REMOTE_WRITE_POOL_SIZE);
+        let buffers: Vec<_> = (0..REMOTE_WRITE_POOL_SIZE)
+            .map(|_| pool.acquire().expect("pool has burst capacity"))
+            .collect();
+        for buffer in buffers {
+            pool.release(buffer);
+        }
+
+        pool.trim_idle(1);
+
+        assert_eq!(pool.created_count, 1);
+        assert_eq!(pool.buffers.len(), 1);
     }
 
     #[tokio::test]

@@ -24,7 +24,10 @@ pub trait TrafficRecorder: Send + Sync + Debug {
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedUser {
-    pub node_tag: String,
+    /// Shared with every other user of the same node and with every connection
+    /// they open. As a `String` this was one heap allocation per user in the
+    /// table plus one more for each of the several clones a connection makes.
+    pub node_tag: Arc<str>,
     pub uid: u64,
     pub user_key: String,
     pub speed_limit: Option<u64>,

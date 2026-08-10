@@ -60,6 +60,7 @@
 pub mod address;
 #[cfg(not(feature = "internal-bench"))]
 mod address;
+pub mod alloc_stats;
 #[cfg(feature = "internal-bench")]
 pub mod anytls;
 #[cfg(not(feature = "internal-bench"))]
@@ -103,6 +104,7 @@ mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;
 mod shadowsocks;
+pub mod shared_users;
 mod slide_buffer;
 mod snell;
 mod socket_util;

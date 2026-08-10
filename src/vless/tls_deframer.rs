@@ -24,6 +24,12 @@ const MAX_TLS_CIPHERTEXT_LEN: usize = 16384 + 2048; // 18,432 bytes (TLS 1.2 lim
 /// Maximum TLS record size (ciphertext + header)
 pub const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
 
+/// Initial buffer capacity. Most connections carry small records (alerts,
+/// handshake fragments), so allocating the full 18 KB up front for every
+/// Vision stream wastes memory under high connection counts. The buffer grows
+/// on demand via `extend_from_slice` up to `TLS_MAX_RECORD_SIZE`.
+const INITIAL_BUFFER_CAPACITY: usize = 1024;
+
 /// TLS protocol versions we expect (0x0303 = TLS 1.2 for compatibility)
 const TLS_PROTOCOL_VERSION_MAJOR: u8 = 0x03;
 const TLS_PROTOCOL_VERSION_MINOR_MIN: u8 = 0x01;
@@ -65,7 +71,7 @@ enum DeframerState {
 impl TlsDeframer {
     pub fn new() -> Self {
         Self {
-            buffer: BytesMut::with_capacity(TLS_MAX_RECORD_SIZE),
+            buffer: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
             state: DeframerState::ReadingHeader,
         }
     }
@@ -473,6 +479,24 @@ mod tests {
 
         let extracted_record = deframer.next_record().unwrap().unwrap();
         assert_eq!(extracted_record, &record[..]);
+    }
+
+    #[test]
+    fn starts_small_and_grows_to_max_size() {
+        let deframer = TlsDeframer::new();
+        // A fresh deframer must not reserve the full TLS record size; it grows
+        // lazily so idle/small-record connections hold only a few KB.
+        assert!(deframer.buffer.capacity() < TLS_MAX_RECORD_SIZE);
+        assert!(deframer.buffer.capacity() >= INITIAL_BUFFER_CAPACITY);
+
+        // Feeding a maximum-size record must grow the buffer and still
+        // round-trip the whole record.
+        let mut deframer = TlsDeframer::new();
+        let payload = vec![0xBB; 18432];
+        let record = make_tls_record(0x17, &payload);
+        deframer.feed(&record);
+        let extracted = deframer.next_record().unwrap().unwrap();
+        assert_eq!(extracted, &record[..]);
     }
 
     #[test]

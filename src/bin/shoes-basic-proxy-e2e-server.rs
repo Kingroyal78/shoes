@@ -2,9 +2,16 @@
 
 use std::io;
 
+// The bench server measures memory with the same allocator as production so
+// jemalloc statistics reflect the real heap (allocated vs retained).
+#[cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     init_logging();
+    shoes::alloc_stats::start_allocator_stats_logger();
 
     let args = match Args::parse() {
         Ok(args) => args,

@@ -11,8 +11,9 @@ mod shadowsocks_tcp_handler;
 mod timed_salt_checker;
 
 pub use default_key::DefaultKey;
+pub use salt_checker::{SharedSaltChecker, new_shared_salt_checker};
 pub use shadowsocks_cipher::ShadowsocksCipher;
 pub use shadowsocks_key::ShadowsocksKey;
 pub use shadowsocks_stream::ShadowsocksStream;
 pub use shadowsocks_stream_type::ShadowsocksStreamType;
-pub use shadowsocks_tcp_handler::ShadowsocksTcpHandler;
+pub use shadowsocks_tcp_handler::{ShadowsocksTcpHandler, ShadowsocksUsers};

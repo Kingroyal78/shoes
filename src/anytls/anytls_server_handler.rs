@@ -20,12 +20,62 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
+use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::write_all;
 use aws_lc_rs::digest::{SHA256, digest};
+
+/// The user set of an AnyTLS listener.
+///
+/// Keyed by the full SHA-256 password hash, with the 8-byte prefixes kept
+/// alongside so non-AnyTLS traffic can be rejected after 8 bytes instead of
+/// blocking for 32.
+#[derive(Debug, Default)]
+pub struct AnyTlsUsers {
+    by_password_hash: HashMap<[u8; 32], AnyTlsAuthenticatedUser>,
+    hash_prefixes: HashSet<[u8; 8]>,
+}
+
+impl AnyTlsUsers {
+    /// Build the table from V2Board users; the panel user key names the user
+    /// and the credential is its password.
+    pub fn new(users: Vec<ServerUser>) -> Self {
+        let mut by_password_hash = HashMap::with_capacity(users.len());
+        let mut hash_prefixes = HashSet::with_capacity(users.len());
+        for user in users {
+            let hash_result = digest(&SHA256, user.credential.as_bytes());
+            let mut password_hash = [0u8; 32];
+            password_hash.copy_from_slice(hash_result.as_ref());
+            hash_prefixes.insert(password_hash[..8].try_into().unwrap());
+            by_password_hash.insert(
+                password_hash,
+                AnyTlsAuthenticatedUser {
+                    name: user.authenticated_user.user_key.clone(),
+                    authenticated_user: Some(user.authenticated_user),
+                },
+            );
+        }
+        Self {
+            by_password_hash,
+            hash_prefixes,
+        }
+    }
+
+    fn matches_prefix(&self, prefix: &[u8]) -> bool {
+        self.hash_prefixes.contains(prefix)
+    }
+
+    fn get(&self, password_hash: &[u8]) -> Option<&AnyTlsAuthenticatedUser> {
+        self.by_password_hash.get(password_hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_password_hash.len()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct AnyTlsAuthenticatedUser {
@@ -40,12 +90,8 @@ struct AnyTlsAuthenticatedUser {
 /// and runs the session which handles all streams internally.
 #[derive(Debug)]
 pub struct AnyTlsServerHandler {
-    /// Authenticated users (password_hash -> user metadata)
-    users: HashMap<[u8; 32], AnyTlsAuthenticatedUser>,
-    /// 8-byte prefixes of all user password hashes for quick fallback.
-    /// If incoming data doesn't match any prefix, we can fallback immediately
-    /// without waiting for the full 32-byte hash.
-    hash_prefixes: HashSet<[u8; 8]>,
+    /// Authenticated users, replaceable while the listener keeps running.
+    users: Arc<SharedUsers<AnyTlsUsers>>,
     /// Padding factory for traffic obfuscation
     padding: Arc<PaddingFactory>,
     /// Resolver for destination addresses
@@ -93,31 +139,22 @@ impl AnyTlsServerHandler {
     }
 
     pub fn new_authenticated(
-        users: Vec<ServerUser>,
+        users: Arc<SharedUsers<AnyTlsUsers>>,
         padding: Arc<PaddingFactory>,
         resolver: Arc<dyn Resolver>,
         proxy_provider: Arc<ClientProxySelector>,
         udp_enabled: bool,
         fallback: Option<NetLocation>,
     ) -> Self {
-        let users = users
-            .into_iter()
-            .map(|user| {
-                (
-                    user.authenticated_user.user_key.clone(),
-                    user.credential,
-                    Some(user.authenticated_user),
-                )
-            })
-            .collect();
-        Self::from_users(
+        Self {
             users,
             padding,
             resolver,
             proxy_provider,
             udp_enabled,
             fallback,
-        )
+            outbound_dispatcher: None,
+        }
     }
 
     /// Attaches the node-side outbound dispatcher used for stream dials.
@@ -161,8 +198,10 @@ impl AnyTlsServerHandler {
         }
 
         Self {
-            users: user_map,
-            hash_prefixes,
+            users: SharedUsers::new(AnyTlsUsers {
+                by_password_hash: user_map,
+                hash_prefixes,
+            }),
             padding,
             resolver,
             proxy_provider,
@@ -211,7 +250,9 @@ impl AnyTlsServerHandler {
         // password or the remaining 24 bytes of the SHA256 hash.
         let prefix_data = reader.peek_slice(&mut server_stream, 8).await?;
 
-        if !self.hash_prefixes.contains(prefix_data) {
+        // Borrowed across the two peeks of one handshake only; see `SharedUsers`.
+        let users = self.users.load();
+        if !users.matches_prefix(prefix_data) {
             log::debug!("AnyTLS quick fallback: 8-byte prefix doesn't match any user");
             if let Some(ref fallback) = self.fallback {
                 return self.fallback_to_dest(server_stream, reader, fallback).await;
@@ -225,7 +266,7 @@ impl AnyTlsServerHandler {
         // Prefix matches - now read the full 32-byte hash
         let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
 
-        let user = match self.users.get(auth_data) {
+        let user = match users.get(auth_data) {
             Some(user) => {
                 log::debug!("AnyTLS user authenticated: {}", user.name);
                 // Auth succeeded - consume the header bytes

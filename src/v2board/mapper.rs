@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::address::{Address, AddressMask, NetLocation, NetLocationMask};
-use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
+use crate::anytls::{AnyTlsServerHandler, AnyTlsUsers, PaddingFactory};
 use crate::async_stream::AsyncStream;
 use crate::backend_config::{AppConfig, NodeType, OutboundConfig, OutboundSpec, V2BoardNodeConfig};
 use crate::client_proxy_chain::ClientChainGroup;
@@ -23,7 +23,7 @@ use crate::config::{
 use crate::hysteria2_obfs::Hysteria2Obfs;
 use crate::hysteria2_server::{
     Hysteria2Masquerade, Hysteria2ServerUser, Hysteria2ServerUsers, Hysteria2StartConfig,
-    start_hysteria2_server,
+    Hysteria2UserTable, start_hysteria2_server,
 };
 use crate::naiveproxy::UserLookup;
 use crate::naiveproxy::naive_h3_service::{
@@ -34,7 +34,11 @@ use crate::reality::{RealityServerTarget, decode_private_key, decode_short_id};
 use crate::resolver::Resolver;
 use crate::rustls_config_util::create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
-use crate::shadowsocks::{ShadowsocksTcpHandler, shadowsocks_obfs::ShadowsocksHttpObfs};
+use crate::shadowsocks::{
+    ShadowsocksCipher, ShadowsocksTcpHandler, ShadowsocksUsers,
+    shadowsocks_obfs::ShadowsocksHttpObfs,
+};
+use crate::shared_users::SharedUsers;
 use crate::ss_plugins::gost::{GostPluginServerConfig, GostPluginServerHandler};
 use crate::ss_plugins::kcptun::config::{
     KcptunConfig, KcptunCrypt as RuntimeKcptunCrypt, KcptunMode as RuntimeKcptunMode,
@@ -61,8 +65,8 @@ use crate::thread_util::get_num_threads;
 use crate::tls_server_handler::{
     InnerProtocol, NaiveConfig, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
 };
-use crate::trojan_handler::TrojanTcpHandler;
-use crate::tuic_server::{TuicServerUser, TuicServerUsers, start_tuic_server};
+use crate::trojan_handler::{TrojanTcpHandler, TrojanUsers};
+use crate::tuic_server::{TuicServerUser, TuicServerUsers, TuicUserTable, start_tuic_server};
 use crate::v2board::grpc::GrpcServerHandler;
 use crate::v2board::http::{V2RayHttp2ServerHandler, V2RayHttpServerHandler};
 use crate::v2board::httpupgrade::HttpUpgradeServerHandler;
@@ -75,9 +79,10 @@ use crate::v2board::runtime_model::{
     ShadowsocksObfs, TcpHeader, normalize_node,
 };
 use crate::v2board::tracker::TrafficTracker;
+use crate::v2board::user_tables::NodeUserTables;
 use crate::v2board::xhttp::XHttpServerHandler;
-use crate::vless::vless_server_handler::VlessTcpServerHandler;
-use crate::vmess::VmessTcpServerHandler;
+use crate::vless::vless_server_handler::{VlessTcpServerHandler, VlessUsers};
+use crate::vmess::{VmessTcpServerHandler, VmessUsers};
 use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
 use super::plugin_api::{
@@ -87,8 +92,6 @@ use super::plugin_api::{
 use super::types::{ServerConfig, UserInfo};
 
 const VLESS_XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
-
-type VlessVisionUser = (Box<[u8]>, Option<AuthenticatedUser>);
 
 #[derive(Clone)]
 pub struct RuntimeNode {
@@ -489,6 +492,7 @@ pub fn map_node(
     users: &[UserInfo],
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     if app_config.runtime.tcp_fast_open {
         return invalid(
@@ -503,6 +507,7 @@ pub fn map_node(
         resolver,
         app_config.runtime.max_legacy_shadowsocks_users,
         outbound_dispatcher,
+        user_tables,
     )
 }
 
@@ -510,6 +515,7 @@ pub fn map_node(
 ///
 /// The returned nodes are intentionally not started here; `RuntimeGraph`
 /// health-gates the whole set before committing the generation.
+#[allow(clippy::too_many_arguments)]
 pub fn map_shadowsocks_plugin_nodes(
     app_config: &AppConfig,
     node: &V2BoardNodeConfig,
@@ -518,6 +524,7 @@ pub fn map_shadowsocks_plugin_nodes(
     manifest: &PluginRuntimeManifest,
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<Vec<RuntimeNode>> {
     if node.node_type != NodeType::Shadowsocks {
         return invalid("plugin runtime can only be built for a Shadowsocks node");
@@ -560,6 +567,7 @@ pub fn map_shadowsocks_plugin_nodes(
         app_config.runtime.max_legacy_shadowsocks_users,
         multiplex.map(|mux| mux.padding),
         outbound_dispatcher,
+        user_tables,
     )?;
     let Some(plugin) = manifest.plugin.as_ref() else {
         return Ok(vec![raw_public]);
@@ -977,6 +985,7 @@ fn build_runtime_node(
     resolver: Arc<dyn Resolver>,
     max_legacy_shadowsocks_users: usize,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     build_runtime_node_with_shadowsocks_mux(
         spec,
@@ -985,6 +994,7 @@ fn build_runtime_node(
         max_legacy_shadowsocks_users,
         None,
         outbound_dispatcher,
+        user_tables,
     )
 }
 
@@ -995,6 +1005,7 @@ fn build_runtime_node_with_shadowsocks_mux(
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let proxy_selector = Arc::new(build_v2board_proxy_selector(&spec, resolver.clone())?);
@@ -1002,7 +1013,13 @@ fn build_runtime_node_with_shadowsocks_mux(
         // UDP-only listeners do not use the outbound dispatcher yet; the
         // legacy selector dial path applies.
         NodeType::Tuic => {
-            return build_tuic_runtime_node(spec, tracker, proxy_selector, outbound_dispatcher);
+            return build_tuic_runtime_node(
+                spec,
+                tracker,
+                proxy_selector,
+                outbound_dispatcher,
+                user_tables,
+            );
         }
         NodeType::Hysteria => {
             return build_hysteria2_runtime_node(
@@ -1010,6 +1027,7 @@ fn build_runtime_node_with_shadowsocks_mux(
                 tracker,
                 proxy_selector,
                 outbound_dispatcher,
+                user_tables,
             );
         }
         NodeType::Naiveproxy => {
@@ -1019,6 +1037,7 @@ fn build_runtime_node_with_shadowsocks_mux(
                 proxy_selector,
                 resolver,
                 outbound_dispatcher,
+                user_tables,
             );
         }
         _ => {}
@@ -1031,6 +1050,7 @@ fn build_runtime_node_with_shadowsocks_mux(
         max_legacy_shadowsocks_users,
         shadowsocks_mux_padding,
         outbound_dispatcher.clone(),
+        user_tables,
     )?;
     let transport = build_transport_handler(&spec, protocol, resolver.clone())?;
     let mut handler = build_security_handler(
@@ -1040,6 +1060,7 @@ fn build_runtime_node_with_shadowsocks_mux(
         proxy_selector,
         resolver,
         outbound_dispatcher,
+        user_tables,
     )?;
     if spec.accept_proxy_protocol {
         handler = Arc::new(ProxyProtocolServerHandler::new(handler));
@@ -1060,6 +1081,7 @@ fn build_tuic_runtime_node(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (zero_rtt_handshake, congestion_control, udp_relay_mode, disable_sni) = match &spec.protocol
@@ -1125,7 +1147,7 @@ fn build_tuic_runtime_node(
         }
     };
     let quic_server_config = build_quic_server_config(&spec, tls, "tuic")?;
-    let users = tuic_server_users(&spec, tracker)?;
+    let users = tuic_server_users(&spec, tracker, user_tables)?;
 
     Ok(RuntimeNode {
         tag: spec.tag,
@@ -1147,6 +1169,7 @@ fn build_hysteria2_runtime_node(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (up_mbps, down_mbps, ignore_client_bandwidth, obfs, obfs_password, masquerade) =
@@ -1212,7 +1235,7 @@ fn build_hysteria2_runtime_node(
         }
     };
     let quic_server_config = build_quic_server_config(&spec, tls, "hysteria2")?;
-    let users = hysteria2_server_users(&spec, tracker)?;
+    let users = hysteria2_server_users(&spec, tracker, user_tables)?;
 
     Ok(RuntimeNode {
         tag: spec.tag,
@@ -1239,6 +1262,7 @@ fn build_naiveproxy_runtime_node(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let quic_congestion_control = match &spec.protocol {
@@ -1269,7 +1293,7 @@ fn build_naiveproxy_runtime_node(
     };
 
     let naive_cfg = NaiveConfig {
-        users: Arc::new(naiveproxy_user_lookup(&spec, tracker)?),
+        users: naiveproxy_user_lookup(&spec, tracker, user_tables)?,
         fallback_path: None,
         udp_enabled: true,
         padding_enabled: true,
@@ -1974,6 +1998,7 @@ fn build_security_handler(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     match &spec.security {
         RuntimeSecurity::None => {
@@ -1992,8 +2017,13 @@ fn build_security_handler(
             Ok(inner)
         }
         RuntimeSecurity::Tls(tls) => {
-            let inner_protocol =
-                secured_inner_protocol(spec, inner, tracker, outbound_dispatcher.clone())?;
+            let inner_protocol = secured_inner_protocol(
+                spec,
+                inner,
+                tracker,
+                outbound_dispatcher.clone(),
+                user_tables,
+            )?;
             build_tls_handler(spec, tls, inner_protocol, proxy_selector, resolver)
         }
         RuntimeSecurity::Reality(reality) => {
@@ -2003,8 +2033,13 @@ fn build_security_handler(
                     spec.tag
                 ));
             }
-            let inner_protocol =
-                secured_inner_protocol(spec, inner, tracker, outbound_dispatcher.clone())?;
+            let inner_protocol = secured_inner_protocol(
+                spec,
+                inner,
+                tracker,
+                outbound_dispatcher.clone(),
+                user_tables,
+            )?;
             build_reality_handler(spec, reality, inner_protocol, proxy_selector, resolver)
         }
     }
@@ -2015,10 +2050,11 @@ fn secured_inner_protocol(
     inner: Arc<dyn TcpServerHandler>,
     tracker: Arc<TrafficTracker>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<InnerProtocol> {
     if vless_vision_flow(spec).is_some() {
         return Ok(InnerProtocol::VisionVless(VisionVlessConfig {
-            users: vless_vision_users(spec, tracker)?,
+            users: user_tables.publish_vless(vless_vision_users(spec, tracker)?),
             udp_enabled: true,
             fallback: None,
             outbound_dispatcher,
@@ -2329,6 +2365,7 @@ fn transport_requires_h2_alpn(spec: &RuntimeNodeSpec) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_protocol_handler(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
@@ -2337,6 +2374,7 @@ fn build_protocol_handler(
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     let server_users = server_users(spec, tracker.clone())?;
 
@@ -2365,7 +2403,7 @@ fn build_protocol_handler(
             validate_vless_user_ids(spec)?;
             Arc::new(
                 VlessTcpServerHandler::new_multi(
-                    server_users,
+                    user_tables.publish_vless(VlessUsers::new(server_users)?),
                     true,
                     proxy_selector,
                     resolver,
@@ -2377,7 +2415,7 @@ fn build_protocol_handler(
         (NodeType::Vmess, RuntimeProtocol::Vmess { security }) => Arc::new(
             VmessTcpServerHandler::new_multi(
                 security,
-                server_users,
+                user_tables.publish_vmess(VmessUsers::new(server_users)),
                 true,
                 proxy_selector,
                 resolver,
@@ -2393,7 +2431,7 @@ fn build_protocol_handler(
             }
             Arc::new(
                 TrojanTcpHandler::new_multi_server(
-                    server_users,
+                    user_tables.publish_trojan(TrojanUsers::new(server_users)),
                     &None,
                     proxy_selector,
                     resolver,
@@ -2412,7 +2450,7 @@ fn build_protocol_handler(
             validate_duplicate_credentials(spec, "anytls")?;
             Arc::new(
                 AnyTlsServerHandler::new_authenticated(
-                    server_users,
+                    user_tables.publish_anytls(AnyTlsUsers::new(server_users)),
                     anytls_padding_factory(spec, padding_scheme)?,
                     resolver,
                     proxy_selector,
@@ -2453,10 +2491,14 @@ fn build_protocol_handler(
                         ))
                     })?,
                     key_len,
-                    &format!("node `{}` shadowsocks server_key", spec.tag),
+                    || format!("node `{}` shadowsocks server_key", spec.tag),
                 )?;
-                let users = shadowsocks_2022_server_users(spec, key_len, tracker.clone())?;
                 let cipher = shadowsocks_2022_runtime_cipher(cipher)?;
+                let users = user_tables.publish_shadowsocks(build_shadowsocks_users(
+                    spec,
+                    tracker.clone(),
+                    max_legacy_shadowsocks_users,
+                )?);
                 let mut handler = ShadowsocksTcpHandler::new_v2board_aead2022_multi_server(
                     cipher,
                     server_key,
@@ -2465,6 +2507,7 @@ fn build_protocol_handler(
                     proxy_selector,
                     resolver,
                 )
+                .with_salt_checker(user_tables.shadowsocks_salt_checker())
                 .with_outbound_dispatcher(outbound_dispatcher.clone());
                 if let Some(http_obfs) = http_obfs {
                     handler = handler.with_http_obfs(http_obfs);
@@ -2483,10 +2526,15 @@ fn build_protocol_handler(
                     spec.tag
                 ));
             }
-            let cipher = cipher.as_str().try_into()?;
+            let cipher: ShadowsocksCipher = cipher.as_str().try_into()?;
+            let users = user_tables.publish_shadowsocks(build_shadowsocks_users(
+                spec,
+                tracker.clone(),
+                max_legacy_shadowsocks_users,
+            )?);
             let mut handler = ShadowsocksTcpHandler::new_v2board_multi_server(
                 cipher,
-                server_users,
+                users,
                 true,
                 proxy_selector,
                 resolver,
@@ -2648,20 +2696,16 @@ fn validate_shadowsocks_user_keys(
             spec.tag
         ))
     })?;
-    let _ = decode_shadowsocks_2022_psk(
-        server_key,
-        key_len,
-        &format!("node `{}` shadowsocks server_key", spec.tag),
-    )?;
+    let _ = decode_shadowsocks_2022_psk(server_key, key_len, || {
+        format!("node `{}` shadowsocks server_key", spec.tag)
+    })?;
 
     let mut seen = HashMap::with_capacity(spec.users.len());
     for user in &spec.users {
         let password = shadowsocks_2022_user_password(user, key_len, &spec.tag)?;
-        let psk = decode_shadowsocks_2022_psk(
-            &password,
-            key_len,
-            &format!("node `{}` user {} shadowsocks 2022 psk", spec.tag, user.uid),
-        )?;
+        let psk = decode_shadowsocks_2022_psk(&password, key_len, || {
+            format!("node `{}` user {} shadowsocks 2022 psk", spec.tag, user.uid)
+        })?;
         if let Some(previous) = seen.insert(psk, user.uid) {
             return invalid(format!(
                 "node `{}` shadowsocks user {} psk duplicates user {} psk",
@@ -2702,19 +2746,24 @@ fn shadowsocks_2022_user_password(
     Ok(BASE64.encode(&user.credential.as_bytes()[..key_len]))
 }
 
+/// `name` is only ever consulted to build an error message, so it is taken as a
+/// closure: formatting it eagerly meant one throwaway `String` per user on
+/// every table rebuild, which happens on every pull.
 fn decode_shadowsocks_2022_psk(
     value: &str,
     key_len: usize,
-    name: &str,
+    name: impl Fn() -> String,
 ) -> std::io::Result<Vec<u8>> {
     let mut key = BASE64.decode(value).map_err(|e| {
         invalid_error(format!(
-            "{name} must be base64-encoded for shadowsocks 2022: {e}"
+            "{} must be base64-encoded for shadowsocks 2022: {e}",
+            name()
         ))
     })?;
     if key.len() < key_len {
         return invalid(format!(
-            "{name} is too short for shadowsocks 2022 key length {key_len}"
+            "{} is too short for shadowsocks 2022 key length {key_len}",
+            name()
         ));
     }
     if key.len() > key_len {
@@ -2739,19 +2788,20 @@ fn shadowsocks_2022_server_users(
     key_len: usize,
     tracker: Arc<TrafficTracker>,
 ) -> std::io::Result<Vec<(Vec<u8>, AuthenticatedUser)>> {
+    // One allocation for the node, shared by every user and by every
+    // connection they open, instead of one per user per rebuild.
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
     spec.users
         .iter()
         .map(|user| {
             let password = shadowsocks_2022_user_password(user, key_len, &spec.tag)?;
-            let psk = decode_shadowsocks_2022_psk(
-                &password,
-                key_len,
-                &format!("node `{}` user {} shadowsocks 2022 psk", spec.tag, user.uid),
-            )?;
+            let psk = decode_shadowsocks_2022_psk(&password, key_len, || {
+                format!("node `{}` user {} shadowsocks 2022 psk", spec.tag, user.uid)
+            })?;
             Ok((
                 psk,
                 AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
+                    node_tag: node_tag.clone(),
                     uid: user.uid,
                     user_key: user.user_key.clone(),
                     speed_limit: user.policy.speed_limit_mbps,
@@ -2763,17 +2813,110 @@ fn shadowsocks_2022_server_users(
         .collect()
 }
 
+/// Build the Shadowsocks user table described by `spec`.
+///
+/// Shared by listener construction and by the users-only sync path so both
+/// derive the table — and reject the same malformed user lists — identically.
+fn build_shadowsocks_users(
+    spec: &RuntimeNodeSpec,
+    tracker: Arc<TrafficTracker>,
+    max_legacy_shadowsocks_users: usize,
+) -> std::io::Result<ShadowsocksUsers> {
+    let RuntimeProtocol::Shadowsocks {
+        cipher, server_key, ..
+    } = &spec.protocol
+    else {
+        return invalid(format!("node `{}` is not a shadowsocks node", spec.tag));
+    };
+    let is_2022 = validate_shadowsocks_user_keys(
+        spec,
+        cipher,
+        server_key.as_deref(),
+        max_legacy_shadowsocks_users,
+    )?;
+    if is_2022 {
+        let key_len = shadowsocks_2022_key_len(cipher)?.ok_or_else(|| {
+            invalid_error(format!(
+                "node `{}` shadowsocks cipher `{cipher}` was classified as 2022 without key length",
+                spec.tag
+            ))
+        })?;
+        let users = shadowsocks_2022_server_users(spec, key_len, tracker)?;
+        let cipher = shadowsocks_2022_runtime_cipher(cipher)?;
+        Ok(ShadowsocksUsers::aead2022(&cipher, users))
+    } else {
+        let users = server_users(spec, tracker)?;
+        let cipher: ShadowsocksCipher = cipher.as_str().try_into()?;
+        Ok(ShadowsocksUsers::legacy(&cipher, users))
+    }
+}
+
+/// Publish a new user list into a node's live listeners.
+///
+/// Returns `false` when this node's protocol has no hot-swappable table yet, in
+/// which case the caller must fall back to replacing the runtime generation.
+/// Validation matches the listener path, so a user list rejected here is
+/// rejected on a full apply too and the previous users stay in effect.
+pub fn refresh_node_users(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    user_tables: &NodeUserTables,
+) -> std::io::Result<bool> {
+    let spec = normalize_node(app_config, node, server, users)?;
+    match node.node_type {
+        NodeType::Shadowsocks => {
+            let table = build_shadowsocks_users(
+                &spec,
+                tracker,
+                app_config.runtime.max_legacy_shadowsocks_users,
+            )?;
+            user_tables.publish_shadowsocks(table);
+        }
+        NodeType::Vless => {
+            // The Vision and plain VLESS listeners share one table.
+            user_tables.publish_vless(vless_vision_users(&spec, tracker)?);
+        }
+        NodeType::Vmess => {
+            user_tables.publish_vmess(VmessUsers::new(server_users(&spec, tracker)?));
+        }
+        NodeType::Trojan => {
+            user_tables.publish_trojan(TrojanUsers::new(server_users(&spec, tracker)?));
+        }
+        NodeType::Anytls => {
+            validate_duplicate_credentials(&spec, "anytls")?;
+            user_tables.publish_anytls(AnyTlsUsers::new(server_users(&spec, tracker)?));
+        }
+        NodeType::Tuic => {
+            tuic_server_users(&spec, tracker, user_tables)?;
+        }
+        NodeType::Hysteria => {
+            hysteria2_server_users(&spec, tracker, user_tables)?;
+        }
+        NodeType::Naiveproxy => {
+            naiveproxy_user_lookup(&spec, tracker, user_tables)?;
+        }
+        NodeType::V2Node => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
 ) -> std::io::Result<Vec<ServerUser>> {
+    // One allocation for the node, shared by every user and by every
+    // connection they open, instead of one per user per rebuild.
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
     spec.users
         .iter()
         .map(|user| {
             Ok(ServerUser {
                 credential: user.credential.clone(),
                 authenticated_user: AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
+                    node_tag: node_tag.clone(),
                     uid: user.uid,
                     user_key: user.user_key.clone(),
                     speed_limit: user.policy.speed_limit_mbps,
@@ -2788,8 +2931,12 @@ fn server_users(
 fn naiveproxy_user_lookup(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
-) -> std::io::Result<UserLookup> {
+    user_tables: &NodeUserTables,
+) -> std::io::Result<Arc<SharedUsers<UserLookup>>> {
     let mut seen = HashMap::with_capacity(spec.users.len());
+    // One allocation for the node, shared by every user and by every
+    // connection they open, instead of one per user per rebuild.
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
     let users = spec
         .users
         .iter()
@@ -2826,7 +2973,7 @@ fn naiveproxy_user_lookup(
                 username,
                 password,
                 Some(AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
+                    node_tag: node_tag.clone(),
                     uid: user.uid,
                     user_key: user.user_key.clone(),
                     speed_limit: user.policy.speed_limit_mbps,
@@ -2836,14 +2983,18 @@ fn naiveproxy_user_lookup(
             ))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    Ok(UserLookup::new_with_authenticated_users(users))
+    Ok(user_tables.publish_naiveproxy(UserLookup::new_with_authenticated_users(users)))
 }
 
 fn tuic_server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<TuicServerUsers> {
     validate_duplicate_credentials(spec, "tuic")?;
+    // One allocation for the node, shared by every user and by every
+    // connection they open, instead of one per user per rebuild.
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
     let users = spec
         .users
         .iter()
@@ -2864,7 +3015,7 @@ fn tuic_server_users(
                 uuid,
                 user.credential.clone(),
                 Some(AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
+                    node_tag: node_tag.clone(),
                     uid: user.uid,
                     user_key: user.user_key.clone(),
                     speed_limit: user.policy.speed_limit_mbps,
@@ -2874,19 +3025,26 @@ fn tuic_server_users(
             ))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    TuicServerUsers::new(users).map_err(|e| {
+    let table = TuicUserTable::new(users).map_err(|e| {
         invalid_error(format!(
             "node `{}` failed to build TUIC users: {e}",
             spec.tag
         ))
-    })
+    })?;
+    Ok(TuicServerUsers::from_shared(
+        user_tables.publish_tuic(table),
+    ))
 }
 
 fn hysteria2_server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
+    user_tables: &NodeUserTables,
 ) -> std::io::Result<Hysteria2ServerUsers> {
     validate_duplicate_credentials(spec, "hysteria2")?;
+    // One allocation for the node, shared by every user and by every
+    // connection they open, instead of one per user per rebuild.
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
     let users = spec
         .users
         .iter()
@@ -2894,7 +3052,7 @@ fn hysteria2_server_users(
             Hysteria2ServerUser::new(
                 user.credential.clone(),
                 Some(AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
+                    node_tag: node_tag.clone(),
                     uid: user.uid,
                     user_key: user.user_key.clone(),
                     speed_limit: user.policy.speed_limit_mbps,
@@ -2904,12 +3062,15 @@ fn hysteria2_server_users(
             )
         })
         .collect();
-    Hysteria2ServerUsers::new(users).map_err(|e| {
+    let table = Hysteria2UserTable::new(users).map_err(|e| {
         invalid_error(format!(
             "node `{}` failed to build hysteria2 users: {e}",
             spec.tag
         ))
-    })
+    })?;
+    Ok(Hysteria2ServerUsers::from_shared(
+        user_tables.publish_hysteria2(table),
+    ))
 }
 
 fn validate_vless_user_ids(spec: &RuntimeNodeSpec) -> std::io::Result<()> {
@@ -2922,23 +3083,13 @@ fn validate_vless_user_ids(spec: &RuntimeNodeSpec) -> std::io::Result<()> {
 fn vless_vision_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
-) -> std::io::Result<Vec<VlessVisionUser>> {
-    spec.users
-        .iter()
-        .map(|user| {
-            Ok((
-                parse_vless_user_id(spec, user)?.into_boxed_slice(),
-                Some(AuthenticatedUser {
-                    node_tag: spec.tag.clone(),
-                    uid: user.uid,
-                    user_key: user.user_key.clone(),
-                    speed_limit: user.policy.speed_limit_mbps,
-                    device_limit: user.policy.device_limit,
-                    recorder: Some(tracker.clone()),
-                }),
-            ))
-        })
-        .collect()
+) -> std::io::Result<VlessUsers> {
+    // Validate every id up front with the node in the message, matching what
+    // the non-Vision VLESS path reports.
+    for user in &spec.users {
+        parse_vless_user_id(spec, user)?;
+    }
+    VlessUsers::new(server_users(spec, tracker)?)
 }
 
 fn parse_vless_user_id(
@@ -3063,7 +3214,14 @@ mod tests {
     }
 
     fn expect_build_err(spec: RuntimeNodeSpec) -> std::io::Error {
-        match build_runtime_node(spec, test_tracker(), test_resolver(), 10, None) {
+        match build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        ) {
             Ok(_) => panic!("expected runtime node build to fail"),
             Err(err) => err,
         }
@@ -3364,6 +3522,45 @@ mod tests {
         }
     }
 
+    /// A user-list change must reach the running listener without building a
+    /// new table container: the container is what the listener holds, and
+    /// replacing it is exactly the rebuild that left superseded tables pinned
+    /// by every open connection.
+    #[test]
+    fn publishing_users_reuses_the_listener_container() {
+        let tables = NodeUserTables::new();
+        let spec = shadowsocks_spec(
+            "aes-128-gcm",
+            None,
+            vec![
+                runtime_user(1, "user-one", None),
+                runtime_user(2, "user-two", None),
+            ],
+        );
+        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None, &tables)
+            .expect("listener builds");
+        // Keep the listener alive for the whole test, as an open connection would.
+        let _listener = node;
+
+        let published = tables.shadowsocks().expect("listener published its table");
+        assert_eq!(published.load().len(), 2);
+
+        // A later sync publishes a different user list.
+        let refreshed = shadowsocks_spec(
+            "aes-128-gcm",
+            None,
+            vec![runtime_user(3, "user-three", None)],
+        );
+        let table = build_shadowsocks_users(&refreshed, test_tracker(), 10).expect("table builds");
+        tables.publish_shadowsocks(table);
+
+        // Same container, new contents: nothing was rebuilt and the previous
+        // table has no remaining owner.
+        let after = tables.shadowsocks().expect("still published");
+        assert!(Arc::ptr_eq(&published, &after));
+        assert_eq!(published.load().len(), 1);
+    }
+
     fn runtime_user(uid: u64, credential: &str, secret: Option<String>) -> RuntimeUser {
         RuntimeUser {
             uid,
@@ -3385,7 +3582,15 @@ mod tests {
         let (tls, _dir) = runtime_tls_with_certificate();
         let spec = tuic_tls_spec(tls);
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Tuic {
@@ -3419,7 +3624,15 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3463,7 +3676,15 @@ mod tests {
             }),
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3487,7 +3708,15 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 { obfs, .. } => {
@@ -3557,7 +3786,15 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 { obfs, .. } => {
@@ -3601,7 +3838,15 @@ mod tests {
             masquerade: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Hysteria2 {
@@ -3629,17 +3874,25 @@ mod tests {
         let (tls, _dir) = runtime_tls_with_certificate();
         let spec = naiveproxy_tls_spec(tls);
 
-        let lookup = naiveproxy_user_lookup(&spec, test_tracker()).unwrap();
+        let lookup = naiveproxy_user_lookup(&spec, test_tracker(), &NodeUserTables::new()).unwrap();
         let auth_header = format!(
             "Basic {}",
             BASE64.encode("user-1:00000000-0000-0000-0000-000000000001")
         );
+        let lookup = lookup.load();
         let validated = lookup.validate(&auth_header).unwrap();
         assert_eq!(validated.name, "user-1");
         assert_eq!(validated.authenticated_user.unwrap().uid, 1);
 
-        let node =
-            build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec.clone(),
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::Tcp { .. } => {}
@@ -3666,7 +3919,15 @@ mod tests {
         };
         spec.transport = RuntimeTransport::Quic;
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::NaiveH3 {
@@ -3696,7 +3957,15 @@ mod tests {
         };
         spec.transport = RuntimeTransport::TcpAndQuic;
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         match node.kind {
             RuntimeNodeKind::NaiveCombined {
@@ -3797,7 +4066,8 @@ mod tests {
         second.password = Some("00000000-0000-0000-0000-000000000001".to_string());
         spec.users.push(second);
 
-        let err = naiveproxy_user_lookup(&spec, test_tracker()).unwrap_err();
+        let err =
+            naiveproxy_user_lookup(&spec, test_tracker(), &NodeUserTables::new()).unwrap_err();
 
         assert!(err.to_string().contains("duplicates user"));
     }
@@ -3844,7 +4114,15 @@ mod tests {
                 *udp_relay_mode = Some(mode.to_string());
             }
 
-            build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+            build_runtime_node(
+                spec,
+                test_tracker(),
+                test_resolver(),
+                10,
+                None,
+                &NodeUserTables::new(),
+            )
+            .unwrap();
         }
     }
 
@@ -4151,7 +4429,15 @@ mod tests {
             response_headers: HashMap::from([("X-Edge".to_string(), "ok".to_string())]),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4167,7 +4453,15 @@ mod tests {
             }),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4181,7 +4475,15 @@ mod tests {
             response_headers: HashMap::new(),
         };
 
-        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
+        build_runtime_node(
+            spec.clone(),
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
         assert_eq!(tls_alpn_for_transport(&spec, &runtime_tls()), vec!["h2"]);
     }
 
@@ -4197,7 +4499,15 @@ mod tests {
             }),
         };
 
-        build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4205,7 +4515,15 @@ mod tests {
         let (tls, _dir) = runtime_tls_with_certificate();
         let spec = anytls_tls_spec(tls);
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         assert_eq!(node.tag, "anytls-tls");
     }
@@ -4255,7 +4573,15 @@ mod tests {
         spec.config_node_type = NodeType::V2Node;
         spec.security = RuntimeSecurity::Reality(runtime_reality());
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         assert_eq!(node.tag, "anytls-tls");
     }
@@ -4284,7 +4610,15 @@ mod tests {
             response_headers: HashMap::new(),
         };
 
-        build_runtime_node(spec.clone(), test_tracker(), test_resolver(), 10, None).unwrap();
+        build_runtime_node(
+            spec.clone(),
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
         assert_eq!(selected_reality_alpn(&spec), Some("h2".to_string()));
     }
 
@@ -4395,7 +4729,15 @@ mod tests {
             encryption_settings: None,
         };
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         assert_eq!(node.tag, "ss-node");
     }
@@ -4476,7 +4818,15 @@ mod tests {
             )],
         );
 
-        let node = build_runtime_node(spec, test_tracker(), test_resolver(), 10, None).unwrap();
+        let node = build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .unwrap();
 
         assert_eq!(node.tag, "ss-node");
     }
@@ -4746,6 +5096,7 @@ runtime:
                 &manifest,
                 test_tracker(),
                 test_resolver(),
+                &NodeUserTables::new(),
             )
             .unwrap();
             assert_eq!(nodes.len(), 2);
@@ -4825,6 +5176,7 @@ v2board:
             &manifest,
             test_tracker(),
             test_resolver(),
+            &NodeUserTables::new(),
         ) {
             Ok(_) => panic!("expected TCP Brutal plugin graph to fail"),
             Err(error) => error,

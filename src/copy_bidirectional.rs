@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::async_stream::AsyncStream;
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 const DEFAULT_BUF_SIZE: usize = 16384;
 // Once one side reaches EOF, keep the opposite direction alive briefly for
@@ -32,12 +32,11 @@ struct CopyBuffer {
     start_index: usize,
     cache_length: usize,
     size: usize,
-    buf: Box<[u8]>,
+    buf: LazyBuffer,
 }
 
 impl CopyBuffer {
     pub fn new(size: usize, need_initial_flush: bool) -> Self {
-        let buf = allocate_vec(size);
         Self {
             read_done: false,
             need_flush: need_initial_flush,
@@ -45,7 +44,7 @@ impl CopyBuffer {
             start_index: 0,
             cache_length: 0,
             size,
-            buf: buf.into_boxed_slice(),
+            buf: LazyBuffer::new(size),
         }
     }
 
@@ -74,6 +73,10 @@ impl CopyBuffer {
             // packetize/write to the stream on poll_flush - and this also ends up being
             // beneficial since we are calling poll_flush each external loop iteration.
             while !self.read_done && self.cache_length < self.size {
+                // The only place bytes enter this buffer, so the only place it
+                // has to exist. All the circular arithmetic below is in terms
+                // of `self.size`, which a released buffer does not change.
+                self.buf.ensure();
                 let unused_start_index = (self.start_index + self.cache_length) % self.size;
                 let unused_end_index_exclusive = if unused_start_index < self.start_index {
                     self.start_index
@@ -170,11 +173,18 @@ impl CopyBuffer {
 
             // If we've written all the data and we've seen EOF, finish the transfer.
             if self.read_done && self.cache_length == 0 {
+                self.buf.release();
                 return Poll::Ready(Ok(()));
             }
 
             // Return Pending to prevent task starvation
             if read_pending || write_pending {
+                // Parked with nothing buffered. A proxied connection spends
+                // almost all of its life here -- an idle tunnel would otherwise
+                // hold both directions' buffers for as long as it stays open.
+                if self.cache_length == 0 {
+                    self.buf.release();
+                }
                 return Poll::Pending;
             }
         }
@@ -420,7 +430,99 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+    use super::{CopyBuffer, DEFAULT_BUF_SIZE};
     use crate::async_stream::{AsyncPing, AsyncStream};
+
+    /// Yields one chunk, then parks -- the shape of a connection that has just
+    /// finished forwarding and is waiting for its peer to say something else.
+    struct OnceThenPendingStream {
+        remaining: Option<&'static [u8]>,
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for OnceThenPendingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.remaining.take() {
+                Some(data) => {
+                    buf.put_slice(data);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for OnceThenPendingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for OnceThenPendingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for OnceThenPendingStream {}
+
+    #[tokio::test]
+    async fn a_parked_copy_holds_no_buffer() {
+        let mut copy = CopyBuffer::new(DEFAULT_BUF_SIZE, false);
+        assert_eq!(
+            copy.buf.held_bytes(),
+            0,
+            "a connection that has not moved a byte should not have paid for a buffer"
+        );
+
+        let mut reader = OnceThenPendingStream {
+            remaining: Some(b"hello"),
+            written: Vec::new(),
+        };
+        let mut writer = OnceThenPendingStream {
+            remaining: None,
+            written: Vec::new(),
+        };
+
+        let result = futures::future::poll_fn(|cx| {
+            Poll::Ready(copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer)))
+        })
+        .await;
+
+        assert!(result.is_pending(), "the reader parks after its one chunk");
+        assert_eq!(
+            writer.written, b"hello",
+            "the chunk still has to get through"
+        );
+        // Forwarded and drained, so the buffer goes back until the peer speaks
+        // again. An idle tunnel used to hold this for as long as it stayed open.
+        assert_eq!(
+            copy.buf.held_bytes(),
+            0,
+            "a drained, parked copy must not hold a buffer"
+        );
+    }
 
     struct PendingReadStream {
         shutdown_called: bool,

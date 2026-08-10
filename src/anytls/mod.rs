@@ -17,4 +17,4 @@ pub use anytls_client_handler::AnyTlsClientHandler;
 #[cfg(feature = "internal-bench")]
 pub use anytls_client_session::build_open_destination_frames_for_bench;
 pub use anytls_padding::PaddingFactory;
-pub use anytls_server_handler::AnyTlsServerHandler;
+pub use anytls_server_handler::{AnyTlsServerHandler, AnyTlsUsers};

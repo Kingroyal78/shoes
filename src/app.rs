@@ -7,9 +7,9 @@ use tokio::time::{Interval, interval};
 use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
 use crate::resolver::{CachingNativeResolver, Resolver};
 use crate::thread_util::set_num_threads;
-use crate::v2board::client::{FetchResult, V2BoardClient};
+use crate::v2board::client::{FetchResult, UserListFetch, V2BoardClient};
 use crate::v2board::lkg::{self, NodeLkgSnapshot};
-use crate::v2board::mapper::{map_node, map_shadowsocks_plugin_nodes};
+use crate::v2board::mapper::{map_node, map_shadowsocks_plugin_nodes, refresh_node_users};
 use crate::v2board::plugin_api::{
     AppliedFeature, OpaqueEtag, PluginApiError, PluginConfigApplied, PluginConfigCandidate,
     PluginConfigObserved, PluginStatusReport,
@@ -17,6 +17,7 @@ use crate::v2board::plugin_api::{
 use crate::v2board::runtime_graph::{RuntimeGraph, RuntimeGraphSlot};
 use crate::v2board::tracker::TrafficTracker;
 use crate::v2board::types::{ServerConfig, UserInfo};
+use crate::v2board::user_tables::NodeUserTables;
 
 pub async fn validate(config_path: &str) -> std::io::Result<()> {
     let config = AppConfig::load(config_path).await?;
@@ -167,12 +168,22 @@ struct NodeController {
     resolver: Arc<dyn Resolver>,
     server_etag: Option<String>,
     user_etag: Option<String>,
+    /// Digest of the user-list body last decoded, so an identical one can be
+    /// recognised without paying to decode it again.
+    user_body_hash: Option<[u8; 32]>,
     server_config: Option<ServerConfig>,
     users: Option<Vec<UserInfo>>,
     plugin_candidate: Option<PluginConfigCandidate>,
     plugin_applied: Option<PluginConfigApplied>,
     force_plugin_refresh: bool,
+    /// Set when the on-disk snapshot is known to be behind the applied state,
+    /// so a failed persist is retried even though nothing changed afterwards.
+    lkg_persist_pending: bool,
     runtime: NodeRuntime,
+    /// User tables shared with the live listeners. They outlive runtime
+    /// generations so a user-list change is published in place instead of
+    /// rebuilding listeners that open connections would then pin.
+    user_tables: NodeUserTables,
 }
 
 impl NodeController {
@@ -191,12 +202,15 @@ impl NodeController {
             resolver,
             server_etag: None,
             user_etag: None,
+            user_body_hash: None,
             server_config: None,
             users: None,
             plugin_candidate: None,
             plugin_applied: None,
             force_plugin_refresh: false,
+            lkg_persist_pending: false,
             runtime: NodeRuntime::default(),
+            user_tables: NodeUserTables::new(),
         }
     }
 
@@ -283,10 +297,14 @@ impl NodeController {
 
     async fn sync(&mut self) -> std::io::Result<()> {
         let mut changed = false;
-        let mut cache_updated = false;
+        // Tracked apart from `changed` so a sync that touched only the user
+        // list can be published into the running listeners.
+        let mut users_changed = false;
+        let mut non_user_changed = false;
         let mut next_server_etag = self.server_etag.clone();
         let mut next_server_config = self.server_config.clone();
         let mut next_user_etag = self.user_etag.clone();
+        let mut next_user_body_hash = self.user_body_hash;
         let mut next_users = self.users.clone();
         let mut next_plugin_candidate = self.plugin_candidate.clone();
 
@@ -301,7 +319,7 @@ impl NodeController {
                 next_server_etag = etag;
                 next_server_config = Some(value);
                 changed |= config_changed;
-                cache_updated = true;
+                non_user_changed |= config_changed;
             }
         }
 
@@ -321,7 +339,7 @@ impl NodeController {
                 PluginConfigObserved::Candidate(candidate) => {
                     next_plugin_candidate = Some(candidate);
                     changed = true;
-                    cache_updated = true;
+                    non_user_changed = true;
                 }
             }
             self.force_plugin_refresh = false;
@@ -329,16 +347,32 @@ impl NodeController {
 
         match self
             .client
-            .get_user_list(&self.config, &self.node, self.user_etag.as_deref())
+            .get_user_list(
+                &self.config,
+                &self.node,
+                self.user_etag.as_deref(),
+                self.user_body_hash.as_ref(),
+            )
             .await?
         {
-            FetchResult::NotModified => {}
-            FetchResult::Updated { etag, value } => {
-                let users_changed = self.users.as_ref() != Some(&value.users);
+            UserListFetch::NotModified => {}
+            UserListFetch::Unchanged { etag } => {
+                // Same bytes as last time: nothing to decode, nothing to
+                // compare, nothing to apply. The validator is still taken, so a
+                // panel that does answer conditional requests can graduate to
+                // 304 and skip sending the body at all.
+                next_user_etag = etag;
+            }
+            UserListFetch::Updated {
+                etag,
+                value,
+                body_hash,
+            } => {
+                users_changed = self.users.as_ref() != Some(&value.users);
                 next_user_etag = etag;
                 next_users = Some(value.users);
+                next_user_body_hash = Some(body_hash);
                 changed |= users_changed;
-                cache_updated = true;
             }
         }
 
@@ -362,8 +396,23 @@ impl NodeController {
         if applied_generation {
             let server = next_server_config.as_ref().unwrap();
             let users = next_users.as_ref().unwrap();
-            self.apply_runtime(server, users, next_plugin_candidate.as_ref())
-                .await?;
+            // A sync that only changed the user list can be published into the
+            // running listeners. Replacing the generation instead would leave
+            // the superseded listener — and its whole user table — resident
+            // until the last connection it accepted closes.
+            let users_only = users_changed
+                && !non_user_changed
+                && !self.runtime.is_empty()
+                && self.user_tables.is_published();
+            let refreshed = if users_only {
+                self.refresh_users(server, users)?
+            } else {
+                false
+            };
+            if !refreshed {
+                self.apply_runtime(server, users, next_plugin_candidate.as_ref())
+                    .await?;
+            }
         }
 
         // The conditional request validators and cached values describe the
@@ -373,35 +422,81 @@ impl NodeController {
         let previous_server_etag = self.server_etag.clone();
         let previous_server_config = self.server_config.clone();
         let previous_user_etag = self.user_etag.clone();
+        let previous_user_body_hash = self.user_body_hash;
         let previous_users = self.users.clone();
         let previous_plugin_candidate = self.plugin_candidate.clone();
 
         self.server_etag = next_server_etag;
         self.server_config = next_server_config;
         self.user_etag = next_user_etag;
+        self.user_body_hash = next_user_body_hash;
         self.users = next_users;
         self.plugin_candidate = next_plugin_candidate;
 
-        if (applied_generation || cache_updated)
-            && let Err(e) = self.persist_lkg().await
-        {
-            // LKG persist failed (e.g. disk full/permissions). Rolling back
-            // the committed validators forces the next pull to re-fetch the
-            // payloads and retry the persist, instead of seeing 304s and
-            // freezing the on-disk crash-recovery point indefinitely.
-            log::error!(
-                "node `{}` LKG persist failed; will retry on next sync: {e}",
-                self.node.tag
-            );
-            self.server_etag = previous_server_etag;
-            self.server_config = previous_server_config;
-            self.user_etag = previous_user_etag;
-            self.users = previous_users;
-            self.plugin_candidate = previous_plugin_candidate;
-            return Err(e);
+        // Persist only when the snapshot's *contents* moved, not merely because
+        // a fetch came back 200 instead of 304. A panel that does not honour
+        // conditional requests re-sends an identical user list every pull, and
+        // rewriting the whole snapshot each time to record nothing but a new
+        // ETag is the largest source of write amplification on a node -- it
+        // scales with the user count and repeats every interval forever.
+        //
+        // What that costs is one stale validator: after a restart the node
+        // offers the older ETag and gets a full body back instead of a 304,
+        // once. The snapshot's contents stay correct, because everything that
+        // changes them sets `applied_generation`.
+        if applied_generation || self.lkg_persist_pending {
+            match self.persist_lkg().await {
+                Ok(()) => self.lkg_persist_pending = false,
+                Err(e) => {
+                    // LKG persist failed (e.g. disk full/permissions). The
+                    // retry used to come from rolling the validators back so
+                    // the next pull re-fetched and re-persisted; now that an
+                    // unchanged payload no longer triggers a persist, the
+                    // intent is recorded directly, so the on-disk recovery
+                    // point still cannot freeze behind 304s. The rollback
+                    // stays -- it also re-derives the payloads the snapshot is
+                    // built from.
+                    log::error!(
+                        "node `{}` LKG persist failed; will retry on next sync: {e}",
+                        self.node.tag
+                    );
+                    self.lkg_persist_pending = true;
+                    self.server_etag = previous_server_etag;
+                    self.server_config = previous_server_config;
+                    self.user_etag = previous_user_etag;
+                    self.user_body_hash = previous_user_body_hash;
+                    self.users = previous_users;
+                    self.plugin_candidate = previous_plugin_candidate;
+                    return Err(e);
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Publish a new user list into the live listeners.
+    ///
+    /// Returns `false` when this node has no hot-swappable table, so the caller
+    /// falls back to replacing the runtime generation.
+    fn refresh_users(
+        &mut self,
+        server: &ServerConfig,
+        users: &[UserInfo],
+    ) -> std::io::Result<bool> {
+        let active_uids: std::collections::HashSet<u64> =
+            users.iter().map(|user| user.id).collect();
+        crate::tcp::tcp_server::reconcile_speed_limiters(&self.node.tag, &active_uids);
+        self.tracker.reconcile_users(&self.node.tag, &active_uids);
+
+        refresh_node_users(
+            &self.config,
+            &self.node,
+            server,
+            users,
+            self.tracker.clone(),
+            &self.user_tables,
+        )
     }
 
     async fn apply_runtime(
@@ -410,6 +505,13 @@ impl NodeController {
         users: &[UserInfo],
         plugin_candidate: Option<&PluginConfigCandidate>,
     ) -> std::io::Result<()> {
+        // Reconcile process-global per-user state against the panel truth so
+        // entries for deleted users cannot accumulate forever.
+        let active_uids: std::collections::HashSet<u64> =
+            users.iter().map(|user| user.id).collect();
+        crate::tcp::tcp_server::reconcile_speed_limiters(&self.node.tag, &active_uids);
+        self.tracker.reconcile_users(&self.node.tag, &active_uids);
+
         if self.node.node_type == NodeType::Shadowsocks {
             let candidate = plugin_candidate.ok_or_else(|| {
                 std::io::Error::other(format!(
@@ -425,6 +527,7 @@ impl NodeController {
                 candidate.manifest(),
                 self.tracker.clone(),
                 self.resolver.clone(),
+                &self.user_tables,
             )?;
             let features = plugin_features(candidate);
             let graph = RuntimeGraph::new(
@@ -450,6 +553,7 @@ impl NodeController {
                 users,
                 self.tracker.clone(),
                 self.resolver.clone(),
+                &self.user_tables,
             )?;
             self.runtime
                 .replace(RuntimeGraph::single(runtime_node), self.resolver.clone())
@@ -496,7 +600,7 @@ impl NodeController {
             users,
             self.plugin_candidate.as_ref(),
         )?;
-        lkg::persist(&self.config.runtime.data_dir, &self.node, &snapshot).await
+        lkg::persist(&self.config.runtime.data_dir, &self.node, snapshot).await
     }
 
     async fn push(&mut self) -> std::io::Result<()> {

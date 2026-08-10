@@ -7,11 +7,16 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
-use crate::util::allocate_vec;
+
+/// A VLESS message carries at most a `u16` payload plus its 2-byte length
+/// header, so the read buffer never needs more than this many bytes.
+const MAX_MESSAGE_BUF_SIZE: usize = u16::MAX as usize + 2;
 
 pub struct VlessMessageStream<S> {
     stream: S,
-    read_buf: Box<[u8]>,
+    /// Grows on demand up to `MAX_MESSAGE_BUF_SIZE` so idle or small-frame
+    /// connections do not hold a 64 KB read buffer each.
+    read_buf: Vec<u8>,
     read_end_index: usize,
     pending_write: Vec<u8>,
     write_offset: usize,
@@ -22,20 +27,39 @@ impl<S: AsyncStream> VlessMessageStream<S> {
     pub fn new(stream: S) -> Self {
         Self {
             stream,
-            read_buf: allocate_vec(65537).into_boxed_slice(),
+            read_buf: Vec::new(),
             read_end_index: 0,
-            pending_write: Vec::with_capacity(65537),
+            pending_write: Vec::new(),
             write_offset: 0,
             is_eof: false,
         }
     }
 
+    /// Grow the read buffer (doubling, capped at the maximum message size)
+    /// when it has no room for another read. Keeps the framing invariant that
+    /// `read_end_index <= read_buf.len()` and that a full message always fits.
+    fn ensure_read_capacity(&mut self) {
+        if self.read_end_index < self.read_buf.len() {
+            return;
+        }
+        if self.read_buf.len() < MAX_MESSAGE_BUF_SIZE {
+            let target = self
+                .read_buf
+                .len()
+                .saturating_mul(2)
+                .clamp(4096, MAX_MESSAGE_BUF_SIZE);
+            self.read_buf.resize(target, 0);
+        }
+    }
+
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if data.len() > self.read_buf.len() {
+        if data.len() > MAX_MESSAGE_BUF_SIZE {
             return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
+        self.read_buf
+            .resize(data.len().clamp(4096, MAX_MESSAGE_BUF_SIZE), 0);
         self.read_buf[0..data.len()].copy_from_slice(data);
         self.read_end_index = data.len();
         Ok(())
@@ -85,9 +109,11 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                 }
             }
 
+            // Make sure the read buffer has room before reading more data.
+            // The buffer grows on demand up to MAX_MESSAGE_BUF_SIZE, which can
+            // always hold a full message (u16 payload + 2-byte header).
+            this.ensure_read_capacity();
             let read_buf_slice = &mut this.read_buf[this.read_end_index..];
-            // this is impossible because our buffer size is u16::MAX + 2, so there should always
-            // be space for a full message.
             assert!(!read_buf_slice.is_empty());
             let mut tmp = ReadBuf::new(read_buf_slice);
             match Pin::new(&mut this.stream).poll_read(cx, &mut tmp) {
@@ -293,5 +319,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_buf.filled(), b"xyz");
+    }
+
+    #[tokio::test]
+    async fn read_buffer_grows_lazily_and_handles_max_message() {
+        let (writer, reader) = duplex(65536);
+        let mut stream = VlessMessageStream::new(TestStream(reader));
+
+        // No read happened yet: no 64 KB buffer is reserved upfront.
+        assert!(stream.read_buf.len() < MAX_MESSAGE_BUF_SIZE);
+
+        // A maximum-size message must still be readable end to end.
+        let payload = vec![0x42u8; 65535];
+        let mut frame = Vec::with_capacity(65537);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+        let writer2 = writer.clone();
+        let write_task = tokio::spawn(async move {
+            writer2.lock().await.write_all(&frame).await.unwrap();
+        });
+
+        let mut out = vec![0u8; 65535];
+        let mut read_buf = ReadBuf::new(&mut out);
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut read_buf))
+            .await
+            .unwrap();
+        write_task.await.unwrap();
+        assert_eq!(read_buf.filled(), &payload[..]);
     }
 }

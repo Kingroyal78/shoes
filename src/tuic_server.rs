@@ -29,6 +29,7 @@ use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
+use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::AuthenticatedUser;
 use crate::tcp::tcp_server::{AuthenticatedConnectionScope, setup_client_tcp_stream};
@@ -166,11 +167,11 @@ impl TuicServerUser {
 }
 
 #[derive(Clone, Debug)]
-pub struct TuicServerUsers {
-    users_by_uuid: Arc<HashMap<[u8; 16], TuicServerUser>>,
+pub struct TuicUserTable {
+    users_by_uuid: HashMap<[u8; 16], TuicServerUser>,
 }
 
-impl TuicServerUsers {
+impl TuicUserTable {
     pub fn new(users: Vec<TuicServerUser>) -> std::io::Result<Self> {
         if users.is_empty() {
             return Err(std::io::Error::new(
@@ -195,13 +196,36 @@ impl TuicServerUsers {
             }
         }
 
+        Ok(Self { users_by_uuid })
+    }
+
+    pub fn len(&self) -> usize {
+        self.users_by_uuid.len()
+    }
+}
+
+/// The user set of a TUIC listener, replaceable while the listener keeps
+/// running so a user-list change does not rebuild it.
+#[derive(Clone)]
+pub struct TuicServerUsers {
+    users: Arc<SharedUsers<TuicUserTable>>,
+}
+
+impl TuicServerUsers {
+    pub fn new(users: Vec<TuicServerUser>) -> std::io::Result<Self> {
         Ok(Self {
-            users_by_uuid: Arc::new(users_by_uuid),
+            users: SharedUsers::new(TuicUserTable::new(users)?),
         })
     }
 
-    fn get(&self, uuid: &[u8; 16]) -> Option<&TuicServerUser> {
-        self.users_by_uuid.get(uuid)
+    pub fn from_shared(users: Arc<SharedUsers<TuicUserTable>>) -> Self {
+        Self { users }
+    }
+
+    /// Returns the matched user by value: the table borrow must not outlive
+    /// the lookup, or a replaced table would stay pinned by the connection.
+    fn get(&self, uuid: &[u8; 16]) -> Option<TuicServerUser> {
+        self.users.load().users_by_uuid.get(uuid).cloned()
     }
 }
 
@@ -994,12 +1018,25 @@ async fn run_udp_session_loop(
             packet = rx.recv() => {
                 match packet {
                     Some((payload, _socket_addr)) => {
-                        poll_fn(|cx| Pin::new(&mut client_stream).poll_write_message(cx, &payload))
-                            .await
-                            .map_err(|e| std::io::Error::other(format!("UDP session write failed: {e}")))?;
-                        poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
-                            .await
-                            .map_err(|e| std::io::Error::other(format!("UDP session flush failed: {e}")))?;
+                        // Cancellation-aware write: a stalled upstream write
+                        // must not wedge the session loop (and with it the
+                        // whole connection's datagram forwarding) forever.
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                return Ok(());
+                            }
+                            result = async {
+                                poll_fn(|cx| Pin::new(&mut client_stream).poll_write_message(cx, &payload))
+                                    .await
+                                    .map_err(|e| std::io::Error::other(format!("UDP session write failed: {e}")))?;
+                                poll_fn(|cx| Pin::new(&mut client_stream).poll_flush_message(cx))
+                                    .await
+                                    .map_err(|e| std::io::Error::other(format!("UDP session flush failed: {e}")))?;
+                                Ok::<(), std::io::Error>(())
+                            } => {
+                                result?;
+                            }
+                        }
                     }
                     None => return Ok(()),
                 }
