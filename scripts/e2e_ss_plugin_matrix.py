@@ -287,6 +287,12 @@ def _build_cases() -> list[Case]:
         _restls("restls-script-resp-max", "restls-probe", script="100<127"),
         _restls("restls-script-mid", "restls-probe", script="8192<64"),
         _restls("restls-script-resp-32", "restls-probe", script="100<32"),
+        _restls("restls-script-resp-33", "restls-probe", script="100<33"),
+        _restls("restls-script-resp-36", "restls-probe", script="100<36"),
+        _restls("restls-script-target-max-32", "restls-probe", script="16364<32"),
+        _restls("restls-probe-big-2", "restls-probe", script="16364<2"),
+        _restls("restls-probe-4k-32", "restls-probe", script="4096<32"),
+        _restls("restls-probe-50-64", "restls-probe", script="50<64"),
         _restls("restls-script-resp-40", "restls-probe", script="100<40"),
         _restls("restls-script-resp-48", "restls-probe", script="100<48"),
         _restls("restls-script-resp-64", "restls-probe", script="100<64"),
@@ -475,6 +481,7 @@ def main() -> int:
     mihomo.add_argument("--server", default="127.0.0.1")
     mihomo.add_argument("--camouflage-host", default="127.0.0.1")
     mihomo.add_argument("--restls-script", default="")
+    mihomo.add_argument("--log-level", default="info")
 
     args = parser.parse_args()
 
@@ -540,7 +547,7 @@ mixed-port: {args.mixed_port}
 bind-address: 127.0.0.1
 allow-lan: false
 mode: rule
-log-level: info
+log-level: {args.log_level}
 ipv6: false
 proxies:
   - name: e2e

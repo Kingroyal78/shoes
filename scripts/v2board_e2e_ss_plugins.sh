@@ -79,6 +79,7 @@ E2E_WAIT_TIMEOUT_SECS="${E2E_WAIT_TIMEOUT_SECS:-60}"
 E2E_CURL_MAX_TIME_SECS="${E2E_CURL_MAX_TIME_SECS:-45}"
 E2E_KEEP_FIXTURES="${E2E_KEEP_FIXTURES:-1}"
 E2E_SHOES_LOG_LEVEL="${E2E_SHOES_LOG_LEVEL:-info}"
+E2E_MIHOMO_LOG_LEVEL="${E2E_MIHOMO_LOG_LEVEL:-info}"
 
 # Fixture identity and ports are index-derived, so a larger matrix needs a
 # wider window than the reserved base-group ranges. Override these when running
@@ -397,7 +398,8 @@ write_mihomo_config() {
     --mixed-port "${mixed_port}" \
     --password "${password}" \
     --camouflage-host "${CAMOUFLAGE_HOST}" \
-    --restls-script "${RESTLS_SCRIPT}" >"${output}"
+    --restls-script "${RESTLS_SCRIPT}" \
+    --log-level "${E2E_MIHOMO_LOG_LEVEL}" >"${output}"
 }
 
 write_mihomo_config_from_subscription() {
