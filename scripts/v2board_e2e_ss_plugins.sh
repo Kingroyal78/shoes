@@ -42,7 +42,33 @@ V2BOARD_MYSQL_DATABASE="${V2BOARD_MYSQL_DATABASE:-v2board}"
 
 SHOES_BIN="${SHOES_BIN:-${ROOT_DIR}/target/debug/shoes}"
 MIHOMO_BIN="${E2E_MIHOMO_BIN:-/tmp/mihomo-interop}"
-CASES="${E2E_SS_PLUGIN_CASES:-obfs-http,obfs-tls,v2ray-ws,v2ray-wss,v2ray-ws-mux,v2ray-wss-mux,v2ray-http-upgrade,v2ray-https-upgrade,gost-ws,gost-wss,gost-ws-mux,gost-wss-mux,shadowtls-v1,shadowtls-v2,shadowtls-v3,restls,kcptun-v1,kcptun-v2}"
+
+# The case matrix is declarative and shared by the profile and the Mihomo
+# config, so an option combination is described exactly once.
+MATRIX_BIN="${SCRIPT_DIR}/e2e_ss_plugin_matrix.py"
+E2E_SS_PLUGIN_GROUPS="${E2E_SS_PLUGIN_GROUPS:-base}"
+
+# matrix: drive Mihomo with the case definition (runtime interop only).
+# subscription: drive it with the panel's own client payload, so the panel
+# description, the client parser and the backend are checked as one chain.
+# The dialect the panel emits depends on the client version it sees, so the
+# user agent and the Mihomo binary must be moved together.
+E2E_SS_PLUGIN_CLIENT="${E2E_SS_PLUGIN_CLIENT:-matrix}"
+E2E_MIHOMO_UA="${E2E_MIHOMO_UA:-mihomo/v1.19.29}"
+# Empty by default: a real client sends no `flag`, and the panel only sees a
+# client's version through the User-Agent when the parameter is absent.
+E2E_SUBSCRIBE_FLAG="${E2E_SUBSCRIBE_FLAG:-}"
+
+matrix_cases() {
+  local -a group_args=()
+  local group
+  for group in ${E2E_SS_PLUGIN_GROUPS//,/ }; do
+    group_args+=(--group "${group}")
+  done
+  python3 "${MATRIX_BIN}" list "${group_args[@]}" --joined
+}
+
+CASES="${E2E_SS_PLUGIN_CASES:-$(matrix_cases)}"
 PAYLOAD_SIZE="${E2E_PAYLOAD_SIZE:-524288}"
 E2E_BIND_HOST="${E2E_BIND_HOST:-127.0.0.1}"
 CAMOUFLAGE_HOST="${E2E_CAMOUFLAGE_HOST:-127.0.0.1}"
@@ -54,11 +80,14 @@ E2E_CURL_MAX_TIME_SECS="${E2E_CURL_MAX_TIME_SECS:-45}"
 E2E_KEEP_FIXTURES="${E2E_KEEP_FIXTURES:-1}"
 E2E_SHOES_LOG_LEVEL="${E2E_SHOES_LOG_LEVEL:-info}"
 
-CASE_NODE_BASE=9601
-CASE_USER_BASE=19601
-CASE_RAW_PORT_BASE=18601
-CASE_PLUGIN_PORT_BASE=18701
-CASE_TARGET_PORT_BASE=18650
+# Fixture identity and ports are index-derived, so a larger matrix needs a
+# wider window than the reserved base-group ranges. Override these when running
+# a group that does not fit between the neighbouring scripts' reservations.
+CASE_NODE_BASE="${E2E_CASE_NODE_BASE:-9601}"
+CASE_USER_BASE="${E2E_CASE_USER_BASE:-19601}"
+CASE_RAW_PORT_BASE="${E2E_CASE_RAW_PORT_BASE:-18601}"
+CASE_PLUGIN_PORT_BASE="${E2E_CASE_PLUGIN_PORT_BASE:-18701}"
+CASE_TARGET_PORT_BASE="${E2E_CASE_TARGET_PORT_BASE:-18650}"
 
 TMP_DIR=""
 PIDS=()
@@ -78,35 +107,24 @@ case_index() {
 }
 
 case_kind() {
-  local name="$1"
-  if [[ "${name}" == v2ray-* ]]; then
-    printf 'v2ray-plugin\n'
-  elif [[ "${name}" == gost-* ]]; then
-    printf 'gost-plugin\n'
-  elif [[ "${name}" == shadowtls-* ]]; then
-    printf 'shadow-tls\n'
-  elif [[ "${name}" == kcptun-* ]]; then
-    printf 'kcptun\n'
-  elif [[ "${name}" == obfs-* ]]; then
-    printf 'obfs\n'
-  elif [[ "${name}" == restls ]]; then
-    printf 'restls\n'
-  else
-    e2e_die "unknown case ${name}"
-  fi
+  python3 "${MATRIX_BIN}" kind "$1" || e2e_die "unknown case $1"
 }
 
 plugin_feature() {
-  local kind
-  kind="$(case_kind "$1")"
-  case "${kind}" in
-    v2ray-plugin) printf 'shadowsocks-plugin-v2ray-v1\n' ;;
-    gost-plugin) printf 'shadowsocks-plugin-gost-v1\n' ;;
-    shadow-tls) printf 'shadowsocks-plugin-shadow-tls-v1\n' ;;
-    kcptun) printf 'shadowsocks-plugin-kcptun-v1\n' ;;
-    obfs) printf 'shadowsocks-plugin-obfs-v1\n' ;;
-    restls) printf 'shadowsocks-plugin-restls-v1\n' ;;
-  esac
+  python3 "${MATRIX_BIN}" feature "$1" || e2e_die "unknown case $1"
+}
+
+# CASE_KIND / CASE_FEATURE / CASE_NEEDS_* for one case, as shell assignments.
+# Which fixtures a case needs is derived from its definition rather than from
+# the shape of its name, so a new case name cannot silently skip a fixture.
+# The fixture user's UUID doubles as its Shadowsocks credential, so it is
+# derived from the user id and stays unique across fixture ID windows.
+case_uuid() {
+  printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+case_flags() {
+  python3 "${MATRIX_BIN}" flags "$1" || e2e_die "unknown case $1"
 }
 
 mysql_exec() {
@@ -142,104 +160,11 @@ discover_server_token() {
 
 profile_for_case() {
   local case_name="$1"
-  local raw_port="$2"
   local plugin_port="$3"
-  python3 - \
-    "${case_name}" \
-    "${raw_port}" \
-    "${plugin_port}" \
-    "${CAMOUFLAGE_HOST}" \
-    "${RESTLS_SCRIPT}" <<'PY'
-import json
-import sys
-
-case, raw_port, plugin_port, camouflage_host, restls_script = sys.argv[1:]
-raw_port, plugin_port = int(raw_port), int(plugin_port)
-
-def options_for_case():
-    if case.startswith("obfs-"):
-        return {"mode": case.removeprefix("obfs-"), "host": "interop.test"}
-    if case.startswith("v2ray-"):
-        tls = case in ("v2ray-wss", "v2ray-wss-mux", "v2ray-https-upgrade")
-        opts = {
-            "mode": "websocket",
-            "host": "interop.test",
-            "path": "/interop",
-            "tls": tls,
-            "fingerprint": "",
-            "skip_cert_verify": tls,
-            "mux": case in ("v2ray-ws-mux", "v2ray-wss-mux"),
-            "v2ray_http_upgrade": case in ("v2ray-http-upgrade", "v2ray-https-upgrade"),
-            "v2ray_http_upgrade_fast_open": False,
-        }
-        return opts
-    if case.startswith("gost-"):
-        tls = case in ("gost-wss", "gost-wss-mux")
-        return {
-            "mode": "websocket",
-            "host": "interop.test",
-            "path": "/interop",
-            "tls": tls,
-            "fingerprint": "",
-            "skip_cert_verify": tls,
-            "mux": case in ("gost-ws-mux", "gost-wss-mux"),
-        }
-    if case.startswith("shadowtls-"):
-        version = int(case[-1])
-        opts = {"host": camouflage_host, "version": version}
-        if version > 1:
-            opts["password"] = "shadowtls-interop-password"
-        return opts
-    if case == "restls":
-        return {
-            "host": camouflage_host,
-            "password": "restls-interop-password",
-            "version_hint": "tls13",
-            "restls_script": restls_script,
-        }
-    if case.startswith("kcptun-"):
-        return {
-            "key": "shoes-kcptun-interop",
-            "crypt": "aes-128",
-            "mode": "manual",
-            "conn": 1,
-            "autoexpire": 0,
-            "scavengettl": 60,
-            "mtu": 1350,
-            "ratelimit": 0,
-            "sndwnd": 256,
-            "rcvwnd": 512,
-            "datashard": 4,
-            "parityshard": 2,
-            "dscp": 0,
-            "nocomp": False,
-            "acknodelay": True,
-            "nodelay": 1,
-            "interval": 10,
-            "resend": 2,
-            "nc": 1,
-            "sockbuf": 4194304,
-            "smuxver": int(case[-1]),
-            "smuxbuf": 4194304,
-            "framesize": 8192,
-            "streambuf": 1048576,
-            "keepalive": 1,
-        }
-    raise SystemExit(f"unsupported case: {case}")
-
-plugin = {
-    "type": {
-        "obfs-http": "obfs", "obfs-tls": "obfs",
-    }.get(case, "v2ray-plugin" if case.startswith("v2ray-") else "gost-plugin" if case.startswith("gost-") else "shadow-tls" if case.startswith("shadowtls-") else "restls" if case == "restls" else "kcptun"),
-    "endpoint_host": "127.0.0.1",
-    "endpoint_port": plugin_port,
-    "options": options_for_case(),
-}
-profile = {"version": 1, "plugin": plugin}
-if case.startswith("shadowtls-") or case == "restls":
-    profile["client_fingerprint"] = "chrome"
-print(json.dumps(profile, separators=(",", ":")))
-PY
+  python3 "${MATRIX_BIN}" profile "${case_name}" \
+    --plugin-port "${plugin_port}" \
+    --camouflage-host "${CAMOUFLAGE_HOST}" \
+    --restls-script "${RESTLS_SCRIPT}"
 }
 
 encode_profile_blob() {
@@ -257,6 +182,8 @@ echo $service->prepareForSave([], $profile);
 ' 2>/dev/null
 }
 
+# The user's subscription token is char(32) in the panel schema, so it is
+# derived from the numeric user id rather than the case name.
 seed_fixture() {
   local case_name="$1"
   local node_id="$2"
@@ -306,7 +233,7 @@ SQL
 INSERT INTO v2_user
 (id, invite_user_id, telegram_id, email, language, password, password_algo, password_salt, balance, discount, commission_type, commission_rate, commission_balance, t, u, d, transfer_enable, device_limit, banned, is_admin, last_login_at, is_staff, last_login_ip, uuid, group_id, plan_id, speed_limit, auto_renewal, remind_expire, remind_traffic, token, expired_at, remarks, created_at, updated_at)
 VALUES
-(${user_id}, NULL, NULL, 'shoes-e2e-${case_name}@example.local', NULL, 'e2e-password', NULL, NULL, 0, NULL, 0, NULL, 0, 0, 0, 0, 1073741824, NULL, 0, 0, NULL, 0, NULL, '00000000-0000-4000-8000-0000000${node_id}', ${group_id}, NULL, NULL, 0, 1, 1, 'shoes-e2e-${case_name}', $((now + 86400)), 'shoes ss plugin e2e user', ${now}, ${now})
+(${user_id}, NULL, NULL, 'shoes-e2e-u${user_id}-${case_name}@example.local', NULL, 'e2e-password', NULL, NULL, 0, NULL, 0, NULL, 0, 0, 0, 0, 1073741824, NULL, 0, 0, NULL, 0, NULL, '$(case_uuid "${user_id}")', ${group_id}, NULL, NULL, 0, 1, 1, 'shoes-e2e-u${user_id}', $((now + 86400)), 'shoes ss plugin e2e user', ${now}, ${now})
 ON DUPLICATE KEY UPDATE
   banned=0,
   transfer_enable=VALUES(transfer_enable),
@@ -314,6 +241,8 @@ ON DUPLICATE KEY UPDATE
   d=0,
   t=0,
   uuid=VALUES(uuid),
+  token=VALUES(token),
+  email=VALUES(email),
   group_id=VALUES(group_id),
   speed_limit=NULL,
   device_limit=NULL,
@@ -463,118 +392,35 @@ write_mihomo_config() {
   local plugin_port="$3"
   local mixed_port="$4"
   local password="$5"
-  python3 - \
-    "${output}" \
-    "${case_name}" \
-    "${plugin_port}" \
-    "${mixed_port}" \
-    "${CAMOUFLAGE_HOST}" \
-    "${password}" <<'PY'
-import json
-import pathlib
-import sys
+  python3 "${MATRIX_BIN}" mihomo "${case_name}" \
+    --plugin-port "${plugin_port}" \
+    --mixed-port "${mixed_port}" \
+    --password "${password}" \
+    --camouflage-host "${CAMOUFLAGE_HOST}" \
+    --restls-script "${RESTLS_SCRIPT}" >"${output}"
+}
 
-output, case, plugin_port, mixed_port, camouflage_host, password = sys.argv[1:]
-plugin = ""
-plugin_opts = []
-if case.startswith("obfs-"):
-    plugin = "obfs"
-    plugin_opts = [
-        f"mode: {case.removeprefix('obfs-')}",
-        "host: interop.test",
-    ]
-elif case.startswith("v2ray-"):
-    plugin = "v2ray-plugin"
-    plugin_opts = [
-        "mode: websocket",
-        "host: interop.test",
-        "path: /interop",
-        f"tls: {'true' if case in ('v2ray-wss', 'v2ray-wss-mux', 'v2ray-https-upgrade') else 'false'}",
-        f"skip-cert-verify: {'true' if case in ('v2ray-wss', 'v2ray-wss-mux', 'v2ray-https-upgrade') else 'false'}",
-        f"mux: {'true' if case in ('v2ray-ws-mux', 'v2ray-wss-mux') else 'false'}",
-        f"v2ray-http-upgrade: {'true' if case in ('v2ray-http-upgrade', 'v2ray-https-upgrade') else 'false'}",
-    ]
-elif case.startswith("gost-"):
-    plugin = "gost-plugin"
-    plugin_opts = [
-        "mode: websocket",
-        "host: interop.test",
-        "path: /interop",
-        f"tls: {'true' if case in ('gost-wss', 'gost-wss-mux') else 'false'}",
-        f"skip-cert-verify: {'true' if case in ('gost-wss', 'gost-wss-mux') else 'false'}",
-        f"mux: {'true' if case in ('gost-ws-mux', 'gost-wss-mux') else 'false'}",
-    ]
-elif case.startswith("kcptun-"):
-    plugin = "kcptun"
-    plugin_opts = [
-        "key: shoes-kcptun-interop",
-        "crypt: aes-128",
-        "mode: manual",
-        "conn: 1",
-        "autoexpire: 0",
-        "scavengettl: 60",
-        "mtu: 1350",
-        "ratelimit: 0",
-        "sndwnd: 256",
-        "rcvwnd: 512",
-        "datashard: 4",
-        "parityshard: 2",
-        "dscp: 0",
-        "nocomp: false",
-        "acknodelay: true",
-        "nodelay: 1",
-        "interval: 10",
-        "resend: 2",
-        "nc: 1",
-        "sockbuf: 4194304",
-        f"smuxver: {case[-1]}",
-        "smuxbuf: 4194304",
-        "framesize: 8192",
-        "streambuf: 1048576",
-        "keepalive: 1",
-    ]
-elif case.startswith("shadowtls-"):
-    plugin = "shadow-tls"
-    plugin_opts = [
-        f"host: {camouflage_host}",
-        f"version: {case[-1]}",
-        "password: shadowtls-interop-password",
-        "skip-cert-verify: true",
-    ]
-elif case == "restls":
-    plugin = "restls"
-    plugin_opts = [
-        f"host: {camouflage_host}",
-        "password: restls-interop-password",
-        "version-hint: tls13",
-        f"restls-script: {json.dumps(__import__('os').environ.get('E2E_RESTLS_SCRIPT', ''))}",
-        "skip-cert-verify: true",
-    ]
-else:
-    raise SystemExit(f"unsupported Mihomo case: {case}")
+write_mihomo_config_from_subscription() {
+  local output="$1"
+  local case_name="$2"
+  local user_id="$3"
+  local plugin_port="$4"
+  local mixed_port="$5"
+  local raw="$6"
 
-opts_yaml = "\n".join(f"      {line}" for line in plugin_opts)
-pathlib.Path(output).write_text(f"""\
-mixed-port: {mixed_port}
-bind-address: 127.0.0.1
-allow-lan: false
-mode: rule
-log-level: info
-ipv6: false
-proxies:
-  - name: e2e
-    type: ss
-    server: 127.0.0.1
-    port: {plugin_port}
-    cipher: aes-128-gcm
-    password: {password}
-    plugin: {plugin}
-    plugin-opts:
-{opts_yaml}
-rules:
-  - MATCH,e2e
-""")
-PY
+  curl --silent --show-error --fail --max-time 20 \
+    --noproxy "" \
+    -H "User-Agent: ${E2E_MIHOMO_UA}" \
+    "${V2BOARD_PANEL_URL}/api/v1/client/subscribe?token=shoes-e2e-u${user_id}${E2E_SUBSCRIBE_FLAG:+&flag=${E2E_SUBSCRIBE_FLAG}}" \
+    >"${raw}" \
+    || e2e_die "${case_name}: subscription fetch failed"
+
+  python3 "${MATRIX_BIN}" from-subscription "${case_name}" \
+    --subscription "${raw}" \
+    --plugin-port "${plugin_port}" \
+    --mixed-port "${mixed_port}" \
+    >"${output}" \
+    || e2e_die "${case_name}: panel subscription did not describe the node"
 }
 
 wait_traffic_accounted() {
@@ -630,9 +476,11 @@ run_case() {
   local case_dir
   local expected_revision
   local expected_feature
-  local needs_certificate=0
+  local CASE_KIND CASE_FEATURE CASE_GROUP
+  local CASE_NEEDS_CAMOUFLAGE CASE_NEEDS_SERVER_TLS CASE_NEEDS_CERT CASE_CAMOUFLAGE_TLS
   local -a tls_version_args=()
 
+  eval "$(case_flags "${case_name}")"
   index="$(case_index "${case_name}")"
   node_id=$((CASE_NODE_BASE + index))
   user_id=$((CASE_USER_BASE + index))
@@ -683,13 +531,7 @@ PY
   wait_http "http://127.0.0.1:${target_port}/payload.bin" \
     || e2e_die "${case_name}: target server did not start"
 
-  if [[ "${case_name}" == *wss* \
-    || "${case_name}" == "v2ray-https-upgrade" \
-    || "${case_name}" == shadowtls-* \
-    || "${case_name}" == "restls" ]]; then
-    needs_certificate=1
-  fi
-  if [[ "${needs_certificate}" == "1" ]]; then
+  if [[ "${CASE_NEEDS_CERT}" == "1" ]]; then
     e2e_require_command openssl "openssl (TLS plugin cases)"
     openssl req -x509 -newkey rsa:2048 -nodes \
       -subj "/CN=localhost" \
@@ -698,9 +540,9 @@ PY
       -out "${case_dir}/camouflage.crt" \
       >"${case_dir}/openssl-cert.log" 2>&1
   fi
-  if [[ "${case_name}" == shadowtls-* || "${case_name}" == "restls" ]]; then
+  if [[ "${CASE_NEEDS_CAMOUFLAGE}" == "1" ]]; then
     e2e_assert_port_free 443 "camouflage TLS"
-    case "${E2E_CAMOUFLAGE_TLS_VERSION:-auto}" in
+    case "${E2E_CAMOUFLAGE_TLS_VERSION:-${CASE_CAMOUFLAGE_TLS}}" in
       auto) ;;
       tls12) tls_version_args=(-tls1_2) ;;
       tls13) tls_version_args=(-tls1_3) ;;
@@ -718,7 +560,7 @@ PY
     wait_tcp 443 || e2e_die "${case_name}: local TLS camouflage server did not start"
   fi
 
-  if [[ "${case_name}" == *wss* || "${case_name}" == "v2ray-https-upgrade" ]]; then
+  if [[ "${CASE_NEEDS_SERVER_TLS}" == "1" ]]; then
     write_shoes_config \
       "${case_dir}/shoes.yml" \
       "${case_dir}/data" \
@@ -734,12 +576,23 @@ PY
   wait_capability_ready "${node_id}" "${expected_revision}" "${expected_feature}"
   e2e_log "${case_name}: shoes ACKed a ready plugin generation"
 
-  write_mihomo_config \
-    "${case_dir}/mihomo.yml" \
-    "${case_name}" \
-    "${plugin_port}" \
-    "${mixed_port}" \
-    "00000000-0000-4000-8000-0000000${node_id}"
+  if [[ "${E2E_SS_PLUGIN_CLIENT}" == "subscription" ]]; then
+    write_mihomo_config_from_subscription \
+      "${case_dir}/mihomo.yml" \
+      "${case_name}" \
+      "${user_id}" \
+      "${plugin_port}" \
+      "${mixed_port}" \
+      "${case_dir}/subscription.yml"
+    e2e_log "${case_name}: client config taken from the panel subscription (UA ${E2E_MIHOMO_UA})"
+  else
+    write_mihomo_config \
+      "${case_dir}/mihomo.yml" \
+      "${case_name}" \
+      "${plugin_port}" \
+      "${mixed_port}" \
+      "$(case_uuid "${user_id}")"
+  fi
   "${MIHOMO_BIN}" -d "${case_dir}/mihomo" -f "${case_dir}/mihomo.yml" \
     >"${case_dir}/mihomo.log" 2>&1 &
   PIDS+=("$!")
