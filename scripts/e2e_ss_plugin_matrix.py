@@ -91,12 +91,21 @@ class Case:
     """Top-level profile keys outside `plugin`, e.g. client_fingerprint."""
     proxy_extra: dict = field(default_factory=dict)
     """Mihomo keys on the proxy entry itself rather than in plugin-opts."""
+    udp: bool = False
+    """Also require a datagram to survive the round trip.
+
+    UDP leaves the backend by a different path than the payload download --
+    UDP-over-TCP, whose version the panel picks and the backend has to agree
+    with -- so a TCP-only case passes while every datagram is dropped.
+    """
     expect: str = "traffic"
     """What a passing run looks like.
 
     traffic           the whole chain applies and carries the payload
     profile-rejected  the panel must refuse to store this profile at all
     runtime-rejected  the panel serves it, the backend must refuse to apply it
+    plugin-disabled   applies, then the plugin is withdrawn and the bare
+                      Shadowsocks runtime has to take over
     """
     camouflage_tls: str = "auto"
     """TLS version the local camouflage server must offer: auto, tls12, tls13.
@@ -253,6 +262,34 @@ def _with_smux(
     )
 
 
+def _with_uot(base: Case, name: str, version: int) -> Case:
+    """UDP-over-TCP on top of an existing plugin case.
+
+    A plugin always forces UOT panel-side; the version is what the two ends
+    have to agree on, and the publication gate wants the matching
+    `shadowsocks-uot-v1` or `-v2` feature in the acknowledgement.
+    """
+    from dataclasses import replace
+
+    return replace(
+        base,
+        name=name,
+        group="uot",
+        profile_extra={
+            **base.profile_extra,
+            "udp_mode": "uot",
+            "udp_over_tcp_version": version,
+        },
+        proxy_extra={
+            **base.proxy_extra,
+            "udp": True,
+            "udp-over-tcp": True,
+            "udp-over-tcp-version": version,
+        },
+        udp=True,
+    )
+
+
 def _kcptun(name: str, group: str, **overrides) -> Case:
     options = dict(KCPTUN_BASE)
     options.update(overrides)
@@ -389,6 +426,47 @@ def _build_cases() -> list[Case]:
         _with_smux(by_name["v2ray-wss"], "v2ray-wss-smux-h2mux", "h2mux"),
     ]
 
+    # The panel can store and serve a JLS manifest; this backend has no JLS
+    # listener, so it must refuse the candidate rather than advertise a
+    # capability it does not have.
+    cases.append(
+        Case(
+            "jls-rejected",
+            "jls",
+            "negative",
+            {
+                "host": CAMOUFLAGE_PLACEHOLDER,
+                "username": "jls-user",
+                "password": "jls-interop-password",
+                "alpn": ["h2", "http/1.1"],
+            },
+            profile_extra={"client_fingerprint": "chrome"},
+            expect="runtime-rejected",
+        )
+    )
+
+    # Disabling a plugin is a runtime transition, not a new node: the backend
+    # has to tear the plugin graph down and acknowledge the `plugin: null`
+    # revision before the bare Shadowsocks endpoint is any good to a client.
+    from dataclasses import replace as _replace
+
+    cases.append(
+        _replace(
+            by_name["gost-ws"],
+            name="gost-ws-plugin-disabled",
+            group="negative",
+            expect="plugin-disabled",
+        )
+    )
+
+    cases += [
+        _with_uot(by_name["obfs-http"], "obfs-http-uot-v1", 1),
+        _with_uot(by_name["obfs-http"], "obfs-http-uot-v2", 2),
+        _with_uot(by_name["gost-ws"], "gost-ws-uot-v2", 2),
+        _with_uot(by_name["v2ray-wss"], "v2ray-wss-uot-v1", 1),
+        _with_uot(by_name["kcptun-v1"], "kcptun-uot-v2", 2),
+    ]
+
     return cases
 
 
@@ -401,6 +479,9 @@ FEATURES = {
     "shadow-tls": "shadowsocks-plugin-shadow-tls-v1",
     "restls": "shadowsocks-plugin-restls-v1",
     "kcptun": "shadowsocks-plugin-kcptun-v1",
+    # Defined by the contract, implemented by no adapter here. Present so a
+    # case can assert the manifest is refused rather than applied.
+    "jls": "shadowsocks-plugin-jls-v1",
 }
 
 
@@ -512,6 +593,11 @@ def main() -> int:
     profile.add_argument("--endpoint-host", default="127.0.0.1")
     profile.add_argument("--camouflage-host", default="127.0.0.1")
     profile.add_argument("--restls-script", default="")
+    profile.add_argument(
+        "--without-plugin",
+        action="store_true",
+        help="emit the same profile with `plugin: null`, as a disable does",
+    )
 
     from_sub = sub.add_parser(
         "from-subscription",
@@ -533,6 +619,11 @@ def main() -> int:
     mihomo.add_argument("--camouflage-host", default="127.0.0.1")
     mihomo.add_argument("--restls-script", default="")
     mihomo.add_argument("--log-level", default="info")
+    mihomo.add_argument(
+        "--without-plugin",
+        action="store_true",
+        help="point at the raw Shadowsocks port with no plugin",
+    )
 
     args = parser.parse_args()
 
@@ -572,9 +663,15 @@ def main() -> int:
         print(f"CASE_NEEDS_CERT={int(camouflage or server_tls)}")
         print(f"CASE_CAMOUFLAGE_TLS={case.camouflage_tls}")
         print(f"CASE_EXPECT={case.expect}")
+        print(f"CASE_UDP={int(case.udp)}")
         return 0
 
     if args.command == "profile":
+        if args.without_plugin:
+            withdrawn = {"version": 1, "plugin": None}
+            withdrawn.update(case.profile_extra)
+            print(json.dumps(withdrawn, separators=(",", ":")))
+            return 0
         profile_json = {
             "version": 1,
             "plugin": {
@@ -590,6 +687,27 @@ def main() -> int:
 
     if args.command == "from-subscription":
         return _from_subscription(case, args)
+
+    if args.without_plugin:
+        print(
+            f"""\
+mixed-port: {args.mixed_port}
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: {args.log_level}
+ipv6: false
+proxies:
+  - name: e2e
+    type: ss
+    server: {args.server}
+    port: {args.plugin_port}
+    cipher: {args.cipher}
+    password: {args.password}
+rules:
+  - MATCH,e2e"""
+        )
+        return 0
 
     options = case.client_options(args.camouflage_host, args.restls_script)
     print(

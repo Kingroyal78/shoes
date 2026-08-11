@@ -453,6 +453,101 @@ write_mihomo_config_from_subscription() {
     || e2e_die "${case_name}: panel subscription did not describe the node"
 }
 
+# A datagram that comes back unchanged is the only proof that the UDP path
+# works; the payload download says nothing about it.
+assert_udp_round_trip() {
+  local case_name="$1"
+  local mixed_port="$2"
+  local udp_port="$3"
+  local case_dir="$4"
+
+  python3 - "${udp_port}" >"${case_dir}/udp-echo.log" 2>&1 <<'ECHO_SERVER' &
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    payload, peer = sock.recvfrom(65535)
+    sock.sendto(payload, peer)
+ECHO_SERVER
+  PIDS+=("$!")
+  sleep 0.5
+
+  python3 "${SCRIPT_DIR}/e2e_socks5_udp_probe.py" \
+    --proxy-port "${mixed_port}" \
+    --target-port "${udp_port}" \
+    >"${case_dir}/udp-probe.log" 2>&1 \
+    || e2e_die "${case_name}: UDP round trip failed ($(tail -n 1 "${case_dir}/udp-probe.log"))"
+  e2e_log "PASS ${case_name}: $(tail -n 1 "${case_dir}/udp-probe.log")"
+}
+
+# Withdrawing a plugin is a runtime transition: the backend has to tear the
+# plugin graph down, acknowledge the `plugin: null` revision, and leave the
+# bare Shadowsocks endpoint serving. A client pointed at the raw port proves
+# the last part; the panel keeps the node hidden from real clients until the
+# acknowledgement, which is what makes the order matter.
+assert_plugin_withdrawal() {
+  local case_name="$1"
+  local node_id="$2"
+  local raw_port="$3"
+  local plugin_port="$4"
+  local target_port="$5"
+  local mixed_port="$6"
+  local password="$7"
+  local case_dir="$8"
+  local profile_json
+  local blob
+  local revision
+  local now
+
+  profile_json="$(python3 "${MATRIX_BIN}" profile "${case_name}" \
+    --plugin-port "${plugin_port}" \
+    --camouflage-host "${CAMOUFLAGE_HOST}" \
+    --restls-script "${RESTLS_SCRIPT}" \
+    --without-plugin)"
+  blob="$(encode_profile_blob "${profile_json}")"
+  [[ "${blob}" == sscp:v1:* ]] \
+    || e2e_die "${case_name}: panel refused the profile with its plugin withdrawn"
+
+  now="$(date +%s)"
+  mysql_exec <<SQL
+UPDATE v2_server_shadowsocks
+SET ss_client_settings='${blob}', updated_at=${now}
+WHERE id=${node_id};
+SQL
+
+  revision="$(plugin_config_revision "${node_id}")"
+  [[ "${revision}" == sha256:* ]] \
+    || e2e_die "${case_name}: panel served no revision after the plugin was withdrawn"
+  wait_capability_ready "${node_id}" "${revision}" "shadowsocks-plugin-runtime-v1"
+  e2e_log "${case_name}: shoes ACKed the plugin-less generation"
+
+  python3 "${MATRIX_BIN}" mihomo "${case_name}" \
+    --plugin-port "${raw_port}" \
+    --mixed-port "${mixed_port}" \
+    --password "${password}" \
+    --without-plugin >"${case_dir}/mihomo-raw.yml"
+  mkdir -p "${case_dir}/mihomo-raw"
+  "${MIHOMO_BIN}" -d "${case_dir}/mihomo-raw" -f "${case_dir}/mihomo-raw.yml" \
+    >"${case_dir}/mihomo-raw.log" 2>&1 &
+  PIDS+=("$!")
+  wait_tcp "${mixed_port}" || e2e_die "${case_name}: Mihomo did not start for the raw endpoint"
+
+  curl --silent --show-error --fail --max-time "${E2E_CURL_MAX_TIME_SECS}" \
+    --noproxy "" \
+    --proxy "socks5h://127.0.0.1:${mixed_port}" \
+    --output "${case_dir}/raw-payload.bin" \
+    "http://127.0.0.1:${target_port}/payload.bin" \
+    || e2e_die "${case_name}: raw Shadowsocks download failed after the plugin was withdrawn"
+
+  if ! printf '%s  %s\n' "$(cat "${case_dir}/expected.sha256")" "${case_dir}/raw-payload.bin" \
+    | sha256sum --check --status; then
+    e2e_die "${case_name}: raw Shadowsocks payload digest mismatch"
+  fi
+  e2e_log "PASS ${case_name}: bare Shadowsocks runtime took over"
+}
+
 wait_traffic_accounted() {
   local node_id="$1"
   local user_id="$2"
@@ -508,7 +603,8 @@ run_case() {
   local expected_feature
   local CASE_KIND CASE_FEATURE CASE_GROUP
   local CASE_NEEDS_CAMOUFLAGE CASE_NEEDS_SERVER_TLS CASE_NEEDS_CERT CASE_CAMOUFLAGE_TLS
-  local CASE_EXPECT
+  local CASE_EXPECT CASE_UDP
+  local udp_port
   local -a tls_version_args=()
 
   eval "$(case_flags "${case_name}")"
@@ -520,6 +616,8 @@ run_case() {
   plugin_port=$((CASE_PLUGIN_PORT_BASE + index))
   target_port=$((CASE_TARGET_PORT_BASE + index * 2))
   mixed_port=$((CASE_TARGET_PORT_BASE + index * 2 + 1))
+  # Well clear of the four per-case ports, which are packed two apart.
+  udp_port=$((mixed_port + 10000))
   case_dir="${TMP_DIR}/${case_name}"
   mkdir -p "${case_dir}/data" "${case_dir}/mihomo" "${case_dir}/www"
 
@@ -664,6 +762,23 @@ PY
   [[ "${actual}" == "${expected}" ]] \
     || e2e_die "${case_name}: payload digest mismatch expected=${expected} actual=${actual}"
   e2e_log "PASS ${case_name}: ${PAYLOAD_SIZE} bytes, sha256=${actual}"
+
+  if [[ "${CASE_EXPECT}" == "plugin-disabled" ]]; then
+    assert_plugin_withdrawal \
+      "${case_name}" \
+      "${node_id}" \
+      "${raw_port}" \
+      "${plugin_port}" \
+      "${target_port}" \
+      "$((udp_port + 1))" \
+      "$(case_uuid "${user_id}")" \
+      "${case_dir}"
+  fi
+
+  if [[ "${CASE_UDP}" == "1" ]]; then
+    e2e_assert_port_free "${udp_port}" "${case_name} udp echo"
+    assert_udp_round_trip "${case_name}" "${mixed_port}" "${udp_port}" "${case_dir}"
+  fi
 
   wait_traffic_accounted "${node_id}" "${user_id}" "${PAYLOAD_SIZE}"
   e2e_log "PASS ${case_name}: panel traffic accounting verified"
