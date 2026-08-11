@@ -389,6 +389,31 @@ impl PluginKind {
     }
 }
 
+/// Name the reason when the panel asks for a plugin the contract defines but
+/// this backend has no adapter for.
+///
+/// The manifest is decoded strictly, so an adapter we do not implement is
+/// indistinguishable from a corrupt payload in the serde error alone, and the
+/// serde message itself is never surfaced because the manifest carries plugin
+/// secrets. This inspects only `plugin.type`, which is a fixed vocabulary
+/// rather than operator data, and returns a static string.
+fn unimplemented_plugin_type_reason(wire_manifest: &Value) -> Option<&'static str> {
+    let plugin_type = wire_manifest.get("plugin")?.get("type")?.as_str()?;
+    match plugin_type {
+        // Every type with a RuntimePlugin variant: a decode failure here is
+        // about the options or the rest of the manifest, not the adapter.
+        "obfs" | "v2ray-plugin" | "gost-plugin" | "shadow-tls" | "restls" | "kcptun" => None,
+        "jls" => Some(
+            "plugin-config selects the JLS plugin, which this backend does not implement; \
+             the last-known-good runtime is kept and the revision is not acknowledged",
+        ),
+        _ => Some(
+            "plugin-config selects a plugin type this backend does not implement; \
+             the last-known-good runtime is kept and the revision is not acknowledged",
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginUpstream {
@@ -739,8 +764,13 @@ fn validate_restls_script(script: &str) -> Result<(), PluginManifestError> {
             .checked_add(range.saturating_sub(1))
             .ok_or_else(|| PluginManifestError::new("Restls script is invalid"))?;
         if last_target > MAX_RESTLS_RECORD_TARGET || responses > MAX_RESTLS_RESPONSES {
+            // The panel accepts a wider script range and gates those Profiles on
+            // the `shadowsocks-plugin-restls-v2` feature, which this backend does
+            // not advertise. Say so instead of reporting a generic limit.
             return Err(PluginManifestError::new(
-                "Restls script exceeds the runtime limits",
+                "Restls script exceeds the v1-safe range this backend implements \
+                 (record target 16364, responses 127); that Profile requires a \
+                 shadowsocks-plugin-restls-v2 backend",
             ));
         }
     }
@@ -845,7 +875,9 @@ impl PluginConfigCandidate {
         let manifest = serde_json::from_value::<PluginRuntimeManifest>(wire_manifest.clone())
             .map_err(|_| {
                 PluginApiError::InvalidResponse(
-                    "plugin-config JSON does not match the strict schema v1 manifest",
+                    unimplemented_plugin_type_reason(&wire_manifest).unwrap_or(
+                        "plugin-config JSON does not match the strict schema v1 manifest",
+                    ),
                 )
             })?;
         manifest
@@ -1141,6 +1173,60 @@ mod tests {
 
     fn parse(value: Value) -> Result<PluginRuntimeManifest, serde_json::Error> {
         serde_json::from_value(value)
+    }
+
+    fn from_wire_error(manifest: Value) -> String {
+        PluginConfigCandidate::from_wire(OpaqueEtag::from_static("\"candidate\""), manifest, 12)
+            .expect_err("manifest must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn rejecting_a_plugin_without_an_adapter_names_the_plugin_type() {
+        let message = from_wire_error(base_manifest(plugin(
+            "jls",
+            json!({
+                "host": "cover.example",
+                "username": "jls-user",
+                "password": "jls-password",
+                "alpn": ["h2", "http/1.1"]
+            }),
+        )));
+        assert!(message.contains("JLS"), "{message}");
+        assert!(message.contains("last-known-good"), "{message}");
+        assert!(!message.contains("jls-password"), "{message}");
+
+        let message = from_wire_error(base_manifest(plugin(
+            "brand-new-plugin",
+            json!({"host": "cover.example"}),
+        )));
+        assert!(message.contains("does not implement"), "{message}");
+    }
+
+    #[test]
+    fn rejecting_a_malformed_supported_plugin_keeps_the_schema_reason() {
+        // `obfs` has an adapter, so a bad payload is a schema problem and must
+        // not be reported as a missing adapter.
+        let message = from_wire_error(base_manifest(plugin("obfs", json!({"mode": "tls"}))));
+        assert!(message.contains("strict schema v1 manifest"), "{message}");
+        assert!(!message.contains("does not implement"), "{message}");
+    }
+
+    #[test]
+    fn a_restls_script_beyond_the_v1_safe_range_points_at_restls_v2() {
+        let message = from_wire_error(base_manifest(plugin(
+            "restls",
+            json!({
+                "host": "cover.example",
+                "password": "restls-password",
+                "restls_script": "16365"
+            }),
+        )));
+        assert!(
+            message.contains("shadowsocks-plugin-restls-v2"),
+            "{message}"
+        );
+        assert!(!message.contains("restls-password"), "{message}");
     }
 
     #[test]

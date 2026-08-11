@@ -81,6 +81,16 @@ Plugin implementations are in-process Rust services. shoes does not spawn or
 supervise external `obfs-server`, `v2ray-plugin`, `gost`, `shadow-tls`,
 `restls`, or `kcptun` executables.
 
+Two plugin intents the contract defines are deliberately not implemented here.
+A `jls` manifest is rejected by name; shoes has no JLS listener and never
+advertises `shadowsocks-plugin-jls-v1`. A Restls script outside the One/Shoes
+v1-safe range (last record target above 16364, or more than 127 responses) is
+rejected by name; the panel gates those Profiles on
+`shadowsocks-plugin-restls-v2`, which shoes does not advertise. In both cases
+the candidate is refused whole, the last-known-good runtime keeps serving, the
+revision is not acknowledged, and the rejection reason names the cause instead
+of reporting a generic schema failure.
+
 For v2ray-plugin or GOST with `tls: true`, configure a readable certificate and
 private key in the node-level or top-level local `tls` block. V2Board never
 sends private certificate material through the plugin manifest.

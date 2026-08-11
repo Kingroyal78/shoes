@@ -120,8 +120,10 @@ Plugin intent comes *only* from the versioned `/plugin-config` contract — neve
 `SecretString`) and fails closed on unknown versions, types, fields, or incoherent revisions, leaving
 the last-known-good generation live. `map_shadowsocks_plugin_nodes` cross-checks `/config` against
 the manifest, then builds the multi-listener graph; the applied feature set is ACKed back via
-`/plugin-config/status`, and a `RevisionMismatch` schedules a forced refresh. Adapters are in
-`src/ss_plugins/` (obfs, v2ray, gost, shadow_tls, restls, kcptun, transport).
+`POST /UniProxy/status`, and a `RevisionMismatch` schedules a forced refresh. Adapters are in
+`src/ss_plugins/` (obfs, v2ray, gost, shadow_tls, restls, kcptun, transport). The panel's `jls`
+plugin and Restls scripts beyond the v1-safe range have no adapter here: both are rejected by name
+and never ACKed — see `docs/v2board-shadowsocks-plugin-runtime.md`.
 
 ### Protocol layer
 
