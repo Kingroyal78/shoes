@@ -382,6 +382,10 @@ where
                     Err(error) => return Err(error),
                 };
                 awaiting_client_records = awaiting_client_records.saturating_sub(1);
+                log::trace!(
+                    "restls from-client record: len={} awaiting_client={awaiting_client_records}",
+                    record.payload.len()
+                );
                 match core.on_client_record(&mut record)? {
                     RestlsServerAction::Authenticated(decoded) => {
                         if !decoded.data.is_empty() {
@@ -459,6 +463,16 @@ async fn flush_one_record<W: AsyncWrite + Unpin>(
     let contiguous = pending.make_contiguous();
     let data = if forced { &[][..] } else { contiguous };
     let encoded = core.encode_to_client(data, target, command)?;
+    // Both sides drive the same script from their own record counters, and a
+    // disagreement about how many records are owed shows up only as a peer
+    // that stops talking. The two sequences are what tells them apart.
+    log::trace!(
+        "restls to-client record: counter={counter} forced={forced} target={target} \
+         command={:?} awaiting_client={} forced_remaining={}",
+        encoded.command,
+        *awaiting_client_records,
+        *forced_responses
+    );
     encoded.record.write_to(client_write).await?;
     client_write.flush().await?;
     if !forced {
