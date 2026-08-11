@@ -329,6 +329,34 @@ wait_capability_ready() {
   done
 }
 
+# Bounded, non-fatal counterpart of wait_capability_ready, for the cases where
+# a ready ACK is the failure: the panel stores the profile and serves the
+# manifest, and the backend has to refuse it rather than apply it.
+capability_ready_within() {
+  local node_id="$1"
+  local expected_revision="$2"
+  local expected_feature="$3"
+  local budget="$4"
+  local start
+  local now
+  local raw_status
+
+  start="$(date +%s)"
+  while true; do
+    raw_status="$(docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 GET \
+      "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" 2>/dev/null || true)"
+    if printf '%s' "${raw_status}" \
+      | python3 "${TMP_DIR}/capability_check.py" "${expected_revision}" "${expected_feature}"; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if ((now - start >= budget)); then
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
 assert_plugin_config_etag() {
   local node_id="$1"
   local headers
@@ -587,6 +615,18 @@ PY
   fi
   "${SHOES_BIN}" run -c "${case_dir}/shoes.yml" >"${case_dir}/shoes.log" 2>&1 &
   PIDS+=("$!")
+  if [[ "${CASE_EXPECT}" == "runtime-rejected" ]]; then
+    if capability_ready_within \
+      "${node_id}" \
+      "${expected_revision}" \
+      "${expected_feature}" \
+      "${E2E_REJECT_WAIT_SECS:-10}"; then
+      e2e_die "${case_name}: backend acknowledged a manifest it is required to refuse"
+    fi
+    e2e_log "PASS ${case_name}: backend refused the manifest"
+    return 0
+  fi
+
   wait_capability_ready "${node_id}" "${expected_revision}" "${expected_feature}"
   e2e_log "${case_name}: shoes ACKed a ready plugin generation"
 

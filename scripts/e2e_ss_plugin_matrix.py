@@ -89,11 +89,14 @@ class Case:
     """Extra or overriding Mihomo plugin-opts."""
     profile_extra: dict = field(default_factory=dict)
     """Top-level profile keys outside `plugin`, e.g. client_fingerprint."""
+    proxy_extra: dict = field(default_factory=dict)
+    """Mihomo keys on the proxy entry itself rather than in plugin-opts."""
     expect: str = "traffic"
     """What a passing run looks like.
 
     traffic           the whole chain applies and carries the payload
     profile-rejected  the panel must refuse to store this profile at all
+    runtime-rejected  the panel serves it, the backend must refuse to apply it
     """
     camouflage_tls: str = "auto"
     """TLS version the local camouflage server must offer: auto, tls12, tls13.
@@ -221,6 +224,35 @@ def _restls(
     )
 
 
+def _with_smux(
+    base: Case,
+    name: str,
+    protocol: str,
+    *,
+    padding: bool = False,
+    expect: str = "traffic",
+) -> Case:
+    """Server multiplex on top of an existing plugin case.
+
+    The manifest carries only `enabled` and `padding`: the protocol is the
+    client's own choice, and the backend has to accept whichever it picks.
+    """
+    from dataclasses import replace
+
+    smux_profile = {"enabled": True, "protocol": protocol, "padding": padding}
+    return replace(
+        base,
+        name=name,
+        group="smux",
+        profile_extra={**base.profile_extra, "smux": smux_profile},
+        proxy_extra={
+            **base.proxy_extra,
+            "smux": {"enabled": True, "protocol": protocol, "padding": padding},
+        },
+        expect=expect,
+    )
+
+
 def _kcptun(name: str, group: str, **overrides) -> Case:
     options = dict(KCPTUN_BASE)
     options.update(overrides)
@@ -336,6 +368,25 @@ def _build_cases() -> list[Case]:
         _kcptun("kcptun-shards", "kcptun", datashard=20, parityshard=10),
         _kcptun("kcptun-framing", "kcptun", framesize=4096, streambuf=524288, smuxbuf=2097152),
         _kcptun("kcptun-nodelay-off", "kcptun", nodelay=0, nc=0, resend=0, acknodelay=False),
+    ]
+
+    # Server multiplex rides on top of a plugin: the manifest turns it on, the
+    # backend advertises `shadowsocks-sing-mux-v1`, and the panel publishes the
+    # node only once that feature comes back in the ACK.
+    by_name = {case.name: case for case in cases}
+    cases += [
+        _with_smux(by_name["gost-ws"], "gost-ws-smux-h2mux", "h2mux"),
+        # Protocols this backend does not implement. The manifest carries the
+        # protocol so they can be refused rather than applied into a node that
+        # publishes and then carries nothing.
+        _with_smux(
+            by_name["gost-ws"], "gost-ws-smux-smux", "smux", expect="runtime-rejected"
+        ),
+        _with_smux(
+            by_name["gost-ws"], "gost-ws-smux-yamux", "yamux", expect="runtime-rejected"
+        ),
+        _with_smux(by_name["obfs-http"], "obfs-http-smux-padding", "h2mux", padding=True),
+        _with_smux(by_name["v2ray-wss"], "v2ray-wss-smux-h2mux", "h2mux"),
     ]
 
     return cases
@@ -559,6 +610,7 @@ proxies:
     plugin: {case.kind}
     plugin-opts:
 {_yaml_opts(options, "      ")}
+{_yaml_opts(case.proxy_extra, "    ")}
 rules:
   - MATCH,e2e"""
     )
