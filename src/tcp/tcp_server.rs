@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use log::{debug, error};
+use log::{debug, error, warn};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -130,7 +130,23 @@ async fn run_tcp_server(
             match process_stream(stream, cloned_handler, cloned_resolver, Some(addr)).await {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
                 Err(StreamFailure::Handshake(e)) => {
-                    debug!("{}:{} handshake rejected: {}", addr.ip(), addr.port(), e)
+                    let reason = e.to_string();
+                    if should_report_handshake_rejection(&reason, Instant::now()) {
+                        warn!(
+                            "{}:{} handshake rejected: {} (identical rejections are logged at debug for the next {}s)",
+                            addr.ip(),
+                            addr.port(),
+                            reason,
+                            HANDSHAKE_REJECTION_REPORT_INTERVAL.as_secs()
+                        )
+                    } else {
+                        debug!(
+                            "{}:{} handshake rejected: {}",
+                            addr.ip(),
+                            addr.port(),
+                            reason
+                        )
+                    }
                 }
                 Err(StreamFailure::Proxy(e)) => {
                     error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e)
@@ -161,7 +177,14 @@ async fn run_unix_server(
         tokio::spawn(async move {
             match process_stream(stream, cloned_handler, cloned_resolver, None).await {
                 Ok(()) => debug!("{addr:?} finished successfully"),
-                Err(StreamFailure::Handshake(e)) => debug!("{addr:?} handshake rejected: {e}"),
+                Err(StreamFailure::Handshake(e)) => {
+                    let reason = e.to_string();
+                    if should_report_handshake_rejection(&reason, Instant::now()) {
+                        warn!("{addr:?} handshake rejected: {reason}")
+                    } else {
+                        debug!("{addr:?} handshake rejected: {reason}")
+                    }
+                }
                 Err(StreamFailure::Proxy(e)) => error!("{addr:?} finished with error: {e:?}"),
             }
         });
@@ -193,6 +216,51 @@ where
     server_handler
         .setup_server_stream_with_peer_addr(server_stream, peer_addr)
         .await
+}
+
+/// How long one distinct handshake-rejection reason stays quiet after being
+/// surfaced.
+const HANDSHAKE_REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+/// Distinct reasons remembered at once. A public listener sees a steady stream
+/// of probes; this bounds what they can make the process remember.
+const HANDSHAKE_REJECTION_REASONS: usize = 32;
+const HANDSHAKE_REJECTION_REASON_CHARS: usize = 160;
+
+static HANDSHAKE_REJECTIONS: LazyLock<Mutex<std::collections::HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Whether this rejection reason should be surfaced to the operator now.
+///
+/// A rejected handshake is ordinary background noise on a public listener, so
+/// it is logged at debug and nobody watches it. A node whose own configuration
+/// cannot accept its own clients produces exactly the same line -- a WebSocket
+/// Host that does not match what the panel published, a camouflage handshake
+/// that never completes -- and then sits there looking healthy while carrying
+/// nothing. Surfacing each distinct reason once per interval makes a standing
+/// misconfiguration visible without letting a scanner decide how much is
+/// logged.
+fn should_report_handshake_rejection(reason: &str, now: Instant) -> bool {
+    let mut seen = HANDSHAKE_REJECTIONS.lock();
+    note_handshake_rejection(&mut seen, reason, now)
+}
+
+fn note_handshake_rejection(
+    seen: &mut std::collections::HashMap<String, Instant>,
+    reason: &str,
+    now: Instant,
+) -> bool {
+    seen.retain(|_, reported| {
+        now.saturating_duration_since(*reported) < HANDSHAKE_REJECTION_REPORT_INTERVAL
+    });
+    let key: String = reason
+        .chars()
+        .take(HANDSHAKE_REJECTION_REASON_CHARS)
+        .collect();
+    if seen.contains_key(&key) || seen.len() >= HANDSHAKE_REJECTION_REASONS {
+        return false;
+    }
+    seen.insert(key, now);
+    true
 }
 
 /// Why a connection ended, so the caller can pick a log level.
@@ -3236,5 +3304,74 @@ mod tests {
 
         assert_eq!(*recorder.alive_ips.lock(), vec![proxied_peer.ip()]);
         assert_eq!(*recorder.removed_ips.lock(), vec![proxied_peer.ip()]);
+    }
+
+    #[test]
+    fn a_handshake_rejection_reason_is_surfaced_once_per_interval() {
+        let mut seen = std::collections::HashMap::new();
+        let start = Instant::now();
+
+        assert!(note_handshake_rejection(
+            &mut seen,
+            "Host does not match",
+            start
+        ));
+        assert!(!note_handshake_rejection(
+            &mut seen,
+            "Host does not match",
+            start + Duration::from_secs(1)
+        ));
+        // A different reason is its own story and is surfaced immediately.
+        assert!(note_handshake_rejection(
+            &mut seen,
+            "camouflage handshake timed out",
+            start + Duration::from_secs(1)
+        ));
+        assert!(note_handshake_rejection(
+            &mut seen,
+            "Host does not match",
+            start + HANDSHAKE_REJECTION_REPORT_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn handshake_rejection_reasons_cannot_grow_without_bound() {
+        // A scanner producing an endless variety of failures must not decide
+        // how much this process remembers, or how much it logs.
+        let mut seen = std::collections::HashMap::new();
+        let start = Instant::now();
+        for index in 0..HANDSHAKE_REJECTION_REASONS {
+            assert!(note_handshake_rejection(
+                &mut seen,
+                &format!("reason {index}"),
+                start
+            ));
+        }
+        assert!(!note_handshake_rejection(
+            &mut seen,
+            "one reason too many",
+            start
+        ));
+        assert_eq!(seen.len(), HANDSHAKE_REJECTION_REASONS);
+
+        // The window passing clears the way again.
+        assert!(note_handshake_rejection(
+            &mut seen,
+            "one reason too many",
+            start + HANDSHAKE_REJECTION_REPORT_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_long_rejection_reason_is_truncated_before_it_is_remembered() {
+        let mut seen = std::collections::HashMap::new();
+        let start = Instant::now();
+        let reason = "x".repeat(HANDSHAKE_REJECTION_REASON_CHARS * 4);
+
+        assert!(note_handshake_rejection(&mut seen, &reason, start));
+        assert_eq!(
+            seen.keys().next().map(String::len),
+            Some(HANDSHAKE_REJECTION_REASON_CHARS)
+        );
     }
 }
