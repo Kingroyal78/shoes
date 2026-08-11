@@ -1019,8 +1019,25 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
 
-        // Externally close the fd to produce EBADF on both read and select.
-        unsafe { libc::close(client_fd) };
+        // Make the stack's descriptor fail on read without ever leaving its
+        // number unallocated. Closing it here instead would double-close it:
+        // the stack still closes `tun_fd` on drop, and in a parallel test run
+        // the kernel can hand that number to another thread in between, so the
+        // stack's own close silently steals an unrelated socket and aborts the
+        // process when its real owner drops it.
+        //
+        // dup2 replaces the open file description atomically, so the number
+        // stays valid and owned by the stack the whole time. A write-only
+        // /dev/null selects as readable and fails reads with EBADF, which is
+        // the fatal-fd path under test.
+        let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        assert!(devnull >= 0, "failed to open /dev/null");
+        assert_eq!(
+            unsafe { libc::dup2(devnull, client_fd) },
+            client_fd,
+            "failed to rebind the stack's TUN fd"
+        );
+        unsafe { libc::close(devnull) };
         // Also drop the writer so there's no other holder.
         drop(server);
 
