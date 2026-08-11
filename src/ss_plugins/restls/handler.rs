@@ -345,31 +345,40 @@ where
         RestlsCommand::Noop => 0u32,
         RestlsCommand::Response(count) => u32::from(count),
     };
-    let mut awaiting_client_records = 0u32;
+    // Whether the client is expected to speak before the conversation
+    // continues. Restls has at most one such request outstanding: it is a
+    // state of the exchange, not a number of records to count down.
+    let mut awaiting = false;
     let mut pending = VecDeque::<u8>::new();
     let mut camouflage_open = true;
     let mut inner_open = true;
     let mut read_buffer = vec![0u8; 32 * 1024];
 
     loop {
-        if flush_one_record(
-            &mut core,
-            &script,
-            limits,
-            &mut client_write,
-            &mut pending,
-            &mut forced_responses,
-            &mut awaiting_client_records,
-        )
-        .await?
-        {
-            continue;
+        // Queued inner data goes out first, and every record it produces also
+        // pays down what the client asked us to send: a response the client
+        // requested is satisfied by a real record just as well as by padding.
+        if (!awaiting || forced_responses > 0) && !pending.is_empty() {
+            let (written, next_awaiting) =
+                write_pending_records(&mut core, &script, limits, &mut client_write, &mut pending)
+                    .await?;
+            forced_responses = forced_responses.saturating_sub(written);
+            awaiting = next_awaiting;
         }
-        if !inner_open
-            && pending.is_empty()
-            && forced_responses == 0
-            && awaiting_client_records == 0
-        {
+        // Whatever the data did not cover goes out as records carrying none.
+        if forced_responses > 0 {
+            awaiting = write_owed_responses(
+                &mut core,
+                &script,
+                limits,
+                &mut client_write,
+                &mut pending,
+                forced_responses,
+            )
+            .await?;
+            forced_responses = 0;
+        }
+        if !inner_open && pending.is_empty() && forced_responses == 0 {
             client_write.shutdown().await?;
             return Ok(());
         }
@@ -381,9 +390,9 @@ where
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(error) => return Err(error),
                 };
-                awaiting_client_records = awaiting_client_records.saturating_sub(1);
+                awaiting = false;
                 log::trace!(
-                    "restls from-client record: len={} awaiting_client={awaiting_client_records}",
+                    "restls from-client record: len={} owed={forced_responses}",
                     record.payload.len()
                 );
                 match core.on_client_record(&mut record)? {
@@ -436,19 +445,19 @@ where
     }
 }
 
-async fn flush_one_record<W: AsyncWrite + Unpin>(
+/// Emit one record to the client and report the command it carried.
+///
+/// A record that exists only to answer what the client asked for carries no
+/// data, but the script still chooses its size, so it is indistinguishable on
+/// the wire from one that does.
+async fn write_one_record<W: AsyncWrite + Unpin>(
     core: &mut RestlsServerCore,
     script: &RestlsScript,
     limits: RestlsRuntimeLimits,
     client_write: &mut W,
     pending: &mut VecDeque<u8>,
-    forced_responses: &mut u32,
-    awaiting_client_records: &mut u32,
-) -> io::Result<bool> {
-    let forced = *forced_responses > 0;
-    if !forced && (*awaiting_client_records > 0 || pending.is_empty()) {
-        return Ok(false);
-    }
+    carry_data: bool,
+) -> io::Result<RestlsCommand> {
     let counter = core
         .counters()
         .ok_or_else(|| io::Error::other("Restls counters unavailable"))?
@@ -461,29 +470,70 @@ async fn flush_one_record<W: AsyncWrite + Unpin>(
         }
     };
     let contiguous = pending.make_contiguous();
-    let data = if forced { &[][..] } else { contiguous };
+    let data = if carry_data { contiguous } else { &[][..] };
     let encoded = core.encode_to_client(data, target, command)?;
     // Both sides drive the same script from their own record counters, and a
     // disagreement about how many records are owed shows up only as a peer
     // that stops talking. The two sequences are what tells them apart.
     log::trace!(
-        "restls to-client record: counter={counter} forced={forced} target={target} \
-         command={:?} awaiting_client={} forced_remaining={}",
-        encoded.command,
-        *awaiting_client_records,
-        *forced_responses
+        "restls to-client record: counter={counter} carry_data={carry_data} target={target} \
+         command={:?}",
+        encoded.command
     );
     encoded.record.write_to(client_write).await?;
     client_write.flush().await?;
-    if !forced {
+    if carry_data {
         pending.drain(..encoded.consumed);
-    } else {
-        *forced_responses -= 1;
     }
-    if let RestlsCommand::Response(count) = encoded.command {
-        *awaiting_client_records = (*awaiting_client_records).saturating_add(u32::from(count));
+    Ok(encoded.command)
+}
+
+/// Drain queued inner data into client records.
+///
+/// Stops as soon as a record carries a response command: the client is then
+/// expected to speak before the conversation continues, and sending past that
+/// point leaves both sides waiting on each other. Returns how many records
+/// went out, so the caller can count them against what the client asked for,
+/// and whether the client now owes us a record.
+async fn write_pending_records<W: AsyncWrite + Unpin>(
+    core: &mut RestlsServerCore,
+    script: &RestlsScript,
+    limits: RestlsRuntimeLimits,
+    client_write: &mut W,
+    pending: &mut VecDeque<u8>,
+) -> io::Result<(u32, bool)> {
+    let mut written = 0u32;
+    while !pending.is_empty() {
+        let command = write_one_record(core, script, limits, client_write, pending, true).await?;
+        written = written.saturating_add(1);
+        if let RestlsCommand::Response(count) = command {
+            return Ok((written, count > 0));
+        }
     }
-    Ok(true)
+    Ok((written, false))
+}
+
+/// Emit the records the client asked for that its own data did not cover.
+///
+/// A response command met here only records that the client is expected to
+/// speak next. Treating it as more records to send would have each side answer
+/// the other's answer.
+async fn write_owed_responses<W: AsyncWrite + Unpin>(
+    core: &mut RestlsServerCore,
+    script: &RestlsScript,
+    limits: RestlsRuntimeLimits,
+    client_write: &mut W,
+    pending: &mut VecDeque<u8>,
+    owed: u32,
+) -> io::Result<bool> {
+    let mut awaiting = false;
+    for _ in 0..owed {
+        let command = write_one_record(core, script, limits, client_write, pending, false).await?;
+        if let RestlsCommand::Response(count) = command {
+            awaiting = count > 0;
+        }
+    }
+    Ok(awaiting)
 }
 
 fn spawn_fallback<C, H>(mut client: C, mut camouflage: H) -> io::Result<TcpServerSetupResult>
