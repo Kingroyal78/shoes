@@ -364,21 +364,19 @@ fn add_etag(request: reqwest::RequestBuilder, etag: Option<&str>) -> reqwest::Re
     }
 }
 
+/// Keep the validator exactly as the panel wrote it.
+///
+/// An ETag is opaque: the quotes are part of the value, and the only thing a
+/// client may do with it is send it back unchanged. Unwrapping them here made
+/// the panel's `/config` and `/user` comparisons fail every time, so those two
+/// payloads were re-downloaded on every pull -- the user list above all, which
+/// is the one the conditional request exists for.
 fn response_etag(headers: &HeaderMap) -> Option<String> {
     headers
         .get(ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(normalize_etag)
+        .map(|value| value.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-fn normalize_etag(value: &str) -> String {
-    let value = value.trim();
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
-        .to_string()
 }
 
 fn http_error(err: reqwest::Error) -> std::io::Error {
@@ -566,15 +564,23 @@ mod tests {
     }
 
     #[test]
-    fn response_etag_normalizes_quotes_for_v1_and_v2_cache_hits() {
+    fn a_response_etag_is_kept_exactly_as_the_panel_wrote_it() {
+        // Round-tripping the quotes is what makes the panel answer 304; it
+        // compares what it sent against what comes back.
+        let quoted = HeaderMap::from_iter([(
+            ETAG,
+            HeaderValue::from_static("\"626edda67fdda7d7d66e50b8d7312939576bd98a\""),
+        )]);
         assert_eq!(
-            normalize_etag("\"626edda67fdda7d7d66e50b8d7312939576bd98a\""),
-            "626edda67fdda7d7d66e50b8d7312939576bd98a"
+            response_etag(&quoted).as_deref(),
+            Some("\"626edda67fdda7d7d66e50b8d7312939576bd98a\"")
         );
-        assert_eq!(
-            normalize_etag("626edda67fdda7d7d66e50b8d7312939576bd98a"),
-            "626edda67fdda7d7d66e50b8d7312939576bd98a"
-        );
+
+        let weak = HeaderMap::from_iter([(ETAG, HeaderValue::from_static("W/\"abc\""))]);
+        assert_eq!(response_etag(&weak).as_deref(), Some("W/\"abc\""));
+
+        let bare = HeaderMap::from_iter([(ETAG, HeaderValue::from_static("bare-etag"))]);
+        assert_eq!(response_etag(&bare).as_deref(), Some("bare-etag"));
     }
 
     #[tokio::test]
