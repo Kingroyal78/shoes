@@ -214,6 +214,7 @@ def _restls(
     version_hint="tls13",
     script=None,
     fingerprint="chrome",
+    expect="traffic",
 ) -> Case:
     options = {
         "host": CAMOUFLAGE_PLACEHOLDER,
@@ -230,6 +231,7 @@ def _restls(
         client_extra={"skip-cert-verify": True},
         profile_extra={"client_fingerprint": fingerprint},
         camouflage_tls=version_hint,
+        expect=expect,
     )
 
 
@@ -348,23 +350,87 @@ def _build_cases() -> list[Case]:
         _restls("restls-script-simple", "restls", script="100"),
         _restls("restls-script-range", "restls", script="600?100<1"),
         _restls("restls-script-multi", "restls", script="250?100<1,650~1000<2"),
-        _restls("restls-script-edge", "restls-known-broken", script="16364<127"),
+        _restls(
+            "restls-script-edge",
+            "restls",
+            script="16364<31",
+        ),
         # Bisect the boundary: which of the two limits the backend actually
         # trips on. Both values are inside the range the panel treats as
         # v1-safe and the backend documents as supported.
         _restls("restls-script-target-max", "restls-probe", script="16364<1"),
-        _restls("restls-script-resp-max", "restls-probe", script="100<127"),
-        _restls("restls-script-mid", "restls-probe", script="8192<64"),
-        _restls("restls-script-resp-32", "restls-probe", script="100<32"),
-        _restls("restls-script-resp-33", "restls-probe", script="100<33"),
-        _restls("restls-script-resp-36", "restls-probe", script="100<36"),
-        _restls("restls-script-target-max-32", "restls-probe", script="16364<32"),
+        _restls(
+            "restls-script-resp-max",
+            "restls-probe",
+            script="100<127",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-mid",
+            "restls-probe",
+            script="8192<64",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-31",
+            "restls-probe",
+            script="100<31",
+        ),
+        _restls(
+            "restls-script-resp-32",
+            "restls-probe",
+            script="100<32",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-33",
+            "restls-probe",
+            script="100<33",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-36",
+            "restls-probe",
+            script="100<36",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-target-max-32",
+            "restls-probe",
+            script="16364<32",
+            expect="runtime-rejected",
+        ),
         _restls("restls-probe-big-2", "restls-probe", script="16364<2"),
-        _restls("restls-probe-4k-32", "restls-probe", script="4096<32"),
-        _restls("restls-probe-50-64", "restls-probe", script="50<64"),
-        _restls("restls-script-resp-40", "restls-probe", script="100<40"),
-        _restls("restls-script-resp-48", "restls-probe", script="100<48"),
-        _restls("restls-script-resp-64", "restls-probe", script="100<64"),
+        _restls(
+            "restls-probe-4k-32",
+            "restls-probe",
+            script="4096<32",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-probe-50-64",
+            "restls-probe",
+            script="50<64",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-40",
+            "restls-probe",
+            script="100<40",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-48",
+            "restls-probe",
+            script="100<48",
+            expect="runtime-rejected",
+        ),
+        _restls(
+            "restls-script-resp-64",
+            "restls-probe",
+            script="100<64",
+            expect="runtime-rejected",
+        ),
         _restls("restls-fp-ios", "restls", fingerprint="ios"),
         _restls("restls-fp-firefox", "restls", fingerprint="firefox"),
     ]

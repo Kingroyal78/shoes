@@ -84,7 +84,8 @@ supervise external `obfs-server`, `v2ray-plugin`, `gost`, `shadow-tls`,
 Two plugin intents the contract defines are deliberately not implemented here.
 A `jls` manifest is rejected by name; shoes has no JLS listener and never
 advertises `shadowsocks-plugin-jls-v1`. A Restls script outside the One/Shoes
-v1-safe range (last record target above 16364, or more than 127 responses) is
+interoperable range (last record target above 16364, or more than 31
+responses) is
 rejected by name; the panel gates those Profiles on
 `shadowsocks-plugin-restls-v2`, which shoes does not advertise. In both cases
 the candidate is refused whole, the last-known-good runtime keeps serving, the

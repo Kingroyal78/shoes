@@ -635,6 +635,7 @@ run_case() {
       e2e_die "${case_name}: panel stored a profile it is required to refuse"
     fi
     e2e_log "PASS ${case_name}: panel refused the profile"
+    cleanup_case
     return 0
   fi
 
@@ -722,6 +723,7 @@ PY
       e2e_die "${case_name}: backend acknowledged a manifest it is required to refuse"
     fi
     e2e_log "PASS ${case_name}: backend refused the manifest"
+    cleanup_case
     return 0
   fi
 

@@ -24,7 +24,15 @@ const MAX_BRUTAL_MBPS: u64 = 18_446_744_073_709;
 pub const MULTIPLEX_PROTOCOL_H2MUX: &str = "h2mux";
 const MAX_KCPTUN_INT: u32 = i32::MAX as u32;
 const MAX_RESTLS_RECORD_TARGET: u64 = 16_364;
-const MAX_RESTLS_RESPONSES: u64 = 127;
+/// How many response records a Restls script may ask a peer for.
+///
+/// Measured, not taken from the script grammar, which allows 254. The
+/// reference client stops carrying traffic somewhere above thirty-one whatever
+/// server it talks to: the reference server fails from thirty-two, this
+/// backend from thirty-three. Thirty-one is what both were seen to carry, and
+/// a manifest asking for more is refused rather than applied into a node that
+/// publishes and then stalls.
+const MAX_RESTLS_RESPONSES: u64 = 31;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
