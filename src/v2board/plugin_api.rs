@@ -20,6 +20,8 @@ pub const FEATURE_PLUGIN_KCPTUN_V1: &str = "shadowsocks-plugin-kcptun-v1";
 const MAX_FEATURES: usize = 32;
 const MAX_VERSION_BYTES: usize = 128;
 const MAX_BRUTAL_MBPS: u64 = 18_446_744_073_709;
+/// The one multiplex protocol this backend's Shadowsocks mux implements.
+pub const MULTIPLEX_PROTOCOL_H2MUX: &str = "h2mux";
 const MAX_KCPTUN_INT: u32 = i32::MAX as u32;
 const MAX_RESTLS_RECORD_TARGET: u64 = 16_364;
 const MAX_RESTLS_RESPONSES: u64 = 127;
@@ -230,11 +232,31 @@ pub struct PluginBaseConfig {
 pub struct ServerMultiplex {
     pub enabled: bool,
     pub padding: bool,
+    /// Which multiplex protocol the client will speak.
+    ///
+    /// Absent from manifests written before the panel learned to send it,
+    /// where the only protocol in play was H2MUX. It has to be part of the
+    /// manifest because both ends must speak the same one: a client told to
+    /// use a protocol this backend does not implement produces a node that
+    /// applies cleanly, acknowledges its revision, publishes, and then carries
+    /// nothing.
+    #[serde(default = "default_multiplex_protocol")]
+    pub protocol: String,
     pub brutal: ServerBrutal,
+}
+
+fn default_multiplex_protocol() -> String {
+    MULTIPLEX_PROTOCOL_H2MUX.to_string()
 }
 
 impl ServerMultiplex {
     fn validate(&self) -> Result<(), PluginManifestError> {
+        if self.enabled && self.protocol != MULTIPLEX_PROTOCOL_H2MUX {
+            return Err(PluginManifestError::new(
+                "server multiplex protocol is not implemented by this backend; \
+                 only h2mux is supported",
+            ));
+        }
         if !self.enabled && (self.padding || self.brutal.enabled) {
             return Err(PluginManifestError::new(
                 "disabled server multiplex cannot enable padding or TCP Brutal",
@@ -1179,6 +1201,49 @@ mod tests {
         PluginConfigCandidate::from_wire(OpaqueEtag::from_static("\"candidate\""), manifest, 12)
             .expect_err("manifest must be rejected")
             .to_string()
+    }
+
+    #[test]
+    fn an_unimplemented_multiplex_protocol_is_refused_rather_than_applied() {
+        // The protocol is server-effective: both ends have to speak the same
+        // one. Applying a manifest that names one this backend does not
+        // implement produces a node that acknowledges its revision, publishes,
+        // and then carries nothing.
+        let with_protocol = |protocol: Value, enabled: bool| {
+            let mut manifest =
+                base_manifest(plugin("obfs", json!({"mode": "tls", "host": "c.example"})));
+            manifest["multiplex"] = json!({
+                "enabled": enabled,
+                "padding": false,
+                "protocol": protocol,
+                "brutal": {"enabled": false, "up_mbps": 0, "down_mbps": 0}
+            });
+            manifest
+        };
+
+        let manifest = parse(with_protocol(json!("h2mux"), true)).expect("h2mux is implemented");
+        assert!(manifest.validate(12).is_ok());
+
+        let error = parse(with_protocol(json!("smux"), true))
+            .expect("an unknown protocol still decodes")
+            .validate(12)
+            .expect_err("smux is not implemented here");
+        assert!(error.reason().contains("h2mux"), "{}", error.reason());
+
+        // Absent means the panel predates the field, when h2mux was the only
+        // protocol in play.
+        let mut legacy = base_manifest(plugin("obfs", json!({"mode": "tls", "host": "c.example"})));
+        legacy["multiplex"] = json!({
+            "enabled": true,
+            "padding": false,
+            "brutal": {"enabled": false, "up_mbps": 0, "down_mbps": 0}
+        });
+        let manifest = parse(legacy).expect("a manifest without the field still decodes");
+        assert!(manifest.validate(12).is_ok());
+
+        // Nothing is multiplexed when it is off, so the name does not matter.
+        let manifest = parse(with_protocol(json!("yamux"), false)).expect("decodes");
+        assert!(manifest.validate(12).is_ok());
     }
 
     #[test]
