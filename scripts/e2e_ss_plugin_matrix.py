@@ -89,6 +89,12 @@ class Case:
     """Extra or overriding Mihomo plugin-opts."""
     profile_extra: dict = field(default_factory=dict)
     """Top-level profile keys outside `plugin`, e.g. client_fingerprint."""
+    expect: str = "traffic"
+    """What a passing run looks like.
+
+    traffic           the whole chain applies and carries the payload
+    profile-rejected  the panel must refuse to store this profile at all
+    """
     camouflage_tls: str = "auto"
     """TLS version the local camouflage server must offer: auto, tls12, tls13.
 
@@ -122,7 +128,18 @@ def _resolve(values: dict, camouflage_host: str, restls_script: str) -> dict:
     return resolved
 
 
-def _ws(name: str, kind: str, group: str, *, tls=False, mux=False, upgrade=False, headers=None, extra=None) -> Case:
+def _ws(
+    name: str,
+    kind: str,
+    group: str,
+    *,
+    tls=False,
+    mux=False,
+    upgrade=False,
+    headers=None,
+    extra=None,
+    expect="traffic",
+) -> Case:
     options = dict(WS_BASE)
     options.update(
         {
@@ -142,7 +159,14 @@ def _ws(name: str, kind: str, group: str, *, tls=False, mux=False, upgrade=False
     client_extra = {}
     if headers is not None:
         client_extra["headers"] = headers
-    return Case(name=name, kind=kind, group=group, options=options, client_extra=client_extra)
+    return Case(
+        name=name,
+        kind=kind,
+        group=group,
+        options=options,
+        client_extra=client_extra,
+        expect=expect,
+    )
 
 
 def _shadowtls(name: str, group: str, version: int, *, alpn=None, fingerprint="chrome") -> Case:
@@ -235,18 +259,16 @@ def _build_cases() -> list[Case]:
             _ws(f"{prefix}-wss-hosthdr", kind, "hosthdr", tls=True, headers={"Host": "front.interop.test"}),
             _ws(f"{prefix}-ws-hosthdr-port", kind, "hosthdr", headers={"Host": "front.interop.test:8443"}),
         ]
-    # A Host header that cannot normalize to a host is kept out of the manifest,
-    # so the backend listens on the validated `options.host` while the client
-    # still sends the unusable header verbatim. The two then disagree and the
-    # WebSocket handshake is refused, even though the node is ACKed and
-    # published. Kept in its own group: it documents a real gap in the panel's
-    # header validation rather than a passing combination.
+    # A Host header that cannot normalize to a host would leave the client
+    # asking for one name while the backend serves the validated
+    # `options.host`, so the panel refuses to store it at all.
     cases.append(
         _ws(
             "v2ray-ws-hosthdr-unusable",
             "v2ray-plugin",
-            "hosthdr-known-broken",
+            "hosthdr",
             headers={"Host": "front.interop.test/websocket"},
+            expect="profile-rejected",
         )
     )
 
@@ -491,6 +513,7 @@ def main() -> int:
         print(f"CASE_NEEDS_SERVER_TLS={int(server_tls)}")
         print(f"CASE_NEEDS_CERT={int(camouflage or server_tls)}")
         print(f"CASE_CAMOUFLAGE_TLS={case.camouflage_tls}")
+        print(f"CASE_EXPECT={case.expect}")
         return 0
 
     if args.command == "profile":

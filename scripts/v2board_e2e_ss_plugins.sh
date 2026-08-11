@@ -478,6 +478,7 @@ run_case() {
   local expected_feature
   local CASE_KIND CASE_FEATURE CASE_GROUP
   local CASE_NEEDS_CAMOUFLAGE CASE_NEEDS_SERVER_TLS CASE_NEEDS_CERT CASE_CAMOUFLAGE_TLS
+  local CASE_EXPECT
   local -a tls_version_args=()
 
   eval "$(case_flags "${case_name}")"
@@ -497,6 +498,17 @@ run_case() {
   e2e_assert_port_free "${plugin_port}" "${case_name} plugin"
   e2e_assert_port_free "${target_port}" "${case_name} target"
   e2e_assert_port_free "${mixed_port}" "${case_name} mixed"
+
+  if [[ "${CASE_EXPECT}" == "profile-rejected" ]]; then
+    local rejected_profile rejected_blob
+    rejected_profile="$(profile_for_case "${case_name}" "${raw_port}" "${plugin_port}")"
+    rejected_blob="$(encode_profile_blob "${rejected_profile}" || true)"
+    if [[ "${rejected_blob}" == sscp:v1:* ]]; then
+      e2e_die "${case_name}: panel stored a profile it is required to refuse"
+    fi
+    e2e_log "PASS ${case_name}: panel refused the profile"
+    return 0
+  fi
 
   seed_fixture \
     "${case_name}" \
