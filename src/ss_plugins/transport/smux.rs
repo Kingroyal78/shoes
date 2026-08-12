@@ -37,6 +37,15 @@ const UPDATE_PAYLOAD_SIZE: usize = 8;
 pub static STREAMS_DROPPED_BY_BACKPRESSURE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Default ceiling on queued inbound bytes for one logical stream.
+///
+/// The queue holds what arrives while the stream's own destination is not
+/// taking it, so it has to cover roughly a high-latency path's worth of data
+/// in flight. Four frames -- the previous limit, and expressed in frames
+/// rather than bytes -- is a small fraction of that on a 200ms path, which is
+/// why ordinary congestion rather than a wedged peer was costing streams.
+const DEFAULT_STREAM_RECEIVE_BUFFER: usize = 256 * 1024;
+
 /// Default ceiling on queued inbound bytes across a listener's sessions.
 /// Far above what healthy traffic queues -- data sits here only while a logical
 /// stream is slower than its peer -- but low enough to bound a listener that
@@ -73,7 +82,7 @@ impl Default for SmuxLimits {
     fn default() -> Self {
         Self {
             max_concurrent_streams: 256,
-            inbound_frames_per_stream: 4,
+            inbound_frames_per_stream: 256,
             outbound_frame_queue: 128,
             max_frame_payload: u16::MAX as usize,
         }
@@ -92,6 +101,10 @@ pub struct SmuxServerConfig {
     /// serves. `max_receive_buffer` is per session, so without this the
     /// listener's exposure is that figure times the number of connections.
     pub max_listener_receive_buffer: Option<usize>,
+    /// Ceiling on queued inbound bytes for one logical stream. Bounds what a
+    /// single stream may take of the session's budget, and decides whether
+    /// congestion costs a stream or only a wedged peer does.
+    pub max_stream_receive_buffer: usize,
 }
 
 impl Default for SmuxServerConfig {
@@ -104,6 +117,7 @@ impl Default for SmuxServerConfig {
             keepalive_interval: None,
             keepalive_timeout: None,
             max_listener_receive_buffer: Some(DEFAULT_LISTENER_RECEIVE_BUFFER),
+            max_stream_receive_buffer: DEFAULT_STREAM_RECEIVE_BUFFER,
         }
     }
 }
@@ -327,6 +341,9 @@ struct StreamState {
     inbound: Option<mpsc::Sender<InboundEvent>>,
     terminal: Option<oneshot::Sender<InboundTerminal>>,
     flow: Option<Arc<SmuxV2FlowControl>>,
+    /// Charges this stream's queued bytes, and through its parent the
+    /// session's and the listener's.
+    budget: Arc<ReceiveBudget>,
 }
 
 async fn serve_smux(
@@ -485,6 +502,10 @@ async fn serve_smux(
                         inbound: Some(inbound_tx),
                         terminal: Some(terminal_tx),
                         flow: flow.clone(),
+                        budget: Arc::new(ReceiveBudget::with_parent(
+                            config.max_stream_receive_buffer,
+                            Some(receive_budget.clone()),
+                        )),
                     },
                 );
                 let mut logical = if let Some(flow) = flow {
@@ -527,14 +548,20 @@ async fn serve_smux(
                     && !frame.payload.is_empty()
                     && let Some(sender) = &inbound.inbound
                 {
-                    let data = match receive_budget.track(frame.payload) {
-                        Ok(data) => data,
-                        Err(error) => break Err(error),
-                    };
-                    match sender.try_send(InboundEvent::Data(data)) {
-                        Ok(()) => {}
-                        Err(TrySendError::Closed(_)) => inbound.inbound = None,
-                        Err(TrySendError::Full(_)) => overran_queue = true,
+                    // Charged to this stream first, so a stream that will not
+                    // drain exhausts its own budget rather than the session's,
+                    // and the streams beside it keep their room. Exhausting it
+                    // costs this stream only: the reader never waits, because
+                    // waiting freezes every other stream the same client has
+                    // open, and never fails the session, because that takes
+                    // those streams down outright.
+                    match inbound.budget.track(frame.payload) {
+                        Ok(data) => match sender.try_send(InboundEvent::Data(data)) {
+                            Ok(()) => {}
+                            Err(TrySendError::Closed(_)) => inbound.inbound = None,
+                            Err(TrySendError::Full(_)) => overran_queue = true,
+                        },
+                        Err(_) => overran_queue = true,
                     }
                 }
                 if overran_queue {
@@ -1058,8 +1085,11 @@ mod tests {
         );
     }
 
+    /// Running out of queue space is one stream's problem. Failing the session
+    /// takes down every stream the same client has open, which is the
+    /// collateral this budget exists to bound rather than to cause.
     #[tokio::test]
-    async fn enforces_receive_buffer_across_the_physical_session() {
+    async fn a_session_out_of_receive_budget_drops_a_stream_not_itself() {
         let (mut client, server) = tokio::io::duplex(256);
         let handler = Arc::new(HoldingHandler::default());
         let session = tokio::spawn(serve_smux(
@@ -1080,33 +1110,101 @@ mod tests {
             None,
         ));
 
-        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
-            .await
-            .unwrap();
-        handler.ready.notified().await;
-        write_frame(&mut client, VERSION_V1, CMD_SYN, 2, &[])
-            .await
-            .unwrap();
-        handler.ready.notified().await;
+        for stream_id in [1, 2] {
+            write_frame(&mut client, VERSION_V1, CMD_SYN, stream_id, &[])
+                .await
+                .unwrap();
+            handler.ready.notified().await;
+        }
+        // The session budget is four bytes, so the second of these has nowhere
+        // to go even though its own stream has barely used anything.
         write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"abc")
             .await
             .unwrap();
         write_frame(&mut client, VERSION_V1, CMD_PSH, 2, b"def")
             .await
             .unwrap();
-        client.shutdown().await.unwrap();
-        tokio::task::yield_now().await;
+
+        // Still serving: a session that gave up here would never get this far.
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 3, &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler.ready.notified())
+            .await
+            .expect("a session out of budget must keep serving its other streams");
+
         handler
             .held
             .lock()
             .expect("holding handler mutex poisoned")
             .clear();
-
-        let error = session
+        client.shutdown().await.unwrap();
+        session
             .await
             .unwrap()
-            .expect_err("physical receive budget must reject excess queued bytes");
-        assert!(error.to_string().contains("receive buffer"));
+            .expect("the session outlives running out of queue space");
+    }
+
+    /// One stream's congestion must not eat the room its neighbours need, so
+    /// the charge lands on the stream before the session.
+    #[tokio::test]
+    async fn a_stream_exhausts_its_own_budget_before_the_sessions() {
+        let (mut client, server) = tokio::io::duplex(512);
+        let handler = Arc::new(HoldingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig {
+                limits: SmuxLimits {
+                    inbound_frames_per_stream: 64,
+                    max_frame_payload: 4,
+                    ..SmuxLimits::default()
+                },
+                // Room for many streams, but very little for any one of them.
+                max_receive_buffer: 4096,
+                max_stream_buffer: 8,
+                max_stream_receive_buffer: 4,
+                ..SmuxServerConfig::default()
+            },
+            None,
+        ));
+
+        for stream_id in [1, 2] {
+            write_frame(&mut client, VERSION_V1, CMD_SYN, stream_id, &[])
+                .await
+                .unwrap();
+            handler.ready.notified().await;
+        }
+        // Nobody reads stream 1, so it fills its four bytes and then loses the
+        // rest -- while stream 2 still has its own four to itself.
+        for _ in 0..8 {
+            write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"aa")
+                .await
+                .unwrap();
+        }
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 2, b"bb")
+            .await
+            .unwrap();
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 4, &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler.ready.notified())
+            .await
+            .expect("a stream over its own budget must not stall or fail the session");
+
+        handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        client.shutdown().await.unwrap();
+        session
+            .await
+            .unwrap()
+            .expect("the session outlives one stream exhausting its budget");
     }
 
     #[tokio::test]

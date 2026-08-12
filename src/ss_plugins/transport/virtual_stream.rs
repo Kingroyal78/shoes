@@ -65,18 +65,34 @@ impl ReceiveBudget {
         }
     }
 
+    /// Charges this budget and every one above it, or nothing at all.
+    ///
+    /// The chain is per-stream, then per-session, then per-listener, so a
+    /// stream that queues without draining runs out of its own budget long
+    /// before it can crowd out the streams beside it.
     fn charge(&self, length: usize) -> bool {
-        self.used
+        if self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(length).filter(|next| *next <= self.max)
             })
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(parent) = &self.parent
+            && !parent.charge(length)
+        {
+            self.used.fetch_sub(length, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 
     fn refund(&self, count: usize) {
         self.used.fetch_sub(count, Ordering::AcqRel);
         if let Some(parent) = &self.parent {
-            parent.used.fetch_sub(count, Ordering::AcqRel);
+            parent.refund(count);
         }
     }
 
@@ -85,17 +101,7 @@ impl ReceiveBudget {
         if !self.charge(length) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "smux physical receive buffer limit exceeded",
-            ));
-        }
-        if let Some(parent) = &self.parent
-            && !parent.charge(length)
-        {
-            // Undo this session's charge only: the parent never took one.
-            self.used.fetch_sub(length, Ordering::AcqRel);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "smux listener receive buffer limit exceeded",
+                "smux receive buffer limit exceeded",
             ));
         }
         Ok(InboundData {
@@ -796,7 +802,7 @@ mod tests {
         let Err(error) = second.track(vec![0_u8; 8]) else {
             panic!("the shared ceiling must apply across sessions");
         };
-        assert!(error.to_string().contains("listener receive buffer"));
+        assert!(error.to_string().contains("receive buffer"));
         // A rejected charge must not leave the session's own budget consumed.
         assert!(
             second.track(vec![0_u8; 4]).is_ok(),
