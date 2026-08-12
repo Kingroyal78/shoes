@@ -619,7 +619,7 @@ fn build_shadowsocks_plugin_handler(
                     V2rayTransportMode::Websocket
                 },
                 tls,
-                host: Some(options.host.clone()),
+                host: expected_websocket_host(&options.host, options.allow_unknown_host),
                 path: options.path.clone(),
                 mux: options.mux,
                 ..Default::default()
@@ -777,6 +777,14 @@ fn build_kcptun_config(options: &KcptunOptions) -> std::io::Result<KcptunConfig>
     })
 }
 
+/// The Host header the plugin edge holds clients to, if it holds them to one.
+///
+/// `None` disables the check, which is what a node serving several published
+/// hosts needs: the edge cannot know which one a given user was handed.
+fn expected_websocket_host(host: &str, allow_unknown_host: bool) -> Option<String> {
+    (!allow_unknown_host).then(|| host.to_string())
+}
+
 fn build_obfs_plugin_handler(
     options: &ObfsOptions,
     raw_handler: Arc<dyn TcpServerHandler>,
@@ -814,7 +822,7 @@ fn build_gost_plugin_handler(
     };
     let config = GostPluginServerConfig {
         tls,
-        host: Some(options.host.clone()),
+        host: expected_websocket_host(&options.host, options.allow_unknown_host),
         path: options.path.clone(),
         mux: options.mux,
         ..Default::default()

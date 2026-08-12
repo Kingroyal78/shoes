@@ -486,6 +486,13 @@ pub struct V2rayPluginOptions {
     pub tls: bool,
     pub mux: bool,
     pub v2ray_http_upgrade: bool,
+    /// Serve clients whose `Host` header is not the published one.
+    ///
+    /// The panel hands different users different hosts for the same node, so
+    /// the header is not a node-wide constant there. Defaults to enforcing it,
+    /// which is what a panel that does not send the field means.
+    #[serde(default)]
+    pub allow_unknown_host: bool,
 }
 
 impl V2rayPluginOptions {
@@ -508,6 +515,9 @@ pub struct GostPluginOptions {
     pub path: String,
     pub tls: bool,
     pub mux: bool,
+    /// See [`V2rayPluginOptions::allow_unknown_host`].
+    #[serde(default)]
+    pub allow_unknown_host: bool,
 }
 
 impl GostPluginOptions {
@@ -1199,6 +1209,44 @@ mod tests {
             "upstream": {"host": "127.0.0.1", "port": 8388},
             "options": options
         })
+    }
+
+    /// A panel that predates the switch means "keep enforcing the host", and
+    /// one that sends it means what it says.
+    #[test]
+    fn the_host_check_is_on_unless_the_panel_turns_it_off() {
+        let without = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket",
+                "host": "gost.example",
+                "path": "/gost",
+                "tls": false,
+                "mux": true
+            }),
+        )))
+        .unwrap();
+        let Some(RuntimePlugin::Gost { options, .. }) = &without.plugin else {
+            panic!("expected a gost plugin");
+        };
+        assert!(!options.allow_unknown_host);
+
+        let with = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket",
+                "host": "gost.example",
+                "path": "/gost",
+                "tls": false,
+                "mux": true,
+                "allow_unknown_host": true
+            }),
+        )))
+        .unwrap();
+        let Some(RuntimePlugin::Gost { options, .. }) = &with.plugin else {
+            panic!("expected a gost plugin");
+        };
+        assert!(options.allow_unknown_host);
     }
 
     fn parse(value: Value) -> Result<PluginRuntimeManifest, serde_json::Error> {

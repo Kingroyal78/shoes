@@ -75,7 +75,13 @@ CLIENT_KEY_RENAMES = {
 
 # Profile-only keys: stored by the panel for the client payload, never part of
 # the Mihomo plugin-opts block written here.
-PROFILE_ONLY_KEYS = {"fingerprint", "v2ray_http_upgrade_fast_open"}
+PROFILE_ONLY_KEYS = {
+    "fingerprint",
+    "v2ray_http_upgrade_fast_open",
+    # Tells the backend whether to hold clients to the published Host. The
+    # client has no say in it and Mihomo rejects plugin-opts it does not know.
+    "allow_unknown_host",
+}
 
 
 @dataclass(frozen=True)
@@ -150,8 +156,10 @@ def _ws(
     upgrade=False,
     headers=None,
     extra=None,
+    client_extra=None,
     expect="traffic",
 ) -> Case:
+    client_extra_override = client_extra
     options = dict(WS_BASE)
     options.update(
         {
@@ -171,6 +179,8 @@ def _ws(
     client_extra = {}
     if headers is not None:
         client_extra["headers"] = headers
+    if client_extra_override:
+        client_extra.update(client_extra_override)
     return Case(
         name=name,
         kind=kind,
@@ -330,6 +340,20 @@ def _build_cases() -> list[Case]:
             _ws(f"{prefix}-wss-hosthdr", kind, "hosthdr", tls=True, headers={"Host": "front.interop.test"}),
             _ws(f"{prefix}-ws-hosthdr-port", kind, "hosthdr", headers={"Host": "front.interop.test:8443"}),
         ]
+    # The panel hands different users different hosts for one node, so the
+    # backend has to serve a Host it never published -- but only when the node
+    # says so.
+    for kind, prefix in (("v2ray-plugin", "v2ray"), ("gost-plugin", "gost")):
+        cases.append(
+            _ws(
+                f"{prefix}-ws-unknown-host",
+                kind,
+                "hosthdr",
+                extra={"allow_unknown_host": True},
+                client_extra={"host": "handed-to-this-user.interop.test"},
+            )
+        )
+
     # A Host header that cannot normalize to a host would leave the client
     # asking for one name while the backend serves the validated
     # `options.host`, so the panel refuses to store it at all.

@@ -197,6 +197,21 @@ mod tests {
         validate_websocket_request(&request, Some("example.com")).unwrap();
     }
 
+    /// A node that hands different users different hosts turns the check off,
+    /// and then a Host it never published still has to be served.
+    #[test]
+    fn an_unpublished_host_is_served_only_when_the_check_is_off() {
+        let request = request(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("host", "handed-to-this-user.example"),
+        ]);
+        assert!(validate_websocket_request(&request, Some("published.example")).is_err());
+        validate_websocket_request(&request, None).unwrap();
+    }
+
     #[test]
     fn rejects_bad_key_version_body_and_missing_upgrade() {
         let base = [
