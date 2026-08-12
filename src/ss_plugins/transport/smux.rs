@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use super::virtual_stream::{
@@ -54,14 +55,6 @@ const DEFAULT_LISTENER_RECEIVE_BUFFER: usize = 256 * 1024 * 1024;
 /// session.
 const SMUX_V1_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long the physical reader waits for a stream to drain before giving up
-/// on it.
-///
-/// Long enough that congestion on a high-latency path never trips it, short
-/// enough that a stream whose peer stopped reading entirely cannot hold the
-/// rest of its session shut for long.
-const DEFAULT_INBOUND_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 fn listener_budget(config: &SmuxServerConfig) -> Option<Arc<ReceiveBudget>> {
     config
         .max_listener_receive_buffer
@@ -99,9 +92,6 @@ pub struct SmuxServerConfig {
     /// serves. `max_receive_buffer` is per session, so without this the
     /// listener's exposure is that figure times the number of connections.
     pub max_listener_receive_buffer: Option<usize>,
-    /// How long the physical reader waits on a full per-stream queue before
-    /// treating the stream as wedged. See [`DEFAULT_INBOUND_ENQUEUE_TIMEOUT`].
-    pub inbound_enqueue_timeout: std::time::Duration,
 }
 
 impl Default for SmuxServerConfig {
@@ -114,7 +104,6 @@ impl Default for SmuxServerConfig {
             keepalive_interval: None,
             keepalive_timeout: None,
             max_listener_receive_buffer: Some(DEFAULT_LISTENER_RECEIVE_BUFFER),
-            inbound_enqueue_timeout: DEFAULT_INBOUND_ENQUEUE_TIMEOUT,
         }
     }
 }
@@ -534,41 +523,19 @@ async fn serve_smux(
                 // was already on the wire. Discard the payload -- failing the
                 // session here would punish every other stream sharing it.
                 let mut overran_queue = false;
-                let mut receiver_gone = false;
-                if let Some(state) = streams.get(&frame.stream_id)
+                if let Some(inbound) = streams.get_mut(&frame.stream_id)
                     && !frame.payload.is_empty()
-                    && let Some(sender) = state.inbound.clone()
+                    && let Some(sender) = &inbound.inbound
                 {
                     let data = match receive_budget.track(frame.payload) {
                         Ok(data) => data,
                         Err(error) => break Err(error),
                     };
-                    // Wait for the stream to drain instead of killing it on the
-                    // first full queue. smux v1 has no per-stream window, so the
-                    // only backpressure available is to stop reading this
-                    // physical connection -- which is what the reference
-                    // implementation does. Congestion is transient and the queue
-                    // is four frames deep, far below what a high-latency path
-                    // keeps in flight, so killing on overflow lost most of the
-                    // uploads on a lossy long path where the reference lost
-                    // none. Pausing costs the session's other streams a stall,
-                    // and only this session's, since a session is one client.
-                    match tokio::time::timeout(
-                        config.inbound_enqueue_timeout,
-                        sender.send(InboundEvent::Data(data)),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => receiver_gone = true,
-                        // Not draining at all rather than merely slowly. Fall
-                        // through to the drop so one wedged stream cannot hold
-                        // the session shut indefinitely.
-                        Err(_) => overran_queue = true,
+                    match sender.try_send(InboundEvent::Data(data)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => inbound.inbound = None,
+                        Err(TrySendError::Full(_)) => overran_queue = true,
                     }
-                }
-                if receiver_gone && let Some(state) = streams.get_mut(&frame.stream_id) {
-                    state.inbound = None;
                 }
                 if overran_queue {
                     STREAMS_DROPPED_BY_BACKPRESSURE
@@ -852,91 +819,6 @@ mod tests {
             self.ready.notify_one();
             Ok(TcpServerSetupResult::AlreadyHandled)
         }
-    }
-
-    /// Reads its stream only after a pause, so the physical reader meets a
-    /// full queue while the stream is still perfectly alive.
-    #[derive(Default)]
-    struct SlowReadingHandler {
-        read: Arc<Mutex<Vec<u8>>>,
-        done: Arc<Notify>,
-    }
-
-    impl fmt::Debug for SlowReadingHandler {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("SlowReadingHandler")
-        }
-    }
-
-    #[async_trait]
-    impl TcpServerHandler for SlowReadingHandler {
-        async fn setup_server_stream(
-            &self,
-            mut stream: Box<dyn AsyncStream>,
-        ) -> io::Result<TcpServerSetupResult> {
-            let read = self.read.clone();
-            let done = self.done.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let mut buffer = [0u8; 6];
-                if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buffer)
-                    .await
-                    .is_ok()
-                {
-                    *read.lock().expect("slow handler mutex poisoned") = buffer.to_vec();
-                }
-                done.notify_one();
-            });
-            Ok(TcpServerSetupResult::AlreadyHandled)
-        }
-    }
-
-    /// A congested path fills the queue of a stream that is merely slow, not
-    /// dead. Killing it there lost most of the uploads on a lossy long path,
-    /// so the reader has to wait for it instead.
-    #[tokio::test]
-    async fn a_stream_that_drains_slowly_keeps_its_bytes() {
-        let (mut client, server) = tokio::io::duplex(512);
-        let handler = Arc::new(SlowReadingHandler::default());
-        let session = tokio::spawn(serve_smux(
-            Box::new(TestStream(server)),
-            handler.clone(),
-            Arc::new(NativeResolver::new()),
-            None,
-            SmuxServerConfig {
-                limits: SmuxLimits {
-                    inbound_frames_per_stream: 1,
-                    max_frame_payload: 4,
-                    ..SmuxLimits::default()
-                },
-                max_receive_buffer: 64,
-                max_stream_buffer: 8,
-                inbound_enqueue_timeout: std::time::Duration::from_secs(5),
-                ..SmuxServerConfig::default()
-            },
-            None,
-        ));
-
-        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
-            .await
-            .unwrap();
-        for payload in [b"aa", b"bb", b"cc"] {
-            write_frame(&mut client, VERSION_V1, CMD_PSH, 1, payload)
-                .await
-                .unwrap();
-        }
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), handler.done.notified())
-            .await
-            .expect("the slow stream must still be served");
-        assert_eq!(
-            &*handler.read.lock().expect("slow handler mutex poisoned"),
-            b"aabbcc",
-            "a stream that is slow rather than dead must not lose bytes"
-        );
-
-        client.shutdown().await.unwrap();
-        let _ = session.await.unwrap();
     }
 
     #[test]
@@ -1357,7 +1239,6 @@ mod tests {
                 },
                 max_receive_buffer: 64,
                 max_stream_buffer: 8,
-                inbound_enqueue_timeout: std::time::Duration::from_millis(100),
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1420,7 +1301,6 @@ mod tests {
                 },
                 max_receive_buffer: 256,
                 max_stream_buffer: 4,
-                inbound_enqueue_timeout: std::time::Duration::from_millis(100),
                 ..SmuxServerConfig::default()
             },
             None,
