@@ -421,6 +421,8 @@ pub async fn run_ss2022_load_client(
     streams: usize,
     concurrency: usize,
     hold: std::time::Duration,
+    echo_rounds: usize,
+    echo_bytes: usize,
 ) -> io::Result<()> {
     let server_addr = tokio::net::lookup_host(server)
         .await?
@@ -450,6 +452,9 @@ pub async fn run_ss2022_load_client(
     let gate = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let established = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rounds = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let reporter = {
         let established = established.clone();
@@ -474,6 +479,9 @@ pub async fn run_ss2022_load_client(
         let target = target.clone();
         let established = established.clone();
         let failed = failed.clone();
+        let bytes = bytes.clone();
+        let nanos = nanos.clone();
+        let rounds = rounds.clone();
         tasks.push(tokio::spawn(async move {
             let permit = gate
                 .acquire_owned()
@@ -493,6 +501,23 @@ pub async fn run_ss2022_load_client(
             // Release the handshake slot but keep the connection, so the server
             // accumulates open streams rather than churning through them.
             drop(permit);
+            let mut held = held;
+            if echo_rounds > 0 {
+                match echo_round_trips(&mut held, echo_rounds, echo_bytes).await {
+                    Ok(elapsed) => {
+                        bytes.fetch_add(
+                            (echo_rounds * echo_bytes * 2) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        nanos.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+                        rounds.fetch_add(echo_rounds as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        log::debug!("load: echo failed: {error}");
+                    }
+                }
+            }
             tokio::time::sleep(hold).await;
             drop(held);
         }));
@@ -502,12 +527,42 @@ pub async fn run_ss2022_load_client(
         let _ = task.await;
     }
     reporter.abort();
+    let total_rounds = rounds.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
         "load finished: established={} failed={}",
         established.load(std::sync::atomic::Ordering::Relaxed),
         failed.load(std::sync::atomic::Ordering::Relaxed)
     );
+    let total_nanos = nanos.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(mean_nanos) = total_nanos.checked_div(total_rounds)
+        && total_nanos > 0
+    {
+        let total_bytes = bytes.load(std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "echo: rounds={total_rounds} mean_rtt_us={} throughput_MiB_s={:.1}",
+            mean_nanos / 1000,
+            total_bytes as f64 / (total_nanos as f64 / 1e9) / (1024.0 * 1024.0)
+        );
+    }
     Ok(())
+}
+
+/// Round-trip `bytes` through an established stream `rounds` times, returning
+/// the total nanoseconds spent waiting. Measures what a request actually costs
+/// through the proxy, which holding an idle connection cannot show.
+async fn echo_round_trips(
+    stream: &mut Box<dyn crate::async_stream::AsyncStream>,
+    rounds: usize,
+    bytes: usize,
+) -> io::Result<u64> {
+    let payload = vec![0x5a_u8; bytes];
+    let mut received = vec![0_u8; bytes];
+    let started = std::time::Instant::now();
+    for _ in 0..rounds {
+        tokio::io::AsyncWriteExt::write_all(stream, &payload).await?;
+        tokio::io::AsyncReadExt::read_exact(stream, &mut received).await?;
+    }
+    Ok(started.elapsed().as_nanos() as u64)
 }
 
 async fn open_ss2022_stream(
@@ -539,11 +594,20 @@ pub async fn run_tcp_sink(listen: &str) -> io::Result<()> {
             // Hold it open and consume anything sent, so the proxied stream
             // stays established instead of completing immediately.
             let mut stream = stream;
-            let mut buffer = vec![0_u8; 4096];
+            let mut buffer = vec![0_u8; 65536];
             loop {
                 match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    // Echo, so a client can time a round trip through the proxy
+                    // rather than only hold the connection open.
+                    Ok(read) => {
+                        if tokio::io::AsyncWriteExt::write_all(&mut stream, &buffer[..read])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             held.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

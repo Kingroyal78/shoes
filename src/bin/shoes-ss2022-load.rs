@@ -43,6 +43,8 @@ async fn main() {
                 args.streams,
                 args.concurrency,
                 Duration::from_secs(args.hold_secs),
+                args.echo_rounds,
+                args.echo_bytes,
             )
             .await
         }
@@ -62,6 +64,8 @@ struct Args {
     streams: usize,
     concurrency: usize,
     hold_secs: u64,
+    echo_rounds: usize,
+    echo_bytes: usize,
 }
 
 impl Args {
@@ -73,6 +77,8 @@ impl Args {
         let mut streams = 1000_usize;
         let mut concurrency = 200_usize;
         let mut hold_secs = 120_u64;
+        let mut echo_rounds = 0_usize;
+        let mut echo_bytes = 1024_usize;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -82,6 +88,8 @@ impl Args {
                 "--streams" => streams = parse_number(&mut args, "--streams")?,
                 "--concurrency" => concurrency = parse_number(&mut args, "--concurrency")?,
                 "--hold-secs" => hold_secs = parse_number(&mut args, "--hold-secs")? as u64,
+                "--echo-rounds" => echo_rounds = parse_number(&mut args, "--echo-rounds")?,
+                "--echo-bytes" => echo_bytes = parse_number(&mut args, "--echo-bytes")?,
                 "-h" | "--help" => {
                     usage();
                     std::process::exit(0);
@@ -103,6 +111,8 @@ impl Args {
                 streams,
                 concurrency,
                 hold_secs,
+                echo_rounds,
+                echo_bytes,
             });
         }
 
@@ -113,6 +123,8 @@ impl Args {
             streams,
             concurrency,
             hold_secs,
+            echo_rounds,
+            echo_bytes,
         })
     }
 }
