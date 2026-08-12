@@ -78,6 +78,10 @@ E2E_PUSH_INTERVAL_SECS="${E2E_PUSH_INTERVAL_SECS:-2}"
 E2E_WAIT_TIMEOUT_SECS="${E2E_WAIT_TIMEOUT_SECS:-60}"
 E2E_CURL_MAX_TIME_SECS="${E2E_CURL_MAX_TIME_SECS:-45}"
 E2E_KEEP_FIXTURES="${E2E_KEEP_FIXTURES:-1}"
+# The panel derives 2022-blake3 server keys from the node row and the client
+# password shape differs from legacy AEAD, so a cipher change has to reach
+# the fixture, not only the client config.
+E2E_SS_CIPHER="${E2E_SS_CIPHER:-aes-128-gcm}"
 E2E_SHOES_LOG_LEVEL="${E2E_SHOES_LOG_LEVEL:-info}"
 E2E_MIHOMO_LOG_LEVEL="${E2E_MIHOMO_LOG_LEVEL:-info}"
 
@@ -122,6 +126,33 @@ plugin_feature() {
 # derived from the user id and stays unique across fixture ID windows.
 case_uuid() {
   printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+# Shadowsocks 2022 authenticates with a server key plus a per-user key rather
+# than the bare UUID the older ciphers use, so the client credential has to be
+# assembled the way the panel assembles it (Helper::buildShadowsocksUri). The
+# server key is read back from the manifest instead of recomputed, so a change
+# in how the panel derives it fails the case rather than passing against our
+# own copy of the rule.
+case_password() {
+  local node_id="$1"
+  local user_id="$2"
+  local uuid
+  uuid="$(case_uuid "${user_id}")"
+  if [[ "${E2E_SS_CIPHER}" != 2022-blake3-* ]]; then
+    printf '%s\n' "${uuid}"
+    return 0
+  fi
+  local key_length=32
+  [[ "${E2E_SS_CIPHER}" == "2022-blake3-aes-128-gcm" ]] && key_length=16
+  local server_key
+  server_key="$(curl --silent --show-error --fail --max-time 5 \
+    "${V2BOARD_PANEL_URL}/api/v1/server/UniProxy/plugin-config?token=${SERVER_TOKEN}&node_type=shadowsocks&node_id=${node_id}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("server_key",""))')"
+  [[ -n "${server_key}" ]] \
+    || e2e_die "node ${node_id}: plugin-config carries no server_key for ${E2E_SS_CIPHER}"
+  printf '%s:%s\n' "${server_key}" \
+    "$(printf '%s' "${uuid:0:${key_length}}" | base64)"
 }
 
 case_flags() {
@@ -215,7 +246,7 @@ SQL
 INSERT INTO v2_server_shadowsocks
 (id, group_id, route_id, parent_id, tags, name, country_code, city_name, city_id, rate, host, port, server_port, cipher, obfs, obfs_settings, gost_enable, gost_settings, ss_client_settings, \`show\`, sort, created_at, updated_at)
 VALUES
-(${node_id}, '["${group_id}"]', NULL, NULL, NULL, 'shoes-e2e-${case_name}', 'US', 'Local', NULL, '1', '${E2E_BIND_HOST}', '${plugin_port}', ${raw_port}, 'aes-128-gcm', NULL, NULL, 0, NULL, '${blob}', 1, ${node_id}, ${now}, ${now})
+(${node_id}, '["${group_id}"]', NULL, NULL, NULL, 'shoes-e2e-${case_name}', 'US', 'Local', NULL, '1', '${E2E_BIND_HOST}', '${plugin_port}', ${raw_port}, '${E2E_SS_CIPHER}', NULL, NULL, 0, NULL, '${blob}', 1, ${node_id}, ${now}, ${now})
 ON DUPLICATE KEY UPDATE
   group_id=VALUES(group_id),
   name=VALUES(name),
@@ -424,6 +455,7 @@ write_mihomo_config() {
   python3 "${MATRIX_BIN}" mihomo "${case_name}" \
     --plugin-port "${plugin_port}" \
     --mixed-port "${mixed_port}" \
+    --cipher "${E2E_SS_CIPHER}" \
     --password "${password}" \
     --camouflage-host "${CAMOUFLAGE_HOST}" \
     --restls-script "${RESTLS_SCRIPT}" \
@@ -745,7 +777,7 @@ PY
       "${case_name}" \
       "${plugin_port}" \
       "${mixed_port}" \
-      "$(case_uuid "${user_id}")"
+      "$(case_password "${node_id}" "${user_id}")"
   fi
   "${MIHOMO_BIN}" -d "${case_dir}/mihomo" -f "${case_dir}/mihomo.yml" \
     >"${case_dir}/mihomo.log" 2>&1 &
@@ -773,7 +805,7 @@ PY
       "${plugin_port}" \
       "${target_port}" \
       "$((udp_port + 1))" \
-      "$(case_uuid "${user_id}")" \
+      "$(case_password "${node_id}" "${user_id}")" \
       "${case_dir}"
   fi
 
