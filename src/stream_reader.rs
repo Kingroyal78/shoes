@@ -4,12 +4,12 @@ use tokio::io::AsyncReadExt;
 use crate::util::allocate_vec;
 
 const DEFAULT_BUFFER_SIZE: usize = 32768;
-const ERROR_ON_BARE_LF: bool = true;
 
 pub struct StreamReader {
     buf: Box<[u8]>,
     start_offset: usize,
     end_offset: usize,
+    allow_bare_lf: bool,
 }
 
 impl StreamReader {
@@ -23,6 +23,18 @@ impl StreamReader {
             buf: allocate_vec(buffer_size).into_boxed_slice(),
             start_offset: 0usize,
             end_offset: 0usize,
+            allow_bare_lf: false,
+        }
+    }
+
+    /// A reader that also accepts a bare LF as a line ending.
+    ///
+    /// Use it where the peer is an HTTP client we have to interoperate with
+    /// rather than one we get to hold to the spec.
+    pub fn new_allowing_bare_lf() -> Self {
+        Self {
+            allow_bare_lf: true,
+            ..Self::new()
         }
     }
 
@@ -45,19 +57,21 @@ impl StreamReader {
             match memchr(b'\n', &self.buf[search_start_offset..search_end_offset]) {
                 Some(pos) => {
                     let newline_pos = search_start_offset + pos;
-                    if newline_pos == self.start_offset || self.buf[newline_pos - 1] != b'\r' {
-                        if ERROR_ON_BARE_LF {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Line is not terminated by CRLF",
-                            ));
-                        } else {
-                            search_start_offset = newline_pos + 1;
-                            continue;
-                        }
+                    let carriage_return =
+                        newline_pos > self.start_offset && self.buf[newline_pos - 1] == b'\r';
+                    if !carriage_return && !self.allow_bare_lf {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Line is not terminated by CRLF",
+                        ));
                     }
-                    // Strips CRLF.
-                    let line = &mut self.buf[self.start_offset..newline_pos - 1];
+                    // Strips the line ending, CRLF or bare LF.
+                    let line_end = if carriage_return {
+                        newline_pos - 1
+                    } else {
+                        newline_pos
+                    };
+                    let line = &mut self.buf[self.start_offset..line_end];
                     let new_start_offset = newline_pos + 1;
                     if new_start_offset == search_end_offset {
                         self.start_offset = 0;

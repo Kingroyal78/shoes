@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io;
 
+use memchr::memchr;
+
 use tokio::io::AsyncReadExt;
 
 use crate::async_stream::AsyncStream;
@@ -39,9 +41,9 @@ impl HttpRequest {
         }
 
         let mut data = Vec::with_capacity(limits.max_header_bytes.min(4096));
-        let header_end = loop {
-            if let Some(pos) = find_header_end(&data) {
-                break pos;
+        let header = loop {
+            if let Some(header) = find_header_end(&data) {
+                break header;
             }
             if data.len() >= limits.max_header_bytes {
                 return invalid("HTTP header exceeds configured byte limit");
@@ -57,22 +59,16 @@ impl HttpRequest {
                 ));
             }
             data.extend_from_slice(&chunk[..read_len]);
-            let header_scan_end = find_header_end(&data)
-                .map(|position| position + 4)
-                .unwrap_or(data.len());
-            if data[..header_scan_end]
-                .iter()
-                .enumerate()
-                .any(|(index, byte)| *byte == b'\n' && (index == 0 || data[index - 1] != b'\r'))
-            {
-                return invalid("HTTP header contains a bare LF");
-            }
         };
+        let header_end = header.end;
+        let body_start = header.body_start;
 
         let header = &data[..header_end];
         let header = std::str::from_utf8(header)
             .map_err(|_| invalid_error("HTTP header is not valid UTF-8/ASCII"))?;
-        let mut lines = header.split("\r\n");
+        let mut lines = header
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
         let request_line = lines
             .next()
             .ok_or_else(|| invalid_error("empty HTTP request"))?;
@@ -141,8 +137,8 @@ impl HttpRequest {
             target: target.to_string(),
             version: version.to_string(),
             headers,
-            raw_header: data[..header_end + 4].to_vec(),
-            unparsed_data: data[header_end + 4..].to_vec(),
+            raw_header: data[..body_start].to_vec(),
+            unparsed_data: data[body_start..].to_vec(),
         })
     }
 
@@ -233,8 +229,53 @@ fn request_target_path(target: &str) -> &str {
     target
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|window| window == b"\r\n\r\n")
+/// Where the header block stops and the body begins.
+struct HeaderEnd {
+    /// Offset one past the last header byte, excluding its line ending.
+    end: usize,
+    /// Offset of the first body byte, past the blank line.
+    body_start: usize,
+}
+
+/// Finds the blank line that ends the header block, accepting a bare LF as a
+/// line ending as well as CRLF.
+///
+/// Clients in the field send bare LF, and every mainstream HTTP server accepts
+/// it, so rejecting the request only locks those users out. Nothing here is
+/// forwarded to another HTTP parser, so tolerating it desynchronizes nothing.
+fn find_header_end(data: &[u8]) -> Option<HeaderEnd> {
+    let mut search = 0usize;
+    while let Some(offset) = memchr(b'\n', &data[search..]) {
+        let line_feed = search + offset;
+        let end = if line_feed > 0 && data[line_feed - 1] == b'\r' {
+            line_feed - 1
+        } else {
+            line_feed
+        };
+        match data.get(line_feed + 1) {
+            Some(b'\n') => {
+                return Some(HeaderEnd {
+                    end,
+                    body_start: line_feed + 2,
+                });
+            }
+            Some(b'\r') => match data.get(line_feed + 2) {
+                Some(b'\n') => {
+                    return Some(HeaderEnd {
+                        end,
+                        body_start: line_feed + 3,
+                    });
+                }
+                // Not a blank line, or not enough bytes to tell yet.
+                Some(_) => {}
+                None => return None,
+            },
+            Some(_) => {}
+            None => return None,
+        }
+        search = line_feed + 1;
+    }
+    None
 }
 
 fn is_token(byte: u8) -> bool {
@@ -365,13 +406,51 @@ mod tests {
         assert_eq!(parsed.unparsed_data, b"binary\npayload");
     }
 
+    /// gost accepts a bare LF and so must we: the clients that send one are
+    /// the ones the panel already handed a working profile to.
     #[tokio::test]
-    async fn rejects_bare_lf_duplicate_singleton_and_too_many_headers() {
-        let err = parse_fragmented(&[b"GET / HTTP/1.1\nHost: x\n\n"], HttpLimits::default())
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    async fn accepts_bare_lf_line_endings_and_splits_the_body_exactly() {
+        let parsed = parse_fragmented(
+            &[b"GET /ws HTTP/1.1\nHost: example.com\nUpgrade: websocket\n\nbody\nrest"],
+            HttpLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parsed.path(), "/ws");
+        assert_eq!(parsed.header("host").unwrap(), Some("example.com"));
+        assert!(parsed.header_contains_token("upgrade", "websocket"));
+        assert_eq!(parsed.unparsed_data, b"body\nrest");
+        assert_eq!(
+            parsed.raw_header,
+            b"GET /ws HTTP/1.1\nHost: example.com\nUpgrade: websocket\n\n"
+        );
+    }
 
+    /// The header block is replayed verbatim to the inner handler, so every
+    /// mixture of line endings has to leave the body boundary where it is.
+    #[tokio::test]
+    async fn finds_the_body_across_mixed_line_endings() {
+        for (request, raw_header) in [
+            (
+                &b"GET / HTTP/1.1\r\nHost: x\n\r\nbody"[..],
+                &b"GET / HTTP/1.1\r\nHost: x\n\r\n"[..],
+            ),
+            (
+                &b"GET / HTTP/1.1\nHost: x\r\n\nbody"[..],
+                &b"GET / HTTP/1.1\nHost: x\r\n\n"[..],
+            ),
+        ] {
+            let parsed = parse_fragmented(&[request], HttpLimits::default())
+                .await
+                .unwrap();
+            assert_eq!(parsed.header("host").unwrap(), Some("x"));
+            assert_eq!(parsed.unparsed_data, b"body");
+            assert_eq!(parsed.raw_header, raw_header);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_singleton_and_too_many_headers() {
         let parsed = parse_fragmented(
             &[b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"],
             HttpLimits::default(),

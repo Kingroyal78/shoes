@@ -168,7 +168,15 @@ impl WebsocketTcpServerHandler {
             return target_setup_result;
         }
 
-        Err(std::io::Error::other("No matching websocket targets"))
+        // Naming the path separates a client on a stale path from a scanner.
+        let logged_path: String = request_path
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect();
+        Err(std::io::Error::other(format!(
+            "No matching websocket targets for path {logged_path}"
+        )))
     }
 }
 
@@ -190,6 +198,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+fn request_path_without_query(request_path: &str) -> &str {
+    request_path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request_path)
+}
+
 fn match_path_and_decode_early_data(
     request_path: &str,
     request_headers: &HashMap<String, String>,
@@ -202,9 +217,12 @@ fn match_path_and_decode_early_data(
         .map(str::trim)
         .filter(|name| !name.is_empty());
 
+    // The query string is not part of the path gost matches on, and clients
+    // append one (`?ed=2048` and friends) to a path the panel handed them
+    // verbatim. Only the early-data-in-path mode below reads past the prefix.
     if (max_early_data == 0 || early_data_header_name.is_some())
         && let Some(path) = matching_path
-        && request_path != path
+        && request_path_without_query(request_path) != path
     {
         return Ok(None);
     }
@@ -380,7 +398,7 @@ struct ParsedHttpData {
 
 impl ParsedHttpData {
     async fn parse(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Self> {
-        let mut stream_reader = StreamReader::new();
+        let mut stream_reader = StreamReader::new_allowing_bare_lf();
         let mut first_line: Option<String> = None;
         // don't use FxHashMap for unvalidated user data
         let mut headers: HashMap<String, String> = HashMap::new();
@@ -472,6 +490,37 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
+        assert_eq!(&*data, b"hi");
+    }
+
+    /// gost matches the path and ignores the query, and clients append one.
+    #[test]
+    fn matches_the_path_with_a_query_string_attached() {
+        let headers = HashMap::new();
+
+        assert!(
+            match_path_and_decode_early_data("/ws?ed=2048", &headers, Some("/ws"), None, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            match_path_and_decode_early_data("/other?ed=2048", &headers, Some("/ws"), None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Early data carried in the path is read past the prefix, so the query
+    /// separator is part of the payload there and must not be stripped.
+    #[test]
+    fn keeps_the_whole_suffix_when_early_data_rides_the_path() {
+        let headers = HashMap::new();
+
+        let data =
+            match_path_and_decode_early_data("/wsaGk", &headers, Some("/ws"), Some(2048), None)
+                .unwrap()
+                .unwrap()
+                .unwrap();
         assert_eq!(&*data, b"hi");
     }
 
