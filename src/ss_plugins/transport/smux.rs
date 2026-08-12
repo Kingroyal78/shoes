@@ -556,15 +556,14 @@ async fn serve_smux(
                             "smux v{version} logical inbound queue is full"
                         )));
                     }
-                    if outbound_tx
-                        .send(OutboundCommand::Finished {
-                            stream_id: frame.stream_id,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break invalid(format!("smux v{version} session writer closed"));
-                    }
+                    // Deliberately no close from here. The stream's own drop
+                    // sends one through a permit reserved at SYN time, which
+                    // cannot block. Enqueuing another would duplicate it and --
+                    // because the outbound queue is bounded -- park the
+                    // *physical reader* whenever the writer is backed up,
+                    // stalling every stream on the connection over one
+                    // stream's overflow. A congested path is exactly where the
+                    // overflow and the backed-up writer happen together.
                 }
             }
             CMD_FIN => {
@@ -1277,6 +1276,69 @@ mod tests {
             .await
             .unwrap()
             .expect("the session outlives a single stream's overflow");
+    }
+
+    #[tokio::test]
+    async fn an_overflow_leaves_the_close_to_the_stream_itself() {
+        // A finished logical stream announces itself on drop, through a permit
+        // it reserved when it was opened -- that send cannot block. Anything
+        // the physical reader enqueues on top of it is both a duplicate FIN and
+        // a chance for the reader to park on a full outbound queue, stalling
+        // every other stream on the connection. Exactly one close must reach
+        // the peer, and it must not come from the reader.
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = Arc::new(HoldingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig {
+                limits: SmuxLimits {
+                    inbound_frames_per_stream: 1,
+                    max_frame_payload: 4,
+                    ..SmuxLimits::default()
+                },
+                max_receive_buffer: 256,
+                max_stream_buffer: 4,
+                ..SmuxServerConfig::default()
+            },
+            None,
+        ));
+
+        let mut client = client;
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        handler.ready.notified().await;
+        // One frame fills the single inbound slot; the next overruns it.
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"aa")
+            .await
+            .unwrap();
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"bb")
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Let the overrun stream drop, which is what should emit the close.
+        handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session).await;
+
+        let mut closes = 0;
+        while let Ok(Some(frame)) = read_frame(&mut client, VERSION_V1, 1024).await {
+            if frame.command == CMD_FIN && frame.stream_id == 1 {
+                closes += 1;
+            }
+        }
+        assert_eq!(
+            closes, 1,
+            "the reader must leave the close to the stream's own drop"
+        );
     }
 
     #[tokio::test]
