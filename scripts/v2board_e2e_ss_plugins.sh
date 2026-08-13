@@ -18,8 +18,14 @@
 #   SHOES_BIN=/path/to/shoes scripts/v2board_e2e_ss_plugins.sh
 #   E2E_SS_PLUGIN_CASES=obfs-http,restls scripts/v2board_e2e_ss_plugins.sh
 #
-# Fixtures use reserved ranges: nodes 9601-9618, users 19601-19618, raw ports
-# 18601-18618, plugin ports 18701-18718, target/mixed ports 18650-18687.
+# Fixtures use reserved ranges, sized for 200 cases so the matrix can grow
+# without the ranges meeting: nodes 9601-9800, users 19601-19800, raw ports
+# 18601-18800, plugin ports 19001-19200, target/mixed ports 19401-19800, UDP
+# echo ports 29402-29800. `assert_case_ports_disjoint` proves they stay apart
+# for the cases actually selected -- an earlier layout packed target/mixed two
+# apart from a base below the plugin range, so at the fifty-first case the
+# plugin port and Mihomo's mixed port were the same number and the case timed
+# out with nothing to show for it.
 
 set -Eeuo pipefail
 
@@ -91,8 +97,8 @@ E2E_MIHOMO_LOG_LEVEL="${E2E_MIHOMO_LOG_LEVEL:-info}"
 CASE_NODE_BASE="${E2E_CASE_NODE_BASE:-9601}"
 CASE_USER_BASE="${E2E_CASE_USER_BASE:-19601}"
 CASE_RAW_PORT_BASE="${E2E_CASE_RAW_PORT_BASE:-18601}"
-CASE_PLUGIN_PORT_BASE="${E2E_CASE_PLUGIN_PORT_BASE:-18701}"
-CASE_TARGET_PORT_BASE="${E2E_CASE_TARGET_PORT_BASE:-18650}"
+CASE_PLUGIN_PORT_BASE="${E2E_CASE_PLUGIN_PORT_BASE:-19001}"
+CASE_TARGET_PORT_BASE="${E2E_CASE_TARGET_PORT_BASE:-19401}"
 
 TMP_DIR=""
 PIDS=()
@@ -153,6 +159,35 @@ case_password() {
     || e2e_die "node ${node_id}: plugin-config carries no server_key for ${E2E_SS_CIPHER}"
   printf '%s:%s\n' "${server_key}" \
     "$(printf '%s' "${uuid:0:${key_length}}" | base64)"
+}
+
+# Every per-case port, for every selected case, must be distinct. The ports are
+# derived from the case index, so a layout that only holds for the first few
+# cases fails silently later: the case times out looking exactly like a backend
+# defect. Checking up front turns that into one clear line before anything runs.
+assert_case_ports_disjoint() {
+  local count="$1"
+  python3 - "${count}" "${CASE_RAW_PORT_BASE}" "${CASE_PLUGIN_PORT_BASE}" \
+    "${CASE_TARGET_PORT_BASE}" <<'PORTCHECK' || e2e_die "case port layout is not disjoint"
+import sys
+count, raw_base, plugin_base, target_base = (int(a) for a in sys.argv[1:5])
+seen = {}
+for index in range(count):
+    ports = {
+        "raw": raw_base + index,
+        "plugin": plugin_base + index,
+        "target": target_base + index * 2,
+        "mixed": target_base + index * 2 + 1,
+        "udp": target_base + index * 2 + 1 + 10000,
+    }
+    for kind, port in ports.items():
+        if port in seen:
+            other_index, other_kind = seen[port]
+            print(f"port {port}: case {index} {kind} collides with "
+                  f"case {other_index} {other_kind}", file=sys.stderr)
+            raise SystemExit(1)
+        seen[port] = (index, kind)
+PORTCHECK
 }
 
 case_flags() {
@@ -555,9 +590,14 @@ SQL
   wait_capability_ready "${node_id}" "${revision}" "shadowsocks-plugin-runtime-v1"
   e2e_log "${case_name}: shoes ACKed the plugin-less generation"
 
+  # Without the cipher this falls back to the matrix default, which only
+  # matches the node when the run happens to use that cipher too -- so the
+  # bare-Shadowsocks client the withdrawal check builds spoke aes-128-gcm to a
+  # 2022 node and was refused for having no matching user.
   python3 "${MATRIX_BIN}" mihomo "${case_name}" \
     --plugin-port "${raw_port}" \
     --mixed-port "${mixed_port}" \
+    --cipher "${E2E_SS_CIPHER}" \
     --password "${password}" \
     --without-plugin >"${case_dir}/mihomo-raw.yml"
   mkdir -p "${case_dir}/mihomo-raw"
@@ -637,7 +677,6 @@ run_case() {
   local CASE_NEEDS_CAMOUFLAGE CASE_NEEDS_SERVER_TLS CASE_NEEDS_CERT CASE_CAMOUFLAGE_TLS
   local CASE_EXPECT CASE_UDP
   local udp_port
-  local -a tls_version_args=()
 
   eval "$(case_flags "${case_name}")"
   index="$(case_index "${case_name}")"
@@ -715,19 +754,21 @@ PY
   fi
   if [[ "${CASE_NEEDS_CAMOUFLAGE}" == "1" ]]; then
     e2e_assert_port_free 443 "camouflage TLS"
-    case "${E2E_CAMOUFLAGE_TLS_VERSION:-${CASE_CAMOUFLAGE_TLS}}" in
-      auto) ;;
-      tls12) tls_version_args=(-tls1_2) ;;
-      tls13) tls_version_args=(-tls1_3) ;;
+    camouflage_version="${E2E_CAMOUFLAGE_TLS_VERSION:-${CASE_CAMOUFLAGE_TLS}}"
+    case "${camouflage_version}" in
+      auto|tls12|tls13) ;;
       *) e2e_die "invalid E2E_CAMOUFLAGE_TLS_VERSION=${E2E_CAMOUFLAGE_TLS_VERSION}" ;;
     esac
-    openssl s_server \
-      -accept "127.0.0.1:443" \
-      -cert "${case_dir}/camouflage.crt" \
-      -key "${case_dir}/camouflage.key" \
-      "${tls_version_args[@]}" \
-      -www \
-      -quiet \
+    # Deliberately not `openssl s_server`, which serves one connection at a
+    # time: a second handshake while another connection is open never
+    # completes. ShadowTLS and Restls relay a handshake here for every
+    # connection they accept, so a serial server stalls the case until the
+    # client times out -- which reads as a backend defect and is not one.
+    python3 "${ROOT_DIR}/scripts/e2e_camouflage_server.py" \
+      443 \
+      "${case_dir}/camouflage.crt" \
+      "${case_dir}/camouflage.key" \
+      "${camouflage_version}" \
       >"${case_dir}/camouflage.log" 2>&1 &
     PIDS+=("$!")
     wait_tcp 443 || e2e_die "${case_name}: local TLS camouflage server did not start"
@@ -913,6 +954,7 @@ if expected_feature not in features or "shadowsocks-plugin-runtime-v1" not in fe
 PY
 
   IFS=',' read -r -a case_list <<<"${CASES}"
+  assert_case_ports_disjoint "${#case_list[@]}"
   local case_name
   for case_name in "${case_list[@]}"; do
     run_case "${case_name}"
