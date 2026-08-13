@@ -44,9 +44,19 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def get_request(self):
-        sock, addr = super().get_request()
-        return context.wrap_socket(sock, server_side=True), addr
+    def process_request_thread(self, request, client_address):
+        # The handshake happens here rather than in get_request, which runs on
+        # the accept loop: a peer that connects and never sends a ClientHello
+        # -- a port prober, a half-open relay -- would otherwise hold up every
+        # connection behind it, which is the serial behaviour this server
+        # exists to replace. The timeout bounds it either way.
+        try:
+            request.settimeout(15)
+            request = context.wrap_socket(request, server_side=True)
+        except OSError:
+            self.shutdown_request(request)
+            return
+        super().process_request_thread(request, client_address)
 
     def handle_error(self, request, client_address):
         # A probe that speaks no TLS is ordinary traffic here, not a failure.
