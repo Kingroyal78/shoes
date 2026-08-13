@@ -32,7 +32,7 @@ use crate::naiveproxy::naive_h3_service::{
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{RealityServerTarget, decode_private_key, decode_short_id};
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_server_config;
+use crate::rustls_config_util::try_create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksTcpHandler, ShadowsocksUsers,
@@ -879,13 +879,24 @@ fn build_plugin_tls_config(
         vec![client_ca.as_bytes().to_vec()]
     };
     if let Some((certificate, private_key)) = published {
-        return Ok(Arc::new(create_server_config(
+        // Panel material is operator-typed text, so it is built through the
+        // fallible path: a truncated certificate or a mismatched key refuses
+        // this generation and leaves the last known good one serving, rather
+        // than unwinding the controller.
+        return try_create_server_config(
             certificate.as_bytes(),
             private_key.as_bytes(),
             client_anchors,
             &["http/1.1".to_string()],
             &[],
-        )));
+        )
+        .map(Arc::new)
+        .map_err(|error| {
+            invalid_error(format!(
+                "node `{}` plugin TLS material published by the panel is unusable: {error}",
+                node.tag
+            ))
+        });
     }
     let tls = app_config.effective_tls(node).ok_or_else(|| {
         invalid_error(format!(
@@ -914,13 +925,15 @@ fn build_plugin_tls_config(
             ),
         )
     })?;
-    Ok(Arc::new(create_server_config(
-        &cert,
-        &key,
-        client_anchors,
-        &["http/1.1".to_string()],
-        &[],
-    )))
+    // The certificate is local but the client CA still came from the panel.
+    try_create_server_config(&cert, &key, client_anchors, &["http/1.1".to_string()], &[])
+        .map(Arc::new)
+        .map_err(|error| {
+            invalid_error(format!(
+                "node `{}` plugin TLS configuration is unusable: {error}",
+                node.tag
+            ))
+        })
 }
 
 fn plugin_bind_location(host: &str, port: u16, tag: &str) -> std::io::Result<BindLocation> {
@@ -2307,7 +2320,16 @@ fn build_tls_handler(
     }
 
     let alpn = tls_alpn_for_transport(spec, tls);
-    let server_config = Arc::new(create_server_config(&cert, &key, Vec::new(), &alpn, &[]));
+    // Refuses the generation rather than unwinding the controller: a node whose
+    // certificate cannot be built is one node, and the others keep serving.
+    let server_config = Arc::new(
+        try_create_server_config(&cert, &key, Vec::new(), &alpn, &[]).map_err(|error| {
+            invalid_error(format!(
+                "node `{}` TLS certificate is unusable: {error}",
+                spec.tag
+            ))
+        })?,
+    );
     let target = TlsServerTarget::Tls {
         server_config,
         effective_selector: proxy_selector,
@@ -2391,7 +2413,16 @@ fn build_quic_server_config(
     if !alpn.iter().any(|item| item.eq_ignore_ascii_case("h3")) {
         alpn.insert(0, "h3".to_string());
     }
-    let server_config = Arc::new(create_server_config(&cert, &key, Vec::new(), &alpn, &[]));
+    // Refuses the generation rather than unwinding the controller: a node whose
+    // certificate cannot be built is one node, and the others keep serving.
+    let server_config = Arc::new(
+        try_create_server_config(&cert, &key, Vec::new(), &alpn, &[]).map_err(|error| {
+            invalid_error(format!(
+                "node `{}` TLS certificate is unusable: {error}",
+                spec.tag
+            ))
+        })?,
+    );
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
         server_config.try_into().map_err(|e| {
             std::io::Error::other(format!(
