@@ -810,13 +810,6 @@ fn validate_plugin_host(host: &str, field: &'static str) -> Result<(), PluginMan
     Ok(())
 }
 
-/// A certificate without its key, or a key without its certificate, cannot
-/// serve anything. Applying half of it would start a listener that fails every
-/// handshake, so the generation is refused instead.
-/// ECH is a client and server agreement: the client hides the name it is
-/// really asking for and the server has to be able to decrypt it. Publishing
-/// it to clients while the edge knows nothing about it leaves those clients
-/// unable to connect, so a node that asks for it is refused here.
 /// A client certificate is presented during the TLS handshake, so asking for
 /// one on a plugin that runs in the clear cannot be honoured. Refusing says so
 /// instead of quietly accepting everyone.
@@ -829,6 +822,10 @@ fn validate_client_ca(client_ca: &str, tls: bool) -> Result<(), PluginManifestEr
     Ok(())
 }
 
+/// ECH is a client and server agreement: the client hides the name it is
+/// really asking for and the server has to be able to decrypt it. Publishing
+/// it to clients while the edge knows nothing about it leaves those clients
+/// unable to connect, so a node that asks for it is refused here.
 fn validate_ech(ech: Option<&EchOptions>) -> Result<(), PluginManifestError> {
     if ech.is_some_and(EchOptions::is_requested) {
         return Err(PluginManifestError::new(
@@ -838,6 +835,9 @@ fn validate_ech(ech: Option<&EchOptions>) -> Result<(), PluginManifestError> {
     Ok(())
 }
 
+/// A certificate without its key, or a key without its certificate, cannot
+/// serve anything. Applying half of it would start a listener that fails every
+/// handshake, so the generation is refused instead.
 fn validate_tls_material(
     certificate: &str,
     private_key: Option<&SecretString>,
