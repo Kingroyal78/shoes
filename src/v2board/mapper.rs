@@ -608,7 +608,15 @@ fn build_shadowsocks_plugin_handler(
         RuntimePlugin::Obfs { options, .. } => build_obfs_plugin_handler(options, raw_handler),
         RuntimePlugin::V2ray { options, .. } => {
             let tls = if options.tls {
-                Some(build_plugin_tls_config(app_config, node)?)
+                Some(build_plugin_tls_config(
+                    app_config,
+                    node,
+                    published_tls_material(
+                        &options.server_certificate,
+                        options.server_private_key.as_ref(),
+                    ),
+                    &options.client_ca,
+                )?)
             } else {
                 None
             };
@@ -816,7 +824,15 @@ fn build_gost_plugin_handler(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     let tls = if options.tls {
-        Some(build_plugin_tls_config(app_config, node)?)
+        Some(build_plugin_tls_config(
+            app_config,
+            node,
+            published_tls_material(
+                &options.server_certificate,
+                options.server_private_key.as_ref(),
+            ),
+            &options.client_ca,
+        )?)
     } else {
         None
     };
@@ -831,13 +847,50 @@ fn build_gost_plugin_handler(
         .map(|handler| Arc::new(handler) as Arc<dyn TcpServerHandler>)
 }
 
+/// The certificate and key the panel published for this node, if it sent both.
+fn published_tls_material<'a>(
+    certificate: &'a str,
+    private_key: Option<&'a super::plugin_api::SecretString>,
+) -> Option<(&'a str, &'a str)> {
+    let certificate = certificate.trim();
+    let private_key = private_key
+        .map(|key| key.expose_secret().trim())
+        .unwrap_or_default();
+    (!certificate.is_empty() && !private_key.is_empty()).then_some((certificate, private_key))
+}
+
+/// The certificate and key the plugin edge serves.
+///
+/// The panel's node form is where an operator configures them, so what it
+/// sends wins; a local `cert_file`/`key_file` is the fallback for a node whose
+/// panel entry carries none.
 fn build_plugin_tls_config(
     app_config: &AppConfig,
     node: &V2BoardNodeConfig,
+    published: Option<(&str, &str)>,
+    client_ca: &str,
 ) -> std::io::Result<Arc<rustls::ServerConfig>> {
+    // A non-empty anchor list is what makes rustls ask for a client
+    // certificate and refuse the handshake without a valid one.
+    let client_ca = client_ca.trim();
+    let client_anchors = if client_ca.is_empty() {
+        Vec::new()
+    } else {
+        vec![client_ca.as_bytes().to_vec()]
+    };
+    if let Some((certificate, private_key)) = published {
+        return Ok(Arc::new(create_server_config(
+            certificate.as_bytes(),
+            private_key.as_bytes(),
+            client_anchors,
+            &["http/1.1".to_string()],
+            &[],
+        )));
+    }
     let tls = app_config.effective_tls(node).ok_or_else(|| {
         invalid_error(format!(
-            "node `{}` plugin TLS requires a local cert_file/key_file",
+            "node `{}` plugin TLS needs a certificate: none published by the \
+             panel and no local cert_file/key_file",
             node.tag
         ))
     })?;
@@ -864,7 +917,7 @@ fn build_plugin_tls_config(
     Ok(Arc::new(create_server_config(
         &cert,
         &key,
-        Vec::new(),
+        client_anchors,
         &["http/1.1".to_string()],
         &[],
     )))

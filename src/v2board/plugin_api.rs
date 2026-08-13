@@ -477,6 +477,24 @@ pub enum WebsocketMode {
     Websocket,
 }
 
+/// What the panel stores under a WebSocket plugin's `ech_opts`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EchOptions {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub config: String,
+    #[serde(default)]
+    pub query_server_name: String,
+}
+
+impl EchOptions {
+    fn is_requested(&self) -> bool {
+        self.enable || !self.config.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V2rayPluginOptions {
@@ -486,6 +504,32 @@ pub struct V2rayPluginOptions {
     pub tls: bool,
     pub mux: bool,
     pub v2ray_http_upgrade: bool,
+    /// PEM certificate chain this plugin edge serves, when the panel holds it.
+    ///
+    /// Deliberately not the panel's `certificate`/`private_key`, which are the
+    /// client certificate for mutual TLS and are published to every
+    /// subscriber. What a node serves is its own identity and must never be.
+    #[serde(default)]
+    pub server_certificate: String,
+    /// PEM private key for [`Self::server_certificate`].
+    #[serde(default)]
+    pub server_private_key: Option<SecretString>,
+    /// Encrypted ClientHello, as the panel has it configured.
+    ///
+    /// This backend does not implement ECH. A node that publishes it to its
+    /// clients and serves a plugin edge that cannot answer it is a node whose
+    /// clients cannot connect, so the generation is refused rather than
+    /// applied -- the same answer the other node types give.
+    #[serde(default)]
+    pub ech_opts: Option<EchOptions>,
+    /// Trust anchor for the client certificates this edge accepts.
+    ///
+    /// Present means the edge requires one. The panel hands every subscriber a
+    /// client certificate, and without this the backend never asks for it, so
+    /// that certificate authenticates nothing. Only the public half belongs
+    /// here; the key stays with the clients that have to present it.
+    #[serde(default)]
+    pub client_ca: String,
     /// Serve clients whose `Host` header is not the published one.
     ///
     /// The panel hands different users different hosts for the same node, so
@@ -498,6 +542,12 @@ pub struct V2rayPluginOptions {
 impl V2rayPluginOptions {
     fn validate(&self) -> Result<(), PluginManifestError> {
         validate_websocket_options(&self.host, &self.path)?;
+        validate_ech(self.ech_opts.as_ref())?;
+        validate_client_ca(self.client_ca.as_str(), self.tls)?;
+        validate_tls_material(
+            self.server_certificate.as_str(),
+            self.server_private_key.as_ref(),
+        )?;
         if self.v2ray_http_upgrade && self.mux {
             return Err(PluginManifestError::new(
                 "V2Ray HTTP Upgrade cannot be combined with plugin mux",
@@ -515,6 +565,32 @@ pub struct GostPluginOptions {
     pub path: String,
     pub tls: bool,
     pub mux: bool,
+    /// PEM certificate chain this plugin edge serves, when the panel holds it.
+    ///
+    /// Deliberately not the panel's `certificate`/`private_key`, which are the
+    /// client certificate for mutual TLS and are published to every
+    /// subscriber. What a node serves is its own identity and must never be.
+    #[serde(default)]
+    pub server_certificate: String,
+    /// PEM private key for [`Self::server_certificate`].
+    #[serde(default)]
+    pub server_private_key: Option<SecretString>,
+    /// Encrypted ClientHello, as the panel has it configured.
+    ///
+    /// This backend does not implement ECH. A node that publishes it to its
+    /// clients and serves a plugin edge that cannot answer it is a node whose
+    /// clients cannot connect, so the generation is refused rather than
+    /// applied -- the same answer the other node types give.
+    #[serde(default)]
+    pub ech_opts: Option<EchOptions>,
+    /// Trust anchor for the client certificates this edge accepts.
+    ///
+    /// Present means the edge requires one. The panel hands every subscriber a
+    /// client certificate, and without this the backend never asks for it, so
+    /// that certificate authenticates nothing. Only the public half belongs
+    /// here; the key stays with the clients that have to present it.
+    #[serde(default)]
+    pub client_ca: String,
     /// See [`V2rayPluginOptions::allow_unknown_host`].
     #[serde(default)]
     pub allow_unknown_host: bool,
@@ -522,7 +598,13 @@ pub struct GostPluginOptions {
 
 impl GostPluginOptions {
     fn validate(&self) -> Result<(), PluginManifestError> {
-        validate_websocket_options(&self.host, &self.path)
+        validate_websocket_options(&self.host, &self.path)?;
+        validate_ech(self.ech_opts.as_ref())?;
+        validate_client_ca(self.client_ca.as_str(), self.tls)?;
+        validate_tls_material(
+            self.server_certificate.as_str(),
+            self.server_private_key.as_ref(),
+        )
     }
 }
 
@@ -724,6 +806,48 @@ fn validate_plugin_host(host: &str, field: &'static str) -> Result<(), PluginMan
     }
     if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
         return Err(PluginManifestError::new(field));
+    }
+    Ok(())
+}
+
+/// A certificate without its key, or a key without its certificate, cannot
+/// serve anything. Applying half of it would start a listener that fails every
+/// handshake, so the generation is refused instead.
+/// ECH is a client and server agreement: the client hides the name it is
+/// really asking for and the server has to be able to decrypt it. Publishing
+/// it to clients while the edge knows nothing about it leaves those clients
+/// unable to connect, so a node that asks for it is refused here.
+/// A client certificate is presented during the TLS handshake, so asking for
+/// one on a plugin that runs in the clear cannot be honoured. Refusing says so
+/// instead of quietly accepting everyone.
+fn validate_client_ca(client_ca: &str, tls: bool) -> Result<(), PluginManifestError> {
+    if !client_ca.trim().is_empty() && !tls {
+        return Err(PluginManifestError::new(
+            "plugin client_ca requires TLS on the same plugin",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ech(ech: Option<&EchOptions>) -> Result<(), PluginManifestError> {
+    if ech.is_some_and(EchOptions::is_requested) {
+        return Err(PluginManifestError::new(
+            "plugin ECH is not supported by this backend",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tls_material(
+    certificate: &str,
+    private_key: Option<&SecretString>,
+) -> Result<(), PluginManifestError> {
+    let has_certificate = !certificate.trim().is_empty();
+    let has_key = private_key.is_some_and(|key| !key.expose_secret().trim().is_empty());
+    if has_certificate != has_key {
+        return Err(PluginManifestError::new(
+            "plugin TLS needs both a certificate and its private key",
+        ));
     }
     Ok(())
 }
@@ -1209,6 +1333,78 @@ mod tests {
             "upstream": {"host": "127.0.0.1", "port": 8388},
             "options": options
         })
+    }
+
+    /// A client certificate is presented during the TLS handshake, so asking
+    /// for one on a plugin serving cleartext cannot be honoured -- and
+    /// accepting it quietly would leave the operator believing the node
+    /// authenticates its clients when it cannot.
+    #[test]
+    fn a_client_ca_without_tls_is_refused() {
+        let with_tls = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket", "host": "gost.example", "path": "/gost",
+                "tls": true, "mux": true,
+                "client_ca": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+            }),
+        )))
+        .expect("the manifest parses");
+        assert!(
+            with_tls.validate(12).is_ok(),
+            "a client CA belongs on a TLS plugin"
+        );
+
+        let error = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket", "host": "gost.example", "path": "/gost",
+                "tls": false, "mux": true,
+                "client_ca": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+            }),
+        )))
+        .expect("the manifest parses")
+        .validate(12)
+        .expect_err("a client CA without TLS must be refused");
+        assert!(error.to_string().contains("client_ca"));
+    }
+
+    /// ECH needs the server to decrypt what the client hid. Serving a node
+    /// that publishes it would hand its clients a handshake this edge cannot
+    /// answer, so the generation is refused -- and a node that merely carries
+    /// the panel's empty defaults is not asking for anything.
+    #[test]
+    fn a_node_asking_for_ech_is_refused() {
+        let quiet = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket", "host": "gost.example", "path": "/gost",
+                "tls": false, "mux": true,
+                "ech_opts": {"enable": false, "config": "", "query_server_name": ""}
+            }),
+        )));
+        assert!(
+            quiet.is_ok(),
+            "an unused ech_opts block must not fail a node"
+        );
+
+        for asking in [
+            json!({"enable": true, "config": "", "query_server_name": ""}),
+            json!({"enable": false, "config": "AEX+DQBB", "query_server_name": ""}),
+        ] {
+            let manifest = base_manifest(plugin(
+                "gost-plugin",
+                json!({
+                    "mode": "websocket", "host": "gost.example", "path": "/gost",
+                    "tls": false, "mux": true, "ech_opts": asking
+                }),
+            ));
+            let error = parse(manifest)
+                .expect("the manifest parses")
+                .validate(12)
+                .expect_err("a node asking for ECH must be refused");
+            assert!(error.to_string().contains("ECH"));
+        }
     }
 
     /// A panel that predates the switch means "keep enforcing the host", and

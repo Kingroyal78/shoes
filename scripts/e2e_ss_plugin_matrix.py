@@ -340,6 +340,27 @@ def _build_cases() -> list[Case]:
             _ws(f"{prefix}-wss-hosthdr", kind, "hosthdr", tls=True, headers={"Host": "front.interop.test"}),
             _ws(f"{prefix}-ws-hosthdr-port", kind, "hosthdr", headers={"Host": "front.interop.test:8443"}),
         ]
+    # ECH is published to clients but cannot be served by the backend, so a
+    # node that turns it on has to be refused rather than left serving clients
+    # a handshake it will fail.
+    for kind, prefix in (("v2ray-plugin", "v2ray"), ("gost-plugin", "gost")):
+        cases.append(
+            _ws(
+                f"{prefix}-wss-ech",
+                kind,
+                "negative",
+                tls=True,
+                extra={
+                    "ech_opts": {
+                        "enable": True,
+                        "config": "",
+                        "query_server_name": "",
+                    }
+                },
+                expect="runtime-rejected",
+            )
+        )
+
     # The panel hands different users different hosts for one node, so the
     # backend has to serve a Host it never published -- but only when the node
     # says so.

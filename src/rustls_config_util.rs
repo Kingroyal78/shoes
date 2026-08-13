@@ -275,10 +275,15 @@ pub fn create_server_config(
     let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
         builder.with_no_client_auth()
     } else {
+        let root_hint_subjects = webpki_verifier
+            .as_ref()
+            .map(|verifier| verifier.root_hint_subjects().to_vec())
+            .unwrap_or_default();
         builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
             supported_algs: get_supported_algorithms(),
             webpki_verifier,
             client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
+            root_hint_subjects,
         }))
     };
     let mut config = builder
@@ -333,6 +338,7 @@ pub struct ClientFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
     webpki_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     client_fingerprints: BTreeSet<Vec<u8>>,
+    root_hint_subjects: Vec<rustls::DistinguishedName>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
@@ -345,8 +351,14 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        // Avoids leaking trusted CA names to unauthenticated clients.
-        &[]
+        // Empty unless a client CA is configured, so a listener that only
+        // pins fingerprints still tells an unauthenticated prober nothing.
+        //
+        // With a CA configured the hint has to go out: Go's TLS client -- and
+        // so every Mihomo build -- sends no certificate at all when the
+        // request carries no acceptable CA names, which made mutual TLS look
+        // enabled while every client was refused for presenting nothing.
+        &self.root_hint_subjects
     }
 
     fn verify_client_cert(
