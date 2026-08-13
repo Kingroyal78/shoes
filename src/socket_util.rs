@@ -156,12 +156,21 @@ pub fn set_tcp_keepalive(
 /// bind across workers with `SO_REUSEPORT` lets the kernel hash arrivals into
 /// independent queues instead.
 ///
-/// Capped well below the worker count: the gain flattens quickly, and each
-/// listener carries its own backlog.
+/// One per worker. `SO_REUSEPORT` gives each listener its own accept queue, so
+/// the parallelism is real all the way into the kernel rather than several
+/// tasks contending for one queue -- which is what decides the accept rate on
+/// a machine with many cores, and a fixed cap would leave most of them idle
+/// there. Follows `--threads`, so the one lever that sizes the runtime sizes
+/// this too.
+///
+/// The cost is visible and worth stating: every listener is another row per
+/// port in `ss`, and `SO_REUSEPORT` means binding no longer fails when another
+/// process already holds the port -- a second instance silently joins the
+/// group and takes a share of the traffic instead of reporting `EADDRINUSE`.
 pub fn accept_loop_count() -> usize {
     #[cfg(target_family = "unix")]
     {
-        crate::thread_util::get_num_threads().clamp(1, 8)
+        crate::thread_util::get_num_threads().max(1)
     }
     #[cfg(not(target_family = "unix"))]
     {
