@@ -375,6 +375,16 @@ async fn serve_smux(
         config.max_receive_buffer,
         listener_budget,
     ));
+    // A v2 stream tells its peer it may keep `max_stream_buffer` in flight, so
+    // budgeting less than that would drop a stream for doing exactly what it
+    // was granted. v1 advertises no window, so its own ceiling stands.
+    let stream_receive_buffer = if version == VERSION_V2 {
+        config
+            .max_stream_receive_buffer
+            .max(config.max_stream_buffer)
+    } else {
+        config.max_stream_receive_buffer
+    };
     let mut writer_task = tokio::spawn(async move {
         let mut updates_open = true;
         let ping_period = config
@@ -503,7 +513,7 @@ async fn serve_smux(
                         terminal: Some(terminal_tx),
                         flow: flow.clone(),
                         budget: Arc::new(ReceiveBudget::with_parent(
-                            config.max_stream_receive_buffer,
+                            stream_receive_buffer,
                             Some(receive_budget.clone()),
                         )),
                     },
