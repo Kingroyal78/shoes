@@ -11,7 +11,6 @@ use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
 use super::salt_checker::SaltChecker;
-use super::timed_salt_checker::TimedSaltChecker;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
@@ -318,7 +317,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(TimedSaltChecker::new(60))),
+            salt_checker: Some(super::salt_checker::new_shared_salt_checker()),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
@@ -346,7 +345,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(TimedSaltChecker::new(60))),
+            salt_checker: Some(super::salt_checker::new_shared_salt_checker()),
             udp_enabled,
             proxy_selector: None,
             resolver: None,
@@ -923,6 +922,46 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constants-only test in `salt_checker` cannot see this: a handler
+    /// that builds its own checker at some other retention still satisfies
+    /// `SALT_REPLAY_WINDOW_SECS > 2 * TIMESTAMP_SKEW_TOLERANCE_SECS`, while
+    /// leaving the path it actually serves with no margin at all. That is
+    /// precisely how two hardcoded 60s checkers survived the first review of
+    /// the widened timestamp window, so assert on what was constructed.
+    #[test]
+    fn aead2022_handlers_use_the_shared_salt_window() {
+        use crate::resolver::NativeResolver;
+        use std::time::Duration;
+
+        let expected = format!(
+            "{:?}",
+            Duration::from_secs(super::super::salt_checker::SALT_REPLAY_WINDOW_SECS)
+        );
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let key = [0u8; 16];
+
+        let client = ShadowsocksTcpHandler::new_aead2022_client(cipher, &key, false);
+        let server = ShadowsocksTcpHandler::new_aead2022_server(
+            cipher,
+            &key,
+            false,
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        );
+
+        for (label, handler) in [("client", &client), ("server", &server)] {
+            let checker = handler
+                .salt_checker
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} handler must carry a salt checker"));
+            let rendered = format!("{checker:?}");
+            assert!(
+                rendered.contains(&expected),
+                "{label} handler retains salts for {rendered}, not the shared {expected}"
+            );
+        }
+    }
 
     #[test]
     fn h2mux_server_requires_explicit_enablement() {

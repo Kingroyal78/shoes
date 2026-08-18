@@ -252,6 +252,18 @@ const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 /// immediate reallocation.
 const INITIAL_BUF_SIZE: usize = 4096;
 
+/// How far a peer's handshake timestamp may drift from ours, in either
+/// direction.
+///
+/// AEAD-2022 specifies +/-30s, and the window has to be symmetric to honour
+/// it: a clock running a few seconds fast is as ordinary as one running slow,
+/// so a one-sided window refuses connections the spec allows -- which it did,
+/// at roughly 2300 handshakes a day on a single node, almost all of them off
+/// by under ten seconds. The salt-replay memory must outlive this whole span,
+/// or a handshake could be replayed once its salt was forgotten but before its
+/// timestamp went stale; see `SALT_REPLAY_WINDOW_SECS`.
+pub(super) const TIMESTAMP_SKEW_TOLERANCE_SECS: u64 = 30;
+
 fn shadowsocks_message_too_large_error(len: usize, max_len: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -704,22 +716,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                check_timestamp_freshness(timestamp_secs, current_time_secs())?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker
@@ -770,22 +767,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                check_timestamp_freshness(timestamp_secs, current_time_secs())?;
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -1262,6 +1244,26 @@ fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
 }
 
+/// Rejects a handshake whose timestamp drifted further than AEAD-2022 allows.
+///
+/// The drift is named in the error either way round: a bare "greater than 30
+/// seconds" told an operator nothing about whether the peer was skewed by a
+/// second or by an hour, which is exactly the question that decides whether a
+/// rejection is a clock problem or an attack.
+fn check_timestamp_freshness(timestamp_secs: u64, now_secs: u64) -> std::io::Result<()> {
+    let (drift_secs, direction) = if now_secs >= timestamp_secs {
+        (now_secs - timestamp_secs, "old")
+    } else {
+        (timestamp_secs - now_secs, "in the future")
+    };
+    if drift_secs > TIMESTAMP_SKEW_TOLERANCE_SECS {
+        return Err(std::io::Error::other(format!(
+            "timestamp is {drift_secs} seconds {direction}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1504,5 +1506,59 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(stream.is_initial_write);
+    }
+
+    /// A fixed instant: the helper used to read the clock itself, so a test
+    /// that captured "now" and then called it could straddle a second
+    /// boundary and see a drift one off from the one it set up.
+    const TEST_NOW_SECS: u64 = 1_800_000_000;
+
+    #[test]
+    fn timestamp_window_accepts_a_clock_running_fast() {
+        // The regression this covers: the window used to allow 30s of lag but
+        // only 2s of lead, so a peer three seconds fast -- the single most
+        // common rejection seen in production -- could not connect at all.
+        for lead in 1..=TIMESTAMP_SKEW_TOLERANCE_SECS {
+            check_timestamp_freshness(TEST_NOW_SECS + lead, TEST_NOW_SECS)
+                .unwrap_or_else(|e| panic!("{lead}s fast must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn timestamp_window_is_symmetric_at_its_edges() {
+        check_timestamp_freshness(TEST_NOW_SECS + TIMESTAMP_SKEW_TOLERANCE_SECS, TEST_NOW_SECS)
+            .expect("the leading edge is inside the window");
+        check_timestamp_freshness(TEST_NOW_SECS - TIMESTAMP_SKEW_TOLERANCE_SECS, TEST_NOW_SECS)
+            .expect("the lagging edge is inside the window");
+
+        assert!(
+            check_timestamp_freshness(
+                TEST_NOW_SECS + TIMESTAMP_SKEW_TOLERANCE_SECS + 1,
+                TEST_NOW_SECS
+            )
+            .is_err()
+        );
+        assert!(
+            check_timestamp_freshness(
+                TEST_NOW_SECS - TIMESTAMP_SKEW_TOLERANCE_SECS - 1,
+                TEST_NOW_SECS
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn timestamp_rejection_names_the_drift_and_direction() {
+        let ahead = check_timestamp_freshness(TEST_NOW_SECS + 300, TEST_NOW_SECS)
+            .unwrap_err()
+            .to_string();
+        assert!(ahead.contains("300"), "{ahead}");
+        assert!(ahead.contains("in the future"), "{ahead}");
+
+        let behind = check_timestamp_freshness(TEST_NOW_SECS - 300, TEST_NOW_SECS)
+            .unwrap_err()
+            .to_string();
+        assert!(behind.contains("300"), "{behind}");
+        assert!(behind.contains("old"), "{behind}");
     }
 }
