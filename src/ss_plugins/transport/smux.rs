@@ -52,6 +52,24 @@ const DEFAULT_STREAM_RECEIVE_BUFFER: usize = 256 * 1024;
 /// would otherwise scale with the connection count.
 const DEFAULT_LISTENER_RECEIVE_BUFFER: usize = 256 * 1024 * 1024;
 
+/// How long a finished session waits for its logical streams to wind down
+/// before cancelling them.
+///
+/// Their tasks own the drop-close permits and the outbound sender clones that
+/// the close forwarder and the writer block on, so waiting for those two is
+/// really waiting on a proxied peer that may never answer. That wait used to
+/// expire on a third of all sessions, and expiring aborted the writer with
+/// flushes still queued, failing every stream that had one in flight.
+/// Cancelling the streams directly ends the session in bounded time and lets
+/// the shared machinery close on its own terms instead.
+///
+/// A second rather than something tighter because this also covers the
+/// teardowns where the physical connection is still writable -- the reader
+/// breaking on a protocol violation, say -- and a stream mid-download there can
+/// still use the time. When the peer is simply gone, which is the common case,
+/// the streams fail fast and the grace never elapses at all.
+const STREAM_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How often the server sends a NOP on an otherwise quiet v1 session.
 ///
 /// Deliberately paired with no read timeout. A read timeout cannot tell an
@@ -459,6 +477,11 @@ async fn serve_smux(
     });
 
     let mut streams: HashMap<u32, StreamState> = HashMap::new();
+    // Held rather than detached so the session can cancel what it started.
+    // Dropping this set aborts anything still running, which is the right end
+    // for a logical stream whose physical session is gone: it has no transport
+    // left to carry anything to the client.
+    let mut stream_tasks = tokio::task::JoinSet::new();
     let read_result = loop {
         let read = read_frame(&mut reader, version, limits.max_frame_payload);
         let frame_result = if let Some(timeout) = config.keepalive_timeout {
@@ -493,6 +516,9 @@ async fn serve_smux(
                         .as_ref()
                         .is_some_and(|inbound| !inbound.is_closed())
                 });
+                // Same reclaim, one layer down: a finished task left in the set
+                // would otherwise accumulate for the life of the session.
+                while stream_tasks.try_join_next().is_some() {}
                 if streams.contains_key(&frame.stream_id) {
                     break invalid("smux v1 SYN reused an active stream ID");
                 }
@@ -539,7 +565,7 @@ async fn serve_smux(
                 logical.set_drop_close_permit(close_permit);
                 let inner = inner.clone();
                 let resolver = resolver.clone();
-                tokio::spawn(async move {
+                stream_tasks.spawn(async move {
                     if let Err(error) = process_stream(logical, inner, resolver, peer_addr).await {
                         log::debug!(
                             "smux v{version} logical stream {} finished with error: {error}",
@@ -655,10 +681,25 @@ async fn serve_smux(
     drop(drop_close_tx);
     drop(updates_tx);
     drop(outbound_tx);
-    // Bound the close forwarder wait. All logical-stream shutdown events were
-    // delivered above, so aborting the forwarder here cannot orphan copy
-    // tasks; it only releases the drop-close channel and its outbound sender
-    // clone so the writer drain below can complete.
+    // Wind the logical streams down before waiting on the forwarder and the
+    // writer, because those two cannot finish until every stream has released
+    // its permit and its sender. The terminal events delivered above only
+    // unblock a stream's inbound half; one parked on its proxied peer needs
+    // cancelling. The grace lets a stream that is already finishing report its
+    // own outcome first.
+    if tokio::time::timeout(STREAM_SHUTDOWN_GRACE, async {
+        while stream_tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        stream_tasks.shutdown().await;
+    }
+    // A backstop now rather than the normal path: with the streams gone the
+    // forwarder has no senders left and returns at once. It stays bounded so a
+    // future holder of one of these senders cannot hang a session's teardown,
+    // and aborting it cannot orphan copy tasks -- every logical stream was
+    // either finished or cancelled above.
     let close_result =
         tokio::time::timeout(std::time::Duration::from_secs(5), &mut close_forwarder)
             .await
@@ -1447,6 +1488,66 @@ mod tests {
             closes, 1,
             "the reader must leave the close to the stream's own drop"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct ParkingHandler {
+        ready: Notify,
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for ParkingHandler {
+        async fn setup_server_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            self.ready.notify_one();
+            // Stands in for a logical stream parked on a peer that never
+            // answers, which is the state a third of production sessions were
+            // in when their physical connection went away.
+            std::future::pending::<()>().await;
+            unreachable!("the parked handler never resolves")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parked_stream_does_not_hold_the_sessions_teardown_open() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handler = Arc::new(ParkingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig::default(),
+            None,
+        ));
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        handler.ready.notified().await;
+        // The peer goes away while that stream is still parked, so nothing will
+        // release its drop-close permit or its outbound sender on its own.
+        drop(client);
+
+        // The close forwarder and the writer bound their own waits at five
+        // seconds each, and a session in this state used to sit out both.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), session)
+            .await
+            .expect("a parked stream must not hold the session's teardown open")
+            .expect("the session task must not panic");
+
+        // Whatever the session reports, it must not be the close forwarder
+        // giving up: that timeout is what used to abort the writer with flushes
+        // still queued. A write-half error is fair game here -- the peer is
+        // already gone -- so only the timeout itself is disqualifying.
+        if let Err(error) = outcome {
+            assert!(
+                !error.to_string().contains("close task timed out"),
+                "teardown fell back to the close-forwarder timeout: {error}"
+            );
+        }
     }
 
     #[tokio::test]
