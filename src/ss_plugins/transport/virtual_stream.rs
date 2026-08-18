@@ -2,10 +2,12 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use futures::task::AtomicWaker;
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Sleep;
@@ -19,7 +21,37 @@ pub(super) enum InboundEvent {
 #[derive(Debug)]
 pub(super) enum InboundTerminal {
     Finished,
-    Failed(String),
+    Failed(InboundFailure),
+}
+
+/// A terminal failure that keeps its semantic `io::ErrorKind` while it is
+/// fanned out to every logical stream in a multiplexed session.
+///
+/// This used to be a `String`; [`VirtualStream`] then reconstructed every
+/// failure as `ConnectionReset`. That made an ordinary physical close, a local
+/// receive-budget overflow and a malformed protocol frame indistinguishable to
+/// callers such as the UDP router, which consequently logged them all as WARN.
+#[derive(Clone, Debug)]
+pub(super) struct InboundFailure {
+    kind: io::ErrorKind,
+    message: Arc<str>,
+}
+
+impl InboundFailure {
+    pub(super) fn new(kind: io::ErrorKind, message: impl Into<Arc<str>>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn from_error(error: &io::Error) -> Self {
+        Self::new(error.kind(), error.to_string())
+    }
+
+    fn into_error(self) -> io::Error {
+        io::Error::new(self.kind, self.message.to_string())
+    }
 }
 
 pub(super) struct InboundChannels {
@@ -36,8 +68,56 @@ impl InboundChannels {
     }
 }
 
+const BUDGET_EVICTED: u64 = 1 << 63;
+const BUDGET_USED_MASK: u64 = u32::MAX as u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReceiveBudgetScope {
+    Stream,
+    Session,
+    Listener,
+}
+
+impl std::fmt::Display for ReceiveBudgetScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream => f.write_str("stream"),
+            Self::Session => f.write_str("session"),
+            Self::Listener => f.write_str("listener"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ReceiveBudgetExceeded {
+    pub(super) scope: ReceiveBudgetScope,
+}
+
+impl std::fmt::Display for ReceiveBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "smux {} receive buffer limit exceeded", self.scope)
+    }
+}
+
+impl std::error::Error for ReceiveBudgetExceeded {}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BudgetEviction {
+    pub(super) stream_id: u32,
+    pub(super) scope: ReceiveBudgetScope,
+}
+
+#[derive(Clone)]
+struct EvictionTarget {
+    stream_id: u32,
+    sender: mpsc::UnboundedSender<BudgetEviction>,
+}
+
 pub(super) struct ReceiveBudget {
-    used: AtomicUsize,
+    /// Upper 31 bits are a permit generation, bit 63 marks an evicted leaf,
+    /// and the lower 32 bits are queued bytes. Keeping both in one atomic
+    /// prevents an old permit from refunding a newly reused accounting state.
+    state: AtomicU64,
     max: usize,
     /// A budget every session on the listener also draws from.
     ///
@@ -46,90 +126,293 @@ pub(super) struct ReceiveBudget {
     /// `max` bytes. Charging a shared parent as well puts a ceiling on the
     /// listener as a whole.
     parent: Option<Arc<ReceiveBudget>>,
+    children: Mutex<Vec<Weak<ReceiveBudget>>>,
+    registered: AtomicBool,
+    eviction_lock: Arc<Mutex<()>>,
+    eviction: Option<EvictionTarget>,
 }
 
 impl ReceiveBudget {
     pub(super) fn new(max: usize) -> Self {
         Self {
-            used: AtomicUsize::new(0),
+            state: AtomicU64::new(0),
             max,
             parent: None,
+            children: Mutex::new(Vec::new()),
+            registered: AtomicBool::new(true),
+            eviction_lock: Arc::new(Mutex::new(())),
+            eviction: None,
         }
     }
 
     pub(super) fn with_parent(max: usize, parent: Option<Arc<ReceiveBudget>>) -> Self {
+        Self::with_parent_and_eviction(max, parent, None)
+    }
+
+    pub(super) fn stream(
+        max: usize,
+        parent: Arc<ReceiveBudget>,
+        stream_id: u32,
+        eviction_tx: mpsc::UnboundedSender<BudgetEviction>,
+    ) -> Self {
+        Self::with_parent_and_eviction(
+            max,
+            Some(parent),
+            Some(EvictionTarget {
+                stream_id,
+                sender: eviction_tx,
+            }),
+        )
+    }
+
+    fn with_parent_and_eviction(
+        max: usize,
+        parent: Option<Arc<ReceiveBudget>>,
+        eviction: Option<EvictionTarget>,
+    ) -> Self {
+        let eviction_lock = parent.as_ref().map_or_else(
+            || Arc::new(Mutex::new(())),
+            |parent| parent.eviction_lock.clone(),
+        );
         Self {
-            used: AtomicUsize::new(0),
+            state: AtomicU64::new(0),
             max,
             parent,
+            children: Mutex::new(Vec::new()),
+            registered: AtomicBool::new(false),
+            eviction_lock,
+            eviction,
         }
     }
 
-    /// Charges this budget and every one above it, or nothing at all.
-    ///
-    /// The chain is per-stream, then per-session, then per-listener, so a
-    /// stream that queues without draining runs out of its own budget long
-    /// before it can crowd out the streams beside it.
-    fn charge(&self, length: usize) -> bool {
+    fn ensure_registered(self: &Arc<Self>) {
+        let Some(parent) = &self.parent else { return };
+        parent.ensure_registered();
         if self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(length).filter(|next| *next <= self.max)
+            .registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            parent.children.lock().push(Arc::downgrade(self));
+        }
+    }
+
+    fn used(&self) -> usize {
+        (self.state.load(Ordering::Acquire) & BUDGET_USED_MASK) as usize
+    }
+
+    fn charge_one(&self, length: usize) -> Option<u32> {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & BUDGET_EVICTED != 0 {
+                    return None;
+                }
+                let used = (state & BUDGET_USED_MASK) as usize;
+                let next = used.checked_add(length)?;
+                (next <= self.max).then_some((state & !BUDGET_USED_MASK) | next as u64)
             })
-            .is_err()
-        {
-            return false;
-        }
-        if let Some(parent) = &self.parent
-            && !parent.charge(length)
-        {
-            self.used.fetch_sub(length, Ordering::AcqRel);
-            return false;
-        }
-        true
+            .ok()
+            .map(|state| (state >> 32) as u32)
     }
 
-    fn refund(&self, count: usize) {
-        self.used.fetch_sub(count, Ordering::AcqRel);
+    fn refund_one(&self, count: usize) {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let used = (state & BUDGET_USED_MASK) as usize;
+                debug_assert!(count <= used);
+                Some((state & !BUDGET_USED_MASK) | used.saturating_sub(count) as u64)
+            })
+            .expect("budget refund always updates");
+    }
+
+    fn chain(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        let mut chain = Vec::new();
+        let mut current = Some(self.clone());
+        while let Some(budget) = current {
+            current = budget.parent.clone();
+            chain.push(budget);
+        }
+        chain.reverse();
+        chain
+    }
+
+    fn try_charge(self: &Arc<Self>, length: usize) -> Result<u32, Arc<Self>> {
+        let chain = self.chain();
+        let mut charged = Vec::with_capacity(chain.len());
+        let mut generation = 0;
+        for budget in chain {
+            match budget.charge_one(length) {
+                Some(value) => {
+                    generation = value;
+                    charged.push(budget);
+                }
+                None => {
+                    for budget in charged.into_iter().rev() {
+                        budget.refund_one(length);
+                    }
+                    return Err(budget);
+                }
+            }
+        }
+        Ok(generation)
+    }
+
+    fn refund_permit(&self, count: usize, generation: u32) {
+        let refunded = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if (state >> 32) as u32 != generation || state & BUDGET_EVICTED != 0 {
+                    return None;
+                }
+                let used = (state & BUDGET_USED_MASK) as usize;
+                debug_assert!(count <= used);
+                Some((state & !BUDGET_USED_MASK) | used.saturating_sub(count) as u64)
+            })
+            .is_ok();
+        if !refunded {
+            return;
+        }
         if let Some(parent) = &self.parent {
-            parent.refund(count);
+            parent.refund_one(count);
+            parent.refund_ancestors(count);
         }
     }
 
-    pub(super) fn track(self: &Arc<Self>, bytes: Vec<u8>) -> io::Result<InboundData> {
-        let length = bytes.len();
-        if !self.charge(length) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "smux receive buffer limit exceeded",
-            ));
+    fn refund_ancestors(&self, count: usize) {
+        if let Some(parent) = &self.parent {
+            parent.refund_one(count);
+            parent.refund_ancestors(count);
         }
+    }
+
+    fn largest_leaf(self: &Arc<Self>) -> Option<(Arc<Self>, usize)> {
+        let children = {
+            let mut children = self.children.lock();
+            children.retain(|child| child.strong_count() > 0);
+            children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        if children.is_empty() {
+            let state = self.state.load(Ordering::Acquire);
+            return (state & BUDGET_EVICTED == 0)
+                .then_some((self.clone(), (state & BUDGET_USED_MASK) as usize));
+        }
+        children
+            .into_iter()
+            .filter_map(|child| child.largest_leaf())
+            .max_by_key(|(_, used)| *used)
+    }
+
+    fn evict(&self, scope: ReceiveBudgetScope) {
+        let previous = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & BUDGET_EVICTED == 0)
+                    .then_some(BUDGET_EVICTED | (((state >> 32).wrapping_add(1)) << 32))
+            });
+        let Ok(previous) = previous else { return };
+        let reclaimed = (previous & BUDGET_USED_MASK) as usize;
+        if reclaimed > 0
+            && let Some(parent) = &self.parent
+        {
+            parent.refund_one(reclaimed);
+            parent.refund_ancestors(reclaimed);
+        }
+        if let Some(target) = &self.eviction {
+            let _ = target.sender.send(BudgetEviction {
+                stream_id: target.stream_id,
+                scope,
+            });
+        }
+    }
+
+    fn scope_of(&self, failed: &Arc<Self>) -> ReceiveBudgetScope {
+        if std::ptr::eq(self, Arc::as_ptr(failed)) {
+            ReceiveBudgetScope::Stream
+        } else if failed.parent.is_none()
+            && self
+                .parent
+                .as_ref()
+                .is_some_and(|p| !Arc::ptr_eq(p, failed))
+        {
+            ReceiveBudgetScope::Listener
+        } else {
+            ReceiveBudgetScope::Session
+        }
+    }
+
+    pub(super) fn track(
+        self: &Arc<Self>,
+        bytes: Vec<u8>,
+    ) -> Result<InboundData, ReceiveBudgetExceeded> {
+        let length = bytes.len();
+        self.ensure_registered();
+        let generation = loop {
+            match self.try_charge(length) {
+                Ok(generation) => break generation,
+                Err(failed) => {
+                    let scope = self.scope_of(&failed);
+                    let _eviction = self.eviction_lock.lock();
+                    if let Ok(generation) = self.try_charge(length) {
+                        break generation;
+                    }
+                    let current_after_charge = self.used().saturating_add(length);
+                    let victim = failed.largest_leaf();
+                    if victim.as_ref().is_none_or(|(victim, used)| {
+                        Arc::ptr_eq(victim, self) || current_after_charge >= *used
+                    }) {
+                        self.evict(scope);
+                        return Err(ReceiveBudgetExceeded { scope });
+                    }
+                    victim.expect("checked above").0.evict(scope);
+                }
+            }
+        };
         Ok(InboundData {
             bytes,
             budget: Some(ReceiveBudgetPermit {
                 budget: self.clone(),
                 remaining: length,
+                generation,
             }),
         })
+    }
+}
+
+impl Drop for ReceiveBudget {
+    fn drop(&mut self) {
+        if !self.registered.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(parent) = &self.parent {
+            let self_ptr: *const ReceiveBudget = self;
+            parent
+                .children
+                .lock()
+                .retain(|child| child.as_ptr() != self_ptr);
+        }
     }
 }
 
 struct ReceiveBudgetPermit {
     budget: Arc<ReceiveBudget>,
     remaining: usize,
+    generation: u32,
 }
 
 impl ReceiveBudgetPermit {
     fn release(&mut self, count: usize) {
         debug_assert!(count <= self.remaining);
         self.remaining -= count;
-        self.budget.refund(count);
+        self.budget.refund_permit(count, self.generation);
     }
 }
 
 impl Drop for ReceiveBudgetPermit {
     fn drop(&mut self) {
-        self.budget.refund(self.remaining);
+        self.budget.refund_permit(self.remaining, self.generation);
     }
 }
 
@@ -515,9 +798,7 @@ impl VirtualStream {
         self.read_finished = true;
         match terminal {
             InboundTerminal::Finished => Poll::Ready(Ok(())),
-            InboundTerminal::Failed(message) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, message)))
-            }
+            InboundTerminal::Failed(failure) => Poll::Ready(Err(failure.into_error())),
         }
     }
 
@@ -791,29 +1072,57 @@ impl Drop for VirtualStream {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn sessions_share_the_listener_receive_budget() {
+    fn listener_pressure_evicts_the_largest_buffered_stream_not_the_next_sender() {
         let listener = Arc::new(ReceiveBudget::new(12));
-        let first = Arc::new(ReceiveBudget::with_parent(8, Some(listener.clone())));
-        let second = Arc::new(ReceiveBudget::with_parent(8, Some(listener.clone())));
+        let first_session = Arc::new(ReceiveBudget::with_parent(12, Some(listener.clone())));
+        let second_session = Arc::new(ReceiveBudget::with_parent(12, Some(listener)));
+        let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel();
+        let first = Arc::new(ReceiveBudget::stream(
+            12,
+            first_session,
+            1,
+            eviction_tx.clone(),
+        ));
+        let second = Arc::new(ReceiveBudget::stream(12, second_session, 2, eviction_tx));
 
-        let held = first.track(vec![0_u8; 8]).expect("within both limits");
-        // The second session is well inside its own limit but the listener has
-        // only 4 bytes left, which is the ceiling that did not exist before.
-        let Err(error) = second.track(vec![0_u8; 8]) else {
-            panic!("the shared ceiling must apply across sessions");
+        let _first_held = first.track(vec![0_u8; 8]).expect("within all limits");
+        let _second_held = second.track(vec![0_u8; 1]).expect("within all limits");
+        let _new_data = second
+            .track(vec![0_u8; 4])
+            .expect("the light sender must survive listener pressure");
+
+        let eviction = eviction_rx
+            .try_recv()
+            .expect("the debtor must be identified");
+        assert_eq!(eviction.stream_id, 1);
+        assert_eq!(eviction.scope, ReceiveBudgetScope::Listener);
+        let Err(error) = first.track(vec![0_u8; 1]) else {
+            panic!("an evicted stream cannot consume the reclaimed budget again")
         };
-        assert!(error.to_string().contains("receive buffer"));
-        // A rejected charge must not leave the session's own budget consumed.
-        assert!(
-            second.track(vec![0_u8; 4]).is_ok(),
-            "the refused charge must be refunded to the session budget"
-        );
+        assert_eq!(error.scope, ReceiveBudgetScope::Stream);
+    }
 
-        drop(held);
-        assert!(
-            second.track(vec![0_u8; 8]).is_ok(),
-            "freeing one session must free the shared listener budget"
-        );
+    #[test]
+    fn session_pressure_evicts_its_largest_buffered_stream() {
+        let session = Arc::new(ReceiveBudget::new(8));
+        let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel();
+        let debtor = Arc::new(ReceiveBudget::stream(
+            8,
+            session.clone(),
+            10,
+            eviction_tx.clone(),
+        ));
+        let sender = Arc::new(ReceiveBudget::stream(8, session, 11, eviction_tx));
+
+        let _debtor_data = debtor.track(vec![0_u8; 6]).unwrap();
+        let _sender_data = sender.track(vec![0_u8; 1]).unwrap();
+        let _new_data = sender
+            .track(vec![0_u8; 2])
+            .expect("the stream using less memory must not be the victim");
+
+        let eviction = eviction_rx.try_recv().unwrap();
+        assert_eq!(eviction.stream_id, 10);
+        assert_eq!(eviction.scope, ReceiveBudgetScope::Session);
     }
 
     use super::*;
@@ -893,7 +1202,10 @@ mod tests {
             .await
             .unwrap();
         terminal_tx
-            .send(InboundTerminal::Failed("physical closed".to_string()))
+            .send(InboundTerminal::Failed(InboundFailure::new(
+                io::ErrorKind::ConnectionAborted,
+                "physical closed",
+            )))
             .unwrap();
 
         let mut byte = [0_u8; 1];
@@ -901,7 +1213,7 @@ mod tests {
         assert_eq!(byte, [b'x']);
 
         let error = stream.read(&mut byte).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert!(error.to_string().contains("physical closed"));
     }
 

@@ -203,10 +203,10 @@ impl TcpServerHandler for ShadowTlsPluginServerHandler {
                             .await
                     }
                     ShadowTlsV2Outcome::Fallback(fallback) => {
-                        tokio::spawn(async move {
+                        Ok(TcpServerSetupResult::connection_task(async move {
                             let _ = fallback.relay().await;
-                        });
-                        Ok(TcpServerSetupResult::AlreadyHandled)
+                            Ok(())
+                        }))
                     }
                 }
             }
@@ -353,12 +353,12 @@ async fn fallback_v3_probe(
     let mut camouflage = connector.connect().await?;
     camouflage.write_all(consumed).await?;
     camouflage.flush().await?;
-    tokio::spawn(async move {
+    Ok(TcpServerSetupResult::connection_task(async move {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut camouflage).await;
         let _ = client.shutdown().await;
         let _ = camouflage.shutdown().await;
-    });
-    Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(())
+    }))
 }
 
 /// Keep the transport peer outside any protocol-derived override. The TCP
@@ -368,13 +368,9 @@ fn with_transport_peer_addr(
     result: TcpServerSetupResult,
     peer_addr: Option<SocketAddr>,
 ) -> TcpServerSetupResult {
-    if matches!(result, TcpServerSetupResult::AlreadyHandled) {
-        result
-    } else {
-        TcpServerSetupResult::PeerAddressOverride {
-            peer_addr,
-            result: Box::new(result),
-        }
+    TcpServerSetupResult::PeerAddressOverride {
+        peer_addr,
+        result: Box::new(result),
     }
 }
 
@@ -490,7 +486,7 @@ mod tests {
                 .lock()
                 .map_err(|_| io::Error::other("test peer lock poisoned"))?
                 .push(peer_addr);
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 
@@ -567,10 +563,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(matches!(
-            setup.await.unwrap().unwrap(),
-            TcpServerSetupResult::AlreadyHandled
-        ));
+        let TcpServerSetupResult::ConnectionTask(task) = setup.await.unwrap().unwrap() else {
+            panic!("fallback must return an owned connection task")
+        };
+        task.await.unwrap();
         assert_eq!(
             *captured.0.lock().unwrap(),
             vec![Some("192.0.2.10:4242".parse().unwrap())]
@@ -583,7 +579,7 @@ mod tests {
         let protocol_peer = Some("198.51.100.2:2000".parse().unwrap());
         let nested = TcpServerSetupResult::PeerAddressOverride {
             peer_addr: protocol_peer,
-            result: Box::new(TcpServerSetupResult::AlreadyHandled),
+            result: Box::new(TcpServerSetupResult::completed()),
         };
         let wrapped = with_transport_peer_addr(nested, transport_peer);
 
@@ -633,10 +629,10 @@ mod tests {
         // consume in the same poll.
         let initial = [0x01, 0x03, 0x03, 0x00, 0x00, 1, 2, 3];
         client_peer.write_all(&initial).await.unwrap();
-        assert!(matches!(
-            setup.await.unwrap().unwrap(),
-            TcpServerSetupResult::AlreadyHandled
-        ));
+        let TcpServerSetupResult::ConnectionTask(task) = setup.await.unwrap().unwrap() else {
+            panic!("fallback must return an owned connection task")
+        };
+        let fallback_task = tokio::spawn(task);
 
         client_peer.write_all(&[4, 5, 6]).await.unwrap();
         let mut forwarded = [0u8; 11];
@@ -648,5 +644,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(forwarded, [0x01, 0x03, 0x03, 0, 0, 1, 2, 3, 4, 5, 6]);
+        fallback_task.abort();
+        let _ = fallback_task.await;
     }
 }

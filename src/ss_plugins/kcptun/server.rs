@@ -205,7 +205,7 @@ impl KcptunSessionHandler for TcpPipelineSessionHandler {
             .setup_server_stream_with_peer_addr(Box::new(stream), Some(peer))
             .await?
         {
-            TcpServerSetupResult::AlreadyHandled => Ok(()),
+            TcpServerSetupResult::ConnectionTask(task) => task.await,
             _ => Err(io::Error::other(
                 "Kcptun physical-session handler did not consume the stream",
             )),
@@ -239,6 +239,7 @@ pub fn smux_session_handler(
                 limits,
                 max_receive_buffer: config.smux_buffer as usize,
                 max_stream_buffer: config.stream_buffer as usize,
+                max_stream_receive_buffer: config.stream_buffer as usize,
                 keepalive_interval: Some(keepalive_interval),
                 keepalive_timeout: Some(keepalive_interval.saturating_mul(3)),
                 ..SmuxServerConfig::default()
@@ -1229,7 +1230,7 @@ mod tests {
                     }
                 }
             });
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 

@@ -384,7 +384,7 @@ impl TcpServerHandler for RawH2MuxServerHandler {
         let proxy_selector = self.proxy_selector.clone();
         let resolver = self.resolver.clone();
 
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             if let Err(err) = handle_h2mux_session(
                 server_stream,
                 None,
@@ -397,9 +397,8 @@ impl TcpServerHandler for RawH2MuxServerHandler {
             {
                 log::debug!("raw h2mux e2e session ended: {err}");
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 }
 

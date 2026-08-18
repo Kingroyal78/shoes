@@ -219,9 +219,6 @@ impl TcpServerHandler for TlsServerHandler {
                 };
 
                 if let Ok(ref mut setup_result) = target_setup_result {
-                    if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-                        return target_setup_result;
-                    }
                     setup_result.set_need_initial_flush(true);
                 }
 

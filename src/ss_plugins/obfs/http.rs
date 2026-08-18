@@ -215,7 +215,7 @@ mod tests {
             let mut payload = [0u8; 10];
             stream.read_exact(&mut payload).await?;
             assert_eq!(&payload, b"ss-payload");
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(response, RESPONSE);
         assert!(matches!(
             accept.await.unwrap(),
-            TcpServerSetupResult::AlreadyHandled
+            TcpServerSetupResult::ConnectionTask(_)
         ));
     }
 

@@ -8,8 +8,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
+use super::smux::{BackpressureCause, record_backpressure_drop};
 use super::virtual_stream::{
-    InboundChannels, InboundData, InboundEvent, InboundTerminal, OutboundCommand, VirtualStream,
+    BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
+    OutboundCommand, ReceiveBudget, VirtualStream,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -23,6 +25,9 @@ const STATUS_KEEP_ALIVE: u8 = 0x04;
 const OPTION_DATA: u8 = 0x01;
 const OPTION_ERROR: u8 = 0x02;
 const NETWORK_TCP: u8 = 0x01;
+const MUX_COOL_STREAM_RECEIVE_BUFFER: usize = 256 * 1024;
+const MUX_COOL_SESSION_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+const MUX_COOL_LISTENER_RECEIVE_BUFFER: usize = 256 * 1024 * 1024;
 
 /// How long a finished session waits for its logical streams to wind down
 /// before cancelling them.
@@ -65,6 +70,7 @@ pub struct MuxCoolServerHandler {
     inner: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     limits: MuxCoolLimits,
+    listener_budget: Arc<ReceiveBudget>,
 }
 
 impl fmt::Debug for MuxCoolServerHandler {
@@ -87,6 +93,7 @@ impl MuxCoolServerHandler {
             inner,
             resolver,
             limits,
+            listener_budget: Arc::new(ReceiveBudget::new(MUX_COOL_LISTENER_RECEIVE_BUFFER)),
         }
     }
 }
@@ -109,16 +116,19 @@ impl TcpServerHandler for MuxCoolServerHandler {
         let inner = self.inner.clone();
         let resolver = self.resolver.clone();
         let limits = self.limits;
-        tokio::spawn(async move {
-            if let Err(error) = serve_mux_cool(stream, inner, resolver, peer_addr, limits).await {
+        let listener_budget = self.listener_budget.clone();
+        Ok(TcpServerSetupResult::connection_task(async move {
+            if let Err(error) =
+                serve_mux_cool(stream, inner, resolver, peer_addr, limits, listener_budget).await
+            {
                 log::debug!("Mux.Cool session finished with error: {error}");
             }
-        });
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ParsedMetadata {
     stream_id: u16,
     status: u8,
@@ -191,32 +201,111 @@ fn parse_new_metadata(metadata: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Frame decoding state that outlives the future reading into it.
+///
+/// The session loop has to service budget evictions while a read is in
+/// flight, and `tokio::select!` drops whichever branch loses. A decoder that
+/// kept its partial metadata or payload on the future's own stack would take
+/// those bytes with it, leaving the next read to parse the middle of a frame
+/// and killing a session that did nothing wrong. Holding the state here makes
+/// the read resumable, so cancelling it costs nothing.
+#[derive(Default)]
+struct FrameReader {
+    length_bytes: [u8; 2],
+    length_read: usize,
+    metadata: Vec<u8>,
+    metadata_read: usize,
+    parsed: Option<ParsedMetadata>,
+    data_length_bytes: [u8; 2],
+    data_length_read: usize,
+    data: Vec<u8>,
+    data_read: usize,
+}
+
+impl FrameReader {
+    async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        max_metadata: usize,
+    ) -> io::Result<Option<(ParsedMetadata, Vec<u8>)>> {
+        while self.length_read < 2 {
+            let read = reader
+                .read(&mut self.length_bytes[self.length_read..])
+                .await?;
+            if read == 0 {
+                return if self.length_read == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Mux.Cool metadata length truncated",
+                    ))
+                };
+            }
+            self.length_read += read;
+        }
+        if self.parsed.is_none() {
+            let metadata_len = u16::from_be_bytes(self.length_bytes) as usize;
+            if metadata_len > max_metadata {
+                return invalid("Mux.Cool metadata exceeds configured limit");
+            }
+            if self.metadata.len() != metadata_len {
+                self.metadata = vec![0u8; metadata_len];
+            }
+            while self.metadata_read < metadata_len {
+                let read = reader
+                    .read(&mut self.metadata[self.metadata_read..])
+                    .await?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Mux.Cool metadata truncated",
+                    ));
+                }
+                self.metadata_read += read;
+            }
+            self.parsed = Some(parse_metadata(&self.metadata)?);
+        }
+        let parsed = self.parsed.expect("metadata was just parsed");
+        if parsed.has_data {
+            while self.data_length_read < 2 {
+                let read = reader
+                    .read(&mut self.data_length_bytes[self.data_length_read..])
+                    .await?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Mux.Cool payload length truncated",
+                    ));
+                }
+                self.data_length_read += read;
+            }
+            let length = u16::from_be_bytes(self.data_length_bytes) as usize;
+            if self.data.len() != length {
+                self.data = vec![0u8; length];
+            }
+            while self.data_read < length {
+                let read = reader.read(&mut self.data[self.data_read..]).await?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Mux.Cool payload truncated",
+                    ));
+                }
+                self.data_read += read;
+            }
+        }
+        let data = std::mem::take(&mut self.data);
+        *self = Self::default();
+        Ok(Some((parsed, data)))
+    }
+}
+
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_metadata: usize,
 ) -> io::Result<Option<(ParsedMetadata, Vec<u8>)>> {
-    let mut length_bytes = [0u8; 2];
-    let first = reader.read(&mut length_bytes[..1]).await?;
-    if first == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut length_bytes[1..]).await?;
-    let metadata_len = u16::from_be_bytes(length_bytes) as usize;
-    if metadata_len > max_metadata {
-        return invalid("Mux.Cool metadata exceeds configured limit");
-    }
-    let mut metadata = vec![0u8; metadata_len];
-    reader.read_exact(&mut metadata).await?;
-    let parsed = parse_metadata(&metadata)?;
-    let data = if parsed.has_data {
-        let length = reader.read_u16().await? as usize;
-        let mut data = vec![0u8; length];
-        reader.read_exact(&mut data).await?;
-        data
-    } else {
-        Vec::new()
-    };
-    Ok(Some((parsed, data)))
+    FrameReader::default().read(reader, max_metadata).await
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -248,6 +337,8 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 struct LogicalStreamState {
     inbound: Option<mpsc::Sender<InboundEvent>>,
     terminal: Option<oneshot::Sender<InboundTerminal>>,
+    budget: Arc<ReceiveBudget>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 async fn serve_mux_cool(
@@ -256,11 +347,17 @@ async fn serve_mux_cool(
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<std::net::SocketAddr>,
     limits: MuxCoolLimits,
+    listener_budget: Arc<ReceiveBudget>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (outbound_tx, mut outbound_rx) =
         mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
     let (drop_close_tx, mut drop_close_rx) = mpsc::channel::<u32>(limits.max_concurrent_streams);
+    let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel::<BudgetEviction>();
+    let receive_budget = Arc::new(ReceiveBudget::with_parent(
+        MUX_COOL_SESSION_RECEIVE_BUFFER,
+        Some(listener_budget),
+    ));
     let close_outbound = outbound_tx.clone();
     let mut close_forwarder = tokio::spawn(async move {
         while let Some(stream_id) = drop_close_rx.recv().await {
@@ -271,11 +368,8 @@ async fn serve_mux_cool(
         }
         Ok::<(), io::Error>(())
     });
-    // The writer cannot be ended by dropping senders alone: an inner handler
-    // that takes a logical stream, spawns it and returns `AlreadyHandled`
-    // keeps an outbound clone in a task this session cannot reach, so the
-    // channel never closes however much of its own work the session cancels.
-    // A signal ends it regardless of who else is still holding a sender.
+    // The writer has an explicit shutdown signal so its lifetime does not
+    // depend on every nested sender clone disappearing in a particular order.
     let writer_shutdown = Arc::new(tokio::sync::Notify::new());
     let writer_shutdown_signal = writer_shutdown.clone();
     let mut writer_task = tokio::spawn(async move {
@@ -327,8 +421,29 @@ async fn serve_mux_cool(
     // for a logical stream whose physical session is gone: it has no transport
     // left to carry anything to the client.
     let mut stream_tasks = tokio::task::JoinSet::new();
+    let mut frame_reader = FrameReader::default();
     let read_result = loop {
-        let (metadata, data) = match read_frame(&mut reader, limits.max_metadata_bytes).await {
+        let frame = tokio::select! {
+            biased;
+            Some(eviction) = eviction_rx.recv() => {
+                let stream_id = eviction.stream_id as u16;
+                if let Some(state) = streams.remove(&stream_id) {
+                    record_backpressure_drop(BackpressureCause::Bytes(eviction.scope));
+                    if let Some(task) = state.task {
+                        task.abort();
+                    }
+                    if let Some(terminal) = state.terminal {
+                        let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
+                        io::ErrorKind::OutOfMemory,
+                        format!("Mux.Cool {} receive budget evicted the largest buffered stream", eviction.scope),
+                        )));
+                    }
+                }
+                continue;
+            }
+            frame = frame_reader.read(&mut reader, limits.max_metadata_bytes) => frame,
+        };
+        let (metadata, data) = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
@@ -352,18 +467,38 @@ async fn serve_mux_cool(
                 };
                 let (inbound_tx, inbound_rx) = mpsc::channel(limits.inbound_frames_per_stream);
                 let (terminal_tx, terminal_rx) = oneshot::channel();
-                if !data.is_empty()
-                    && inbound_tx
-                        .try_send(InboundEvent::Data(InboundData::untracked(data)))
-                        .is_err()
-                {
-                    break invalid("Mux.Cool logical inbound queue rejected initial data");
+                let budget = Arc::new(ReceiveBudget::stream(
+                    MUX_COOL_STREAM_RECEIVE_BUFFER,
+                    receive_budget.clone(),
+                    u32::from(metadata.stream_id),
+                    eviction_tx.clone(),
+                ));
+                if !data.is_empty() {
+                    let tracked = match budget.track(data) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                            let _ = outbound_tx.try_send(OutboundCommand::Finished {
+                                stream_id: u32::from(metadata.stream_id),
+                            });
+                            continue;
+                        }
+                    };
+                    if inbound_tx.try_send(InboundEvent::Data(tracked)).is_err() {
+                        record_backpressure_drop(BackpressureCause::FrameQueue);
+                        let _ = outbound_tx.try_send(OutboundCommand::Finished {
+                            stream_id: u32::from(metadata.stream_id),
+                        });
+                        continue;
+                    }
                 }
                 streams.insert(
                     metadata.stream_id,
                     LogicalStreamState {
                         inbound: Some(inbound_tx),
                         terminal: Some(terminal_tx),
+                        budget,
+                        task: None,
                     },
                 );
                 let mut logical = VirtualStream::new(
@@ -375,7 +510,7 @@ async fn serve_mux_cool(
                 logical.set_drop_close_permit(close_permit);
                 let inner = inner.clone();
                 let resolver = resolver.clone();
-                stream_tasks.spawn(async move {
+                let task = stream_tasks.spawn(async move {
                     if let Err(error) = process_stream(logical, inner, resolver, peer_addr).await {
                         log::debug!(
                             "Mux.Cool logical stream {} finished with error: {error}",
@@ -383,6 +518,10 @@ async fn serve_mux_cool(
                         );
                     }
                 });
+                streams
+                    .get_mut(&metadata.stream_id)
+                    .expect("stream state was just inserted")
+                    .task = Some(task);
             }
             STATUS_KEEP => {
                 match streams.get_mut(&metadata.stream_id) {
@@ -390,12 +529,49 @@ async fn serve_mux_cool(
                         if !data.is_empty()
                             && let Some(sender) = &state.inbound
                         {
-                            match sender.try_send(InboundEvent::Data(InboundData::untracked(data)))
-                            {
+                            let tracked = match state.budget.track(data) {
+                                Ok(data) => data,
+                                Err(error) => {
+                                    record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                                    let removed = streams.remove(&metadata.stream_id);
+                                    if let Some(task) =
+                                        removed.as_ref().and_then(|state| state.task.as_ref())
+                                    {
+                                        task.abort();
+                                    }
+                                    if let Some(terminal) = removed.and_then(|state| state.terminal)
+                                    {
+                                        let _ = terminal.send(InboundTerminal::Failed(
+                                            InboundFailure::new(
+                                                io::ErrorKind::OutOfMemory,
+                                                error.to_string(),
+                                            ),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+                            match sender.try_send(InboundEvent::Data(tracked)) {
                                 Ok(()) => {}
                                 Err(TrySendError::Closed(_)) => state.inbound = None,
                                 Err(TrySendError::Full(_)) => {
-                                    break invalid("Mux.Cool logical inbound queue is full");
+                                    record_backpressure_drop(BackpressureCause::FrameQueue);
+                                    let removed = streams.remove(&metadata.stream_id);
+                                    if let Some(task) =
+                                        removed.as_ref().and_then(|state| state.task.as_ref())
+                                    {
+                                        task.abort();
+                                    }
+                                    if let Some(terminal) = removed.and_then(|state| state.terminal)
+                                    {
+                                        let _ = terminal.send(InboundTerminal::Failed(
+                                            InboundFailure::new(
+                                                io::ErrorKind::OutOfMemory,
+                                                "Mux.Cool logical inbound frame queue is full",
+                                            ),
+                                        ));
+                                    }
+                                    continue;
                                 }
                             }
                         }
@@ -421,23 +597,45 @@ async fn serve_mux_cool(
                 // Close is idempotent in the reference implementation.  In
                 // particular, Mihomo may emit End more than once while
                 // unwinding layered net.Conn wrappers.
-                if let Some(state) = streams.remove(&metadata.stream_id) {
+                if let Some(mut state) = streams.remove(&metadata.stream_id) {
+                    let mut local_failure = None;
                     if !data.is_empty()
-                        && let Some(inbound) = state.inbound
+                        && let Some(inbound) = state.inbound.take()
                     {
-                        match inbound.try_send(InboundEvent::Data(InboundData::untracked(data))) {
-                            Ok(()) => {}
-                            Err(TrySendError::Closed(_)) => {}
-                            Err(TrySendError::Full(_)) => {
-                                break invalid("Mux.Cool logical inbound queue is full");
+                        match state.budget.track(data) {
+                            Ok(tracked) => {
+                                if matches!(
+                                    inbound.try_send(InboundEvent::Data(tracked)),
+                                    Err(TrySendError::Full(_))
+                                ) {
+                                    record_backpressure_drop(BackpressureCause::FrameQueue);
+                                    local_failure = Some(
+                                        "Mux.Cool logical inbound frame queue is full".to_string(),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                                local_failure = Some(error.to_string());
                             }
                         }
                     }
-                    if let Some(terminal_tx) = state.terminal {
+                    if let Some(message) = local_failure {
+                        if let Some(task) = state.task {
+                            task.abort();
+                        }
+                        if let Some(terminal_tx) = state.terminal {
+                            let _ = terminal_tx.send(InboundTerminal::Failed(InboundFailure::new(
+                                io::ErrorKind::OutOfMemory,
+                                message,
+                            )));
+                        }
+                    } else if let Some(terminal_tx) = state.terminal {
                         let terminal = if metadata.has_error {
-                            InboundTerminal::Failed(
-                                "Mux.Cool peer closed the logical stream".to_string(),
-                            )
+                            InboundTerminal::Failed(InboundFailure::new(
+                                io::ErrorKind::ConnectionReset,
+                                "Mux.Cool peer closed the logical stream",
+                            ))
                         } else {
                             InboundTerminal::Finished
                         };
@@ -450,11 +648,15 @@ async fn serve_mux_cool(
         }
     };
 
-    let failure = read_result
-        .as_ref()
-        .err()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "Mux.Cool physical stream closed".to_string());
+    let failure = read_result.as_ref().err().map_or_else(
+        || {
+            InboundFailure::new(
+                io::ErrorKind::ConnectionAborted,
+                "Mux.Cool physical stream closed",
+            )
+        },
+        InboundFailure::from_error,
+    );
     for (_, stream) in streams {
         if let Some(terminal) = stream.terminal {
             let _ = terminal.send(InboundTerminal::Failed(failure.clone()));
@@ -476,12 +678,10 @@ async fn serve_mux_cool(
     {
         stream_tasks.shutdown().await;
     }
-    // Whatever still holds a drop-close permit here is out of this session's
-    // reach -- an inner handler that detached the logical stream it was given,
-    // most concretely -- so waiting on the forwarder is waiting on something
-    // the session can no longer influence. Bounded by the same grace for that
-    // reason. Aborting it cannot orphan anything: it only turns drop
-    // notifications into End frames, and the session is over.
+    // Every production handler now returns an owned connection future, so all
+    // permits should have been released above. Keep a bound here as an
+    // invariant guard: if a future implementation leaks ownership, teardown
+    // still cannot retain the physical connection forever.
     let close_result =
         match tokio::time::timeout(STREAM_SHUTDOWN_GRACE, &mut close_forwarder).await {
             Ok(joined) => joined
@@ -493,17 +693,14 @@ async fn serve_mux_cool(
                 // bury the result that actually describes the session -- the read
                 // result -- under something it could do nothing about.
                 close_forwarder.abort();
-                log::debug!(
-                    "Mux.Cool close forwarder outlived the streams this session owns; \
-                 an inner handler kept one"
-                );
+                log::debug!("Mux.Cool close-forwarder ownership invariant violated");
                 Ok(Ok(()))
             }
         };
     // Tell the writer to drain and stop. Signalled after the streams were
     // cancelled so the End frames their drops emit are already queued, and
-    // issued whether or not the forwarder finished, because the writer is held
-    // open by the same unreachable senders.
+    // issued whether or not the forwarder finished, because an invariant
+    // violation may still have left a sender alive.
     writer_shutdown.notify_one();
     let close_result = close_result?;
     // Bound only the writer drain: it may still be blocked on a physical
@@ -709,6 +906,7 @@ mod tests {
             Arc::new(UnusedResolver),
             None,
             MuxCoolLimits::default(),
+            Arc::new(ReceiveBudget::new(MUX_COOL_LISTENER_RECEIVE_BUFFER)),
         ));
 
         client.write_all(&new_frame(1)).await.unwrap();
@@ -732,6 +930,118 @@ mod tests {
                 "teardown fell back to one of its own bounds: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_logical_queue_does_not_fail_the_mux_cool_session() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handler = Arc::new(ParkingHandler::default());
+        let session = tokio::spawn(serve_mux_cool(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(UnusedResolver),
+            None,
+            MuxCoolLimits {
+                inbound_frames_per_stream: 1,
+                ..MuxCoolLimits::default()
+            },
+            Arc::new(ReceiveBudget::new(MUX_COOL_LISTENER_RECEIVE_BUFFER)),
+        ));
+
+        client.write_all(&new_frame(1)).await.unwrap();
+        handler.ready.notified().await;
+        write_frame(&mut client, 1, STATUS_KEEP, b"a")
+            .await
+            .unwrap();
+        write_frame(&mut client, 1, STATUS_KEEP, b"b")
+            .await
+            .unwrap();
+        client.write_all(&new_frame(2)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler.ready.notified())
+            .await
+            .expect("one full logical queue must not terminate the physical session");
+
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session)
+            .await
+            .expect("Mux.Cool session must tear down after the peer closes");
+    }
+
+    /// A listener-scope eviction is delivered to the read loop of whichever
+    /// session owns the debtor, which is normally *not* the session that ran
+    /// out of budget. That loop may be parked halfway through a frame at the
+    /// time, so handling the eviction must not discard the bytes it already
+    /// consumed: losing them desynchronises the framing and kills the whole
+    /// session, which is the collateral the eviction exists to avoid.
+    #[tokio::test]
+    async fn a_listener_eviction_does_not_desynchronise_the_victims_frame_reader() {
+        let listener = Arc::new(ReceiveBudget::new(8));
+
+        let (mut victim_client, victim_server) = tokio::io::duplex(4096);
+        let victim_handler = Arc::new(ParkingHandler::default());
+        let victim = tokio::spawn(serve_mux_cool(
+            Box::new(TestStream(victim_server)),
+            victim_handler.clone(),
+            Arc::new(UnusedResolver),
+            None,
+            MuxCoolLimits::default(),
+            listener.clone(),
+        ));
+
+        let (mut greedy_client, greedy_server) = tokio::io::duplex(4096);
+        let greedy_handler = Arc::new(ParkingHandler::default());
+        let greedy = tokio::spawn(serve_mux_cool(
+            Box::new(TestStream(greedy_server)),
+            greedy_handler.clone(),
+            Arc::new(UnusedResolver),
+            None,
+            MuxCoolLimits::default(),
+            listener,
+        ));
+
+        // The victim parks six of the listener's eight bytes, making it the
+        // debtor any listener-scope eviction will pick. Opening a second
+        // stream proves that payload was consumed and charged.
+        victim_client.write_all(&new_frame(1)).await.unwrap();
+        victim_handler.ready.notified().await;
+        write_frame(&mut victim_client, 1, STATUS_KEEP, b"abcdef")
+            .await
+            .unwrap();
+        victim_client.write_all(&new_frame(2)).await.unwrap();
+        victim_handler.ready.notified().await;
+
+        // Park the victim's reader inside a frame: announce four payload bytes
+        // and deliver two.
+        victim_client
+            .write_all(&[0, 4, 0, 1, STATUS_KEEP, OPTION_DATA, 0, 4, b'g', b'h'])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A different session now runs the listener budget out. It is not the
+        // debtor, so the eviction lands on the victim's parked stream.
+        greedy_client.write_all(&new_frame(1)).await.unwrap();
+        greedy_handler.ready.notified().await;
+        write_frame(&mut greedy_client, 1, STATUS_KEEP, b"ijk")
+            .await
+            .unwrap();
+
+        // Complete the interrupted frame and open another stream. The trailing
+        // payload belongs to an evicted stream and is discarded, but the frame
+        // after it must still be understood.
+        victim_client.write_all(b"ij").await.unwrap();
+        victim_client.write_all(&new_frame(3)).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            victim_handler.ready.notified(),
+        )
+        .await
+        .expect("evicting a stream must not cost the session its framing");
+
+        drop(victim_client);
+        drop(greedy_client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), victim).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), greedy).await;
     }
 
     #[test]
@@ -848,6 +1158,7 @@ mod tests {
             Arc::new(UnusedResolver),
             None,
             MuxCoolLimits::default(),
+            Arc::new(ReceiveBudget::new(MUX_COOL_LISTENER_RECEIVE_BUFFER)),
         ));
 
         client

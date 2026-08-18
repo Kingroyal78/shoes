@@ -19,7 +19,9 @@ pub use http::{HttpLimits, HttpRequest, normalize_path};
 pub use http_upgrade::{HttpUpgradeConfig, HttpUpgradeServerHandler};
 pub use mux_cool::{MuxCoolLimits, MuxCoolServerHandler};
 pub use smux::{
-    STREAMS_DROPPED_BY_BACKPRESSURE, SmuxLimits, SmuxServerConfig, SmuxServerHandler,
+    STREAMS_DROPPED_BY_BACKPRESSURE, STREAMS_DROPPED_BY_FRAME_QUEUE,
+    STREAMS_DROPPED_BY_LISTENER_BYTES, STREAMS_DROPPED_BY_SESSION_BYTES,
+    STREAMS_DROPPED_BY_STREAM_BYTES, SmuxLimits, SmuxServerConfig, SmuxServerHandler,
     SmuxV1ServerHandler,
 };
 pub use tls::TlsTerminatingServerHandler;

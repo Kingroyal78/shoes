@@ -323,7 +323,7 @@ mod tests {
             server_stream.read_exact(&mut byte).await?;
             *self.peer_addr.lock().unwrap() = peer_addr;
             *self.first_payload_byte.lock().unwrap() = Some(byte[0]);
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 

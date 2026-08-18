@@ -191,7 +191,7 @@ impl TcpServerHandler for RestlsPluginServerHandler {
                                 &mut camouflage_write,
                             )
                             .await?;
-                            return spawn_fallback(
+                            return fallback_task(
                                 client_reader.into_inner().unsplit(client_write),
                                 camouflage_reader.into_inner().unsplit(camouflage_write),
                             );
@@ -213,7 +213,7 @@ impl TcpServerHandler for RestlsPluginServerHandler {
                                 &mut camouflage_write,
                             )
                             .await?;
-                            return spawn_fallback(
+                            return fallback_task(
                                 client_reader.into_inner().unsplit(client_write),
                                 camouflage_reader.into_inner().unsplit(camouflage_write),
                             );
@@ -232,7 +232,7 @@ impl TcpServerHandler for RestlsPluginServerHandler {
                                 &mut camouflage_write,
                             )
                             .await?;
-                            return spawn_fallback(
+                            return fallback_task(
                                 client_reader.into_inner().unsplit(client_write),
                                 camouflage_reader.into_inner().unsplit(camouflage_write),
                             );
@@ -259,7 +259,7 @@ impl TcpServerHandler for RestlsPluginServerHandler {
                                 &mut camouflage_write,
                             )
                             .await?;
-                            return spawn_fallback(
+                            return fallback_task(
                                 client_reader.into_inner().unsplit(client_write),
                                 camouflage_reader.into_inner().unsplit(camouflage_write),
                             );
@@ -536,17 +536,17 @@ async fn write_owed_responses<W: AsyncWrite + Unpin>(
     Ok(awaiting)
 }
 
-fn spawn_fallback<C, H>(mut client: C, mut camouflage: H) -> io::Result<TcpServerSetupResult>
+fn fallback_task<C, H>(mut client: C, mut camouflage: H) -> io::Result<TcpServerSetupResult>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    Ok(TcpServerSetupResult::connection_task(async move {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut camouflage).await;
         let _ = client.shutdown().await;
         let _ = camouflage.shutdown().await;
-    });
-    Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(())
+    }))
 }
 
 struct RestlsApplicationStream {
@@ -810,10 +810,10 @@ mod tests {
         // together so the cancellation-safe decoder may buffer both.
         let initial = [0x99, 3, 3, 0, 0, 1, 2, 3, 4];
         client_peer.write_all(&initial).await.unwrap();
-        assert!(matches!(
-            setup.await.unwrap().unwrap(),
-            TcpServerSetupResult::AlreadyHandled
-        ));
+        let TcpServerSetupResult::ConnectionTask(task) = setup.await.unwrap().unwrap() else {
+            panic!("fallback must return an owned connection task")
+        };
+        let fallback_task = tokio::spawn(task);
 
         client_peer.write_all(&[5, 6, 7]).await.unwrap();
         let mut forwarded = [0u8; 12];
@@ -825,6 +825,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(forwarded, [0x99, 3, 3, 0, 0, 1, 2, 3, 4, 5, 6, 7]);
+        fallback_task.abort();
+        let _ = fallback_task.await;
     }
 
     #[tokio::test]

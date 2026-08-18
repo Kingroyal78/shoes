@@ -13,8 +13,10 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult};
-use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult, TcpServerSetupResult};
+use crate::tcp::tcp_server::{
+    AuthenticatedConnectionScope, handle_server_setup_result, run_udp_copy,
+};
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -436,11 +438,19 @@ impl AnyTlsSession {
                     let session_for_cleanup = Arc::clone(self);
 
                     let handle = tokio::spawn(async move {
+                        let resolver = session.resolver.clone();
+                        let peer_addr = session.peer_addr;
                         // Apply timeout to entire stream handler lifetime
                         // This prevents memory leaks from hung streams
                         let result = tokio::time::timeout(
                             STREAM_HANDLER_TIMEOUT,
-                            session.handle_new_stream(stream),
+                            handle_server_setup_result(
+                                TcpServerSetupResult::connection_task(async move {
+                                    session.handle_new_stream(stream).await
+                                }),
+                                resolver,
+                                peer_addr,
+                            ),
                         )
                         .await;
 

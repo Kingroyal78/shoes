@@ -30,7 +30,9 @@ use crate::routing::{ServerStream, run_udp_routing};
 use crate::shared_users::SharedUsers;
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpServerSetupResult};
-use crate::tcp::tcp_server::{AuthenticatedConnectionScope, run_udp_copy};
+use crate::tcp::tcp_server::{
+    AuthenticatedConnectionScope, handle_server_setup_result, run_udp_copy,
+};
 use crate::tls_server_handler::NaiveConfig;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
@@ -113,6 +115,7 @@ pub(super) struct NaiveServiceConfig {
     pub(super) peer_addr: Option<SocketAddr>,
     pub(super) udp_enabled: bool,
     pub(super) padding_enabled: bool,
+    pub(super) connection_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 const PROTOCOL_SNIFF_MAX_BYTES: usize = 2048;
@@ -143,6 +146,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
 ) -> io::Result<TcpServerSetupResult> {
     let io = TokioIo::new(tls_stream);
 
+    let connection_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
     let service_config = Arc::new(NaiveServiceConfig {
         users: naive_cfg.users.clone(),
         fallback_path: naive_cfg.fallback_path.clone(),
@@ -152,11 +156,12 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         peer_addr,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        connection_tasks: connection_tasks.clone(),
     });
 
     if use_h2 {
         // HTTP/2 for NaiveProxy clients
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             let service = hyper::service::service_fn(move |req| {
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
@@ -179,11 +184,15 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/2 connection error: {}", e);
             }
-        });
+            let mut tasks = connection_tasks.lock().await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            Ok(())
+        }))
     } else {
         // HTTP/1.1 for browsers and censors - serve static files only, no proxy
         let fallback_path = naive_cfg.fallback_path.clone();
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             let service = hyper::service::service_fn(move |req| {
                 let path = fallback_path.clone();
                 async move { http1_fallback_service(req, path).await }
@@ -197,10 +206,9 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/1.1 fallback error: {}", e);
             }
-        });
+            Ok(())
+        }))
     }
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
 }
 
 /// HTTP/1.1 fallback service - only serves static files, no proxy functionality
@@ -314,8 +322,10 @@ async fn naive_service(
     let outbound_dispatcher = config.outbound_dispatcher.clone();
     let peer_addr = config.peer_addr;
     let udp_enabled = config.udp_enabled;
+    let accounting_resolver = resolver.clone();
+    let connection_tasks = config.connection_tasks.clone();
 
-    tokio::spawn(async move {
+    let tunnel = async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = HyperUpgradedStream(TokioIo::new(upgraded));
@@ -346,7 +356,22 @@ async fn naive_service(
                 debug!("NaiveProxy upgrade failed: {}", e);
             }
         }
+        Ok(())
+    };
+    let mut tasks = connection_tasks.lock().await;
+    while tasks.try_join_next().is_some() {}
+    tasks.spawn(async move {
+        if let Err(error) = handle_server_setup_result(
+            TcpServerSetupResult::connection_task(tunnel),
+            accounting_resolver,
+            peer_addr,
+        )
+        .await
+        {
+            debug!("NaiveProxy tunnel task ended: {error}");
+        }
     });
+    drop(tasks);
 
     let response = add_server_padding_response_headers(
         Response::builder().status(StatusCode::OK),

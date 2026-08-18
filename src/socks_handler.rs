@@ -422,15 +422,14 @@ async fn handle_udp_associate(
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 
-    tokio::spawn(async move {
+    Ok(TcpServerSetupResult::connection_task(async move {
         if let Err(e) =
             run_udp_associate(server_stream, relay_stream, proxy_selector, resolver).await
         {
             log::debug!("SOCKS5 UDP ASSOCIATE ended: {}", e);
         }
-    });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(())
+    }))
 }
 
 /// Build a SOCKS5 error response.

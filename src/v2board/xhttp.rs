@@ -218,15 +218,14 @@ impl XHttpServerHandler {
         let connection = h2::server::handshake(server_stream)
             .await
             .map_err(h2_error)?;
-        spawn_h2_accept_loop(
+        Ok(TcpServerSetupResult::connection_task(run_h2_accept_loop(
             connection,
             self.config.clone(),
             self.sessions.clone(),
             self.handler.clone(),
             self.resolver.clone(),
             peer_addr,
-        );
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        )))
     }
 
     async fn run_http1(
@@ -247,7 +246,7 @@ impl XHttpServerHandler {
                 true,
             )
             .await?;
-            return Ok(TcpServerSetupResult::AlreadyHandled);
+            return Ok(TcpServerSetupResult::completed());
         }
         let meta = extract_meta(
             &self.config,
@@ -282,7 +281,7 @@ impl XHttpServerHandler {
                     true,
                 )
                 .await?;
-                Ok(TcpServerSetupResult::AlreadyHandled)
+                Ok(TcpServerSetupResult::completed())
             }
             XHttpRequestKind::StreamUp { session_id } => {
                 let body = read_http1_body(
@@ -307,7 +306,7 @@ impl XHttpServerHandler {
                     true,
                 )
                 .await?;
-                Ok(TcpServerSetupResult::AlreadyHandled)
+                Ok(TcpServerSetupResult::completed())
             }
             XHttpRequestKind::StreamDown { session_id } => {
                 let reader = take_session_reader(
@@ -384,36 +383,40 @@ impl TcpServerHandler for XHttpServerHandler {
     }
 }
 
-fn spawn_h2_accept_loop<T>(
+async fn run_h2_accept_loop<T>(
     mut connection: h2::server::Connection<T, Bytes>,
     config: XHttpConfig,
     sessions: SessionMap,
     handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<SocketAddr>,
-) where
+) -> io::Result<()>
+where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
-        while let Some(result) = connection.accept().await {
-            let (request, respond) = match result {
-                Ok(parts) => parts,
-                Err(e) => {
-                    log::debug!("xhttp h2 connection stopped: {e}");
-                    break;
-                }
-            };
-            tokio::spawn(handle_h2_request(
-                request,
-                respond,
-                config.clone(),
-                sessions.clone(),
-                handler.clone(),
-                resolver.clone(),
-                peer_addr,
-            ));
-        }
-    });
+    let mut requests = tokio::task::JoinSet::new();
+    while let Some(result) = connection.accept().await {
+        while requests.try_join_next().is_some() {}
+        let (request, respond) = match result {
+            Ok(parts) => parts,
+            Err(e) => {
+                log::debug!("xhttp h2 connection stopped: {e}");
+                break;
+            }
+        };
+        requests.spawn(handle_h2_request(
+            request,
+            respond,
+            config.clone(),
+            sessions.clone(),
+            handler.clone(),
+            resolver.clone(),
+            peer_addr,
+        ));
+    }
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_h2_request(
@@ -506,9 +509,7 @@ async fn handle_h2_request_result(
             let mut setup_result = handler
                 .setup_server_stream_with_peer_addr(stream, peer_addr)
                 .await?;
-            if !matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-                setup_result.set_need_initial_flush(true);
-            }
+            setup_result.set_need_initial_flush(true);
             handle_server_setup_result(setup_result, resolver, peer_addr).await?;
         }
         XHttpRequestKind::StreamOne => {
@@ -527,9 +528,7 @@ async fn handle_h2_request_result(
             let mut setup_result = handler
                 .setup_server_stream_with_peer_addr(stream, peer_addr)
                 .await?;
-            if !matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-                setup_result.set_need_initial_flush(true);
-            }
+            setup_result.set_need_initial_flush(true);
             handle_server_setup_result(setup_result, resolver, peer_addr).await?;
         }
     }

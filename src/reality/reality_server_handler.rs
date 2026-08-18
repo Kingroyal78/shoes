@@ -98,10 +98,11 @@ pub async fn setup_reality_server_stream(
 
     if !parsed_client_hello.supports_tls13 {
         log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
-        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "REALITY: Client does not support TLS 1.3, forwarding to dest",
+        return Ok(forward_to_dest_task(
+            server_stream,
+            dest_stream,
+            vec![],
+            Bytes::new(),
         ));
     }
 
@@ -166,34 +167,23 @@ pub async fn setup_reality_server_stream(
                             "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
                             target.dest
                         );
-                        start_forward_to_dest(
+                        return Ok(forward_to_dest_task(
                             server_stream,
                             dest_stream,
                             new_records,
                             deframer.into_remaining_data(),
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            format!(
-                                "REALITY: Dest {} does not support TLS 1.3, forwarding to dest",
-                                target.dest
-                            ),
                         ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
                     log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
-                    start_forward_to_dest(
+                    return Ok(forward_to_dest_task(
                         server_stream,
                         dest_stream,
                         new_records,
                         deframer.into_remaining_data(),
-                    );
-                    return Err(std::io::Error::other(format!(
-                        "REALITY: Failed to parse dest ServerHello: {}, forwarding to dest",
-                        e
-                    )));
+                    ));
                 }
             }
         }
@@ -233,10 +223,11 @@ pub async fn setup_reality_server_stream(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
         );
-        start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "REALITY: Dest TLS handshake incomplete, forwarding to dest",
+        return Ok(forward_to_dest_task(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
         ));
     }
 
@@ -254,13 +245,11 @@ pub async fn setup_reality_server_stream(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
             );
-            start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
-
-            // Return auth error with forwarding note so clients see a meaningful error
-            // instead of connecting to the camouflage site and getting "reality verification failed".
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("REALITY: Auth failed ({}), forwarding to dest", e),
+            return Ok(forward_to_dest_task(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_data,
             ));
         }
 
@@ -314,37 +303,35 @@ pub async fn setup_reality_server_stream(
     };
 
     if let Ok(ref mut setup_result) = target_setup_result {
-        if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-            return target_setup_result;
-        }
         setup_result.set_need_initial_flush(true);
     }
 
     target_setup_result
 }
 
-/// Forward dest records to client and spawn bidirectional copy.
+/// Forward dest records to the client and return the owned copy task.
 ///
 /// Used when Reality auth fails or client doesn't support TLS 1.3.
-/// Forwards any already-read dest records to the client, then spawns
-/// bidirectional copy for the rest of the connection.
-fn start_forward_to_dest(
+/// Forwards any already-read dest records to the client, then copies the rest
+/// of the connection. The accepting path owns this future, so cancellation and
+/// connection accounting cover the camouflage fallback too.
+fn forward_to_dest_task(
     mut client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
-) {
-    tokio::spawn(async move {
+) -> TcpServerSetupResult {
+    TcpServerSetupResult::connection_task(async move {
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
                 let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-                return;
+                return Err(e);
             }
             if let Err(e) = client_stream.flush().await {
                 log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
                 let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-                return;
+                return Err(e);
             }
         }
 
@@ -353,7 +340,7 @@ fn start_forward_to_dest(
         {
             log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
             let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-            return;
+            return Err(e);
         }
 
         log::debug!(
@@ -372,8 +359,6 @@ fn start_forward_to_dest(
 
         let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
 
-        if let Err(e) = result {
-            log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
-        }
-    });
+        result.map(|_| ())
+    })
 }

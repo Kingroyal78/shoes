@@ -9,8 +9,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use super::virtual_stream::{
-    InboundChannels, InboundEvent, InboundTerminal, OutboundCommand, ReceiveBudget,
-    SmuxV2FlowControl, VirtualStream, WindowUpdate,
+    BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
+    OutboundCommand, ReceiveBudget, ReceiveBudgetScope, SmuxV2FlowControl, VirtualStream,
+    WindowUpdate,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -36,6 +37,37 @@ const UPDATE_PAYLOAD_SIZE: usize = 8;
 /// previously only visible at debug level -- which is off in production.
 pub static STREAMS_DROPPED_BY_BACKPRESSURE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+pub static STREAMS_DROPPED_BY_STREAM_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static STREAMS_DROPPED_BY_SESSION_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static STREAMS_DROPPED_BY_LISTENER_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static STREAMS_DROPPED_BY_FRAME_QUEUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn record_backpressure_drop(cause: BackpressureCause) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STREAMS_DROPPED_BY_BACKPRESSURE.fetch_add(1, Relaxed);
+    match cause {
+        BackpressureCause::Bytes(ReceiveBudgetScope::Stream) => {
+            STREAMS_DROPPED_BY_STREAM_BYTES.fetch_add(1, Relaxed)
+        }
+        BackpressureCause::Bytes(ReceiveBudgetScope::Session) => {
+            STREAMS_DROPPED_BY_SESSION_BYTES.fetch_add(1, Relaxed)
+        }
+        BackpressureCause::Bytes(ReceiveBudgetScope::Listener) => {
+            STREAMS_DROPPED_BY_LISTENER_BYTES.fetch_add(1, Relaxed)
+        }
+        BackpressureCause::FrameQueue => STREAMS_DROPPED_BY_FRAME_QUEUE.fetch_add(1, Relaxed),
+    };
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BackpressureCause {
+    Bytes(ReceiveBudgetScope),
+    FrameQueue,
+}
 
 /// Default ceiling on queued inbound bytes for one logical stream.
 ///
@@ -191,7 +223,7 @@ impl TcpServerHandler for SmuxServerHandler {
         let resolver = self.resolver.clone();
         let config = self.config;
         let budget = self.listener_budget.clone();
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config, budget).await
             {
                 log::debug!(
@@ -199,8 +231,8 @@ impl TcpServerHandler for SmuxServerHandler {
                     config.version
                 );
             }
-        });
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 }
 
@@ -262,13 +294,13 @@ impl TcpServerHandler for SmuxV1ServerHandler {
         let inner = self.inner.clone();
         let resolver = self.resolver.clone();
         let budget = self.listener_budget.clone();
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             if let Err(error) = serve_smux(stream, inner, resolver, peer_addr, config, budget).await
             {
                 log::debug!("smux v1 session finished with error: {error}");
             }
-        });
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 }
 
@@ -313,28 +345,85 @@ fn parse_header(
     Ok((command, stream_id, length))
 }
 
+/// Frame decoding state that outlives the future reading into it.
+///
+/// The session loop has to service budget evictions while a read is in
+/// flight, and `tokio::select!` drops whichever branch loses. A decoder that
+/// kept its partial header or payload on the future's own stack would take
+/// those bytes with it, leaving the next read to parse the middle of a frame
+/// and killing a session that did nothing wrong. Holding the state here makes
+/// the read resumable, so cancelling it costs nothing.
+#[derive(Default)]
+struct FrameReader {
+    header: [u8; HEADER_SIZE],
+    header_read: usize,
+    parsed: Option<(u8, u32, usize)>,
+    payload: Vec<u8>,
+    payload_read: usize,
+}
+
+impl FrameReader {
+    async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        version: u8,
+        max_payload: usize,
+    ) -> io::Result<Option<Frame>> {
+        while self.header_read < HEADER_SIZE {
+            let read = reader.read(&mut self.header[self.header_read..]).await?;
+            if read == 0 {
+                return if self.header_read == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("smux v{version} frame header truncated"),
+                    ))
+                };
+            }
+            self.header_read += read;
+        }
+        let (command, stream_id, length) = match self.parsed {
+            Some(parsed) => parsed,
+            None => {
+                let parsed = parse_header(self.header, version, max_payload)?;
+                // Not `vec![0u8; length]`: every byte is overwritten before
+                // anyone can observe one, so zeroing first is a memset per
+                // frame on the busiest path in the process.
+                self.payload = allocate_vec(parsed.2);
+                self.parsed = Some(parsed);
+                parsed
+            }
+        };
+        while self.payload_read < length {
+            let read = reader.read(&mut self.payload[self.payload_read..]).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("smux v{version} frame payload truncated"),
+                ));
+            }
+            self.payload_read += read;
+        }
+        self.header_read = 0;
+        self.parsed = None;
+        self.payload_read = 0;
+        Ok(Some(Frame {
+            command,
+            stream_id,
+            payload: std::mem::take(&mut self.payload),
+        }))
+    }
+}
+
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     version: u8,
     max_payload: usize,
 ) -> io::Result<Option<Frame>> {
-    let mut header = [0u8; HEADER_SIZE];
-    let first = reader.read(&mut header[..1]).await?;
-    if first == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut header[1..]).await?;
-    let (command, stream_id, length) = parse_header(header, version, max_payload)?;
-    // Not `vec![0u8; length]`: `read_exact` overwrites every byte before anyone
-    // can observe one, so zeroing first is a memset per frame on the busiest
-    // path in the process.
-    let mut payload = allocate_vec(length);
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(Frame {
-        command,
-        stream_id,
-        payload,
-    }))
+    FrameReader::default()
+        .read(reader, version, max_payload)
+        .await
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -362,6 +451,7 @@ struct StreamState {
     /// Charges this stream's queued bytes, and through its parent the
     /// session's and the listener's.
     budget: Arc<ReceiveBudget>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 async fn serve_smux(
@@ -389,6 +479,7 @@ async fn serve_smux(
         Ok::<(), io::Error>(())
     });
     let (updates_tx, mut updates_rx) = mpsc::channel::<WindowUpdate>(limits.outbound_frame_queue);
+    let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel::<BudgetEviction>();
     let receive_budget = Arc::new(ReceiveBudget::with_parent(
         config.max_receive_buffer,
         listener_budget,
@@ -403,11 +494,8 @@ async fn serve_smux(
     } else {
         config.max_stream_receive_buffer
     };
-    // The writer cannot be ended by dropping senders alone: an inner handler
-    // that takes a logical stream, spawns it and returns `AlreadyHandled`
-    // keeps an outbound clone in a task this session cannot reach, so the
-    // channel never closes however much of its own work the session cancels.
-    // A signal ends it regardless of who else is still holding a sender.
+    // The writer has an explicit shutdown signal so its lifetime does not
+    // depend on every nested sender clone disappearing in a particular order.
     let writer_shutdown = Arc::new(tokio::sync::Notify::new());
     let writer_shutdown_signal = writer_shutdown.clone();
     let mut writer_task = tokio::spawn(async move {
@@ -528,18 +616,39 @@ async fn serve_smux(
     // for a logical stream whose physical session is gone: it has no transport
     // left to carry anything to the client.
     let mut stream_tasks = tokio::task::JoinSet::new();
+    let mut frame_reader = FrameReader::default();
     let read_result = loop {
-        let read = read_frame(&mut reader, version, limits.max_frame_payload);
-        let frame_result = if let Some(timeout) = config.keepalive_timeout {
-            match tokio::time::timeout(timeout, read).await {
-                Ok(result) => result,
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("smux v{version} keepalive timeout"),
-                )),
+        let frame_result = tokio::select! {
+            biased;
+            Some(eviction) = eviction_rx.recv() => {
+                if let Some(state) = streams.remove(&eviction.stream_id) {
+                    record_backpressure_drop(BackpressureCause::Bytes(eviction.scope));
+                    if let Some(task) = state.task {
+                        task.abort();
+                    }
+                    if let Some(terminal) = state.terminal {
+                        let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
+                            io::ErrorKind::OutOfMemory,
+                            format!("smux v{version} {} receive budget evicted the largest buffered stream", eviction.scope),
+                        )));
+                    }
+                }
+                continue;
             }
-        } else {
-            read.await
+            result = async {
+                let read = frame_reader.read(&mut reader, version, limits.max_frame_payload);
+                if let Some(timeout) = config.keepalive_timeout {
+                    match tokio::time::timeout(timeout, read).await {
+                        Ok(result) => result,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("smux v{version} keepalive timeout"),
+                        )),
+                    }
+                } else {
+                    read.await
+                }
+            } => result,
         };
         let frame = match frame_result {
             Ok(Some(frame)) => frame,
@@ -584,10 +693,13 @@ async fn serve_smux(
                         inbound: Some(inbound_tx),
                         terminal: Some(terminal_tx),
                         flow: flow.clone(),
-                        budget: Arc::new(ReceiveBudget::with_parent(
+                        budget: Arc::new(ReceiveBudget::stream(
                             stream_receive_buffer,
-                            Some(receive_budget.clone()),
+                            receive_budget.clone(),
+                            frame.stream_id,
+                            eviction_tx.clone(),
                         )),
+                        task: None,
                     },
                 );
                 let mut logical = if let Some(flow) = flow {
@@ -611,7 +723,7 @@ async fn serve_smux(
                 logical.set_drop_close_permit(close_permit);
                 let inner = inner.clone();
                 let resolver = resolver.clone();
-                stream_tasks.spawn(async move {
+                let task = stream_tasks.spawn(async move {
                     if let Err(error) = process_stream(logical, inner, resolver, peer_addr).await {
                         log::debug!(
                             "smux v{version} logical stream {} finished with error: {error}",
@@ -619,13 +731,17 @@ async fn serve_smux(
                         );
                     }
                 });
+                streams
+                    .get_mut(&frame.stream_id)
+                    .expect("stream state was just inserted")
+                    .task = Some(task);
             }
             CMD_PSH => {
                 // An unknown stream id is an ordinary race, not an error: the
                 // server closed the logical stream and sent FIN while this frame
                 // was already on the wire. Discard the payload -- failing the
                 // session here would punish every other stream sharing it.
-                let mut overran_queue = false;
+                let mut backpressure = None;
                 if let Some(inbound) = streams.get_mut(&frame.stream_id)
                     && !frame.payload.is_empty()
                     && let Some(sender) = &inbound.inbound
@@ -641,14 +757,15 @@ async fn serve_smux(
                         Ok(data) => match sender.try_send(InboundEvent::Data(data)) {
                             Ok(()) => {}
                             Err(TrySendError::Closed(_)) => inbound.inbound = None,
-                            Err(TrySendError::Full(_)) => overran_queue = true,
+                            Err(TrySendError::Full(_)) => {
+                                backpressure = Some(BackpressureCause::FrameQueue)
+                            }
                         },
-                        Err(_) => overran_queue = true,
+                        Err(error) => backpressure = Some(BackpressureCause::Bytes(error.scope)),
                     }
                 }
-                if overran_queue {
-                    STREAMS_DROPPED_BY_BACKPRESSURE
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(cause) = backpressure {
+                    record_backpressure_drop(cause);
                     // This stream is not draining as fast as its peer is
                     // sending, and smux v1 has no per-stream window to push
                     // back with. Dropping the frame would leave a hole in the
@@ -658,12 +775,27 @@ async fn serve_smux(
                     // same connection over a condition caused by one of them,
                     // and the collateral was invisible because those streams
                     // report their failures at debug level.
-                    if let Some(state) = streams.remove(&frame.stream_id)
-                        && let Some(terminal) = state.terminal
-                    {
-                        let _ = terminal.send(InboundTerminal::Failed(format!(
-                            "smux v{version} logical inbound queue is full"
-                        )));
+                    if let Some(state) = streams.remove(&frame.stream_id) {
+                        if let Some(task) = state.task {
+                            task.abort();
+                        }
+                        if let Some(terminal) = state.terminal {
+                            let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
+                                io::ErrorKind::OutOfMemory,
+                                match cause {
+                                    BackpressureCause::Bytes(scope) => {
+                                        format!(
+                                            "smux v{version} {scope} receive buffer limit exceeded"
+                                        )
+                                    }
+                                    BackpressureCause::FrameQueue => {
+                                        format!(
+                                            "smux v{version} logical inbound frame queue is full"
+                                        )
+                                    }
+                                },
+                            )));
+                        }
                     }
                     // Deliberately no close from here. The stream's own drop
                     // sends one through a permit reserved at SYN time, which
@@ -714,11 +846,15 @@ async fn serve_smux(
         }
     };
 
-    let failure = read_result
-        .as_ref()
-        .err()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("smux v{version} physical stream closed"));
+    let failure = read_result.as_ref().err().map_or_else(
+        || {
+            InboundFailure::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("smux v{version} physical stream closed"),
+            )
+        },
+        InboundFailure::from_error,
+    );
     for (_, stream) in streams {
         if let Some(terminal) = stream.terminal {
             let _ = terminal.send(InboundTerminal::Failed(failure.clone()));
@@ -741,13 +877,10 @@ async fn serve_smux(
     {
         stream_tasks.shutdown().await;
     }
-    // Whatever is left holding a drop-close permit at this point is not
-    // reachable from here -- an inner handler that detached the stream it was
-    // given, most concretely -- so waiting on the forwarder is waiting on
-    // something this session can no longer influence. Bounded by the same
-    // grace rather than by five seconds for that reason. Aborting it cannot
-    // orphan copy tasks: it only forwards close notifications, and the session
-    // is over.
+    // Every production handler now returns an owned connection future, so all
+    // permits should have been released above. Keep a bound here as an
+    // invariant guard: if a future implementation leaks ownership, teardown
+    // still cannot retain the physical connection forever.
     let close_result = match tokio::time::timeout(STREAM_SHUTDOWN_GRACE, &mut close_forwarder).await
     {
         Ok(joined) => {
@@ -760,21 +893,18 @@ async fn serve_smux(
             // outcome buried the real one -- the read result -- under a
             // timeout the session could do nothing about.
             close_forwarder.abort();
-            log::debug!(
-                "smux v{version} close forwarder outlived the streams this session owns; \
-                     an inner handler kept one"
-            );
+            log::debug!("smux v{version} close-forwarder ownership invariant violated");
             Ok(Ok(()))
         }
     };
     // Tell the writer to drain and stop. Signalled after the streams were
     // cancelled so the FINs their drops emit are already queued, and issued
-    // whether or not the forwarder finished, because the writer is held open by
-    // the same unreachable senders.
+    // whether or not the forwarder finished, because an invariant violation
+    // may still have left a sender alive.
     writer_shutdown.notify_one();
     let close_result = close_result?;
-    // Bound only the writer drain: the writer may be stuck behind a leaked
-    // outbound sender, and aborting it only releases the write half of the
+    // Bound only the writer drain: an ownership invariant violation may leave
+    // an outbound sender alive, and aborting only releases the write half of the
     // physical stream (the fd is owned by the reader side, which has already
     // finished and delivered per-stream shutdown events above).
     let writer_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer_task)
@@ -822,6 +952,8 @@ fn validate_config(config: SmuxServerConfig) -> io::Result<()> {
     }
     if config.max_receive_buffer == 0
         || config.max_receive_buffer > i32::MAX as usize
+        || config.max_stream_receive_buffer == 0
+        || config.max_stream_receive_buffer > config.max_receive_buffer
         || config.max_stream_buffer == 0
         || config.max_stream_buffer > i32::MAX as usize
         || config.max_stream_buffer > config.max_receive_buffer
@@ -930,7 +1062,7 @@ mod tests {
 
     #[derive(Default)]
     struct HoldingHandler {
-        held: Mutex<Vec<Box<dyn AsyncStream>>>,
+        held: Mutex<Vec<oneshot::Sender<()>>>,
         ready: Notify,
     }
 
@@ -946,12 +1078,17 @@ mod tests {
             &self,
             stream: Box<dyn AsyncStream>,
         ) -> io::Result<TcpServerSetupResult> {
+            let (release_tx, release_rx) = oneshot::channel();
             self.held
                 .lock()
                 .expect("holding handler mutex poisoned")
-                .push(stream);
+                .push(release_tx);
             self.ready.notify_one();
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::connection_task(async move {
+                let _stream = stream;
+                let _ = release_rx.await;
+                Ok(())
+            }))
         }
     }
 
@@ -1016,6 +1153,18 @@ mod tests {
                 ..SmuxServerConfig::default()
             })
             .expect_err("oversized channel must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_or_impossible_stream_receive_budget() {
+        for max_stream_receive_buffer in [0, 4 * 1024 * 1024 + 1] {
+            let error = validate_config(SmuxServerConfig {
+                max_stream_receive_buffer,
+                ..SmuxServerConfig::default()
+            })
+            .expect_err("stream receive budget must fit inside its session");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
     }
@@ -1196,7 +1345,7 @@ mod tests {
     /// takes down every stream the same client has open, which is the
     /// collateral this budget exists to bound rather than to cause.
     #[tokio::test]
-    async fn a_session_out_of_receive_budget_drops_a_stream_not_itself() {
+    async fn session_pressure_drops_the_largest_debtor_not_the_next_sender() {
         let (mut client, server) = tokio::io::duplex(256);
         let handler = Arc::new(HoldingHandler::default());
         let session = tokio::spawn(serve_smux(
@@ -1210,8 +1359,9 @@ mod tests {
                     max_frame_payload: 4,
                     ..SmuxLimits::default()
                 },
-                max_receive_buffer: 4,
-                max_stream_buffer: 4,
+                max_receive_buffer: 5,
+                max_stream_buffer: 5,
+                max_stream_receive_buffer: 5,
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1223,12 +1373,12 @@ mod tests {
                 .unwrap();
             handler.ready.notified().await;
         }
-        // The session budget is four bytes, so the second of these has nowhere
-        // to go even though its own stream has barely used anything.
-        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"abc")
+        // Stream 1 owns four of the five bytes. Stream 2's two-byte frame
+        // applies pressure, but it is not the debtor and must survive.
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 1, b"abcd")
             .await
             .unwrap();
-        write_frame(&mut client, VERSION_V1, CMD_PSH, 2, b"def")
+        write_frame(&mut client, VERSION_V1, CMD_PSH, 2, b"ef")
             .await
             .unwrap();
 
@@ -1250,6 +1400,116 @@ mod tests {
             .await
             .unwrap()
             .expect("the session outlives running out of queue space");
+    }
+
+    /// A listener-scope eviction is delivered to the read loop of whichever
+    /// session owns the debtor, which is normally *not* the session that ran
+    /// out of budget. That loop may be parked halfway through a frame at the
+    /// time, so handling the eviction must not discard the bytes it already
+    /// consumed: losing them desynchronises the framing and kills the whole
+    /// session, which is the collateral the eviction exists to avoid.
+    #[tokio::test]
+    async fn a_listener_eviction_does_not_desynchronise_the_victims_frame_reader() {
+        let listener = Arc::new(ReceiveBudget::new(8));
+        let config = SmuxServerConfig {
+            limits: SmuxLimits {
+                inbound_frames_per_stream: 4,
+                max_frame_payload: 8,
+                ..SmuxLimits::default()
+            },
+            max_receive_buffer: 8,
+            max_stream_buffer: 8,
+            max_stream_receive_buffer: 8,
+            ..SmuxServerConfig::default()
+        };
+
+        let (mut victim_client, victim_server) = tokio::io::duplex(256);
+        let victim_handler = Arc::new(HoldingHandler::default());
+        let victim = tokio::spawn(serve_smux(
+            Box::new(TestStream(victim_server)),
+            victim_handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            config,
+            Some(listener.clone()),
+        ));
+
+        let (mut greedy_client, greedy_server) = tokio::io::duplex(256);
+        let greedy_handler = Arc::new(HoldingHandler::default());
+        let greedy = tokio::spawn(serve_smux(
+            Box::new(TestStream(greedy_server)),
+            greedy_handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            config,
+            Some(listener),
+        ));
+
+        // The victim parks six of the listener's eight bytes, making it the
+        // debtor any listener-scope eviction will pick.
+        write_frame(&mut victim_client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        victim_handler.ready.notified().await;
+        write_frame(&mut victim_client, VERSION_V1, CMD_PSH, 1, b"abcdef")
+            .await
+            .unwrap();
+        // Opening a second stream proves the payload above was consumed and
+        // charged before the eviction is provoked.
+        write_frame(&mut victim_client, VERSION_V1, CMD_SYN, 2, &[])
+            .await
+            .unwrap();
+        victim_handler.ready.notified().await;
+
+        // Park the victim's reader inside a frame: announce four payload bytes
+        // and deliver two.
+        let mut header = [0u8; HEADER_SIZE];
+        header[0] = VERSION_V1;
+        header[1] = CMD_PSH;
+        header[2..4].copy_from_slice(&4u16.to_le_bytes());
+        header[4..8].copy_from_slice(&1u32.to_le_bytes());
+        victim_client.write_all(&header).await.unwrap();
+        victim_client.write_all(b"gh").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A different session now runs the listener budget out. It is not the
+        // debtor, so the eviction lands on the victim's parked stream.
+        write_frame(&mut greedy_client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        greedy_handler.ready.notified().await;
+        write_frame(&mut greedy_client, VERSION_V1, CMD_PSH, 1, b"ijk")
+            .await
+            .unwrap();
+
+        // Complete the interrupted frame and open another stream. The trailing
+        // payload belongs to an evicted stream and is discarded, but the frame
+        // after it must still be understood.
+        victim_client.write_all(b"ij").await.unwrap();
+        write_frame(&mut victim_client, VERSION_V1, CMD_SYN, 3, &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            victim_handler.ready.notified(),
+        )
+        .await
+        .expect("evicting a stream must not cost the session its framing");
+
+        victim_handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        greedy_handler
+            .held
+            .lock()
+            .expect("holding handler mutex poisoned")
+            .clear();
+        victim_client.shutdown().await.unwrap();
+        greedy_client.shutdown().await.unwrap();
+        let _ = victim.await.unwrap();
+        let _ = greedy.await.unwrap();
     }
 
     /// One stream's congestion must not eat the room its neighbours need, so
@@ -1331,6 +1591,7 @@ mod tests {
                 },
                 max_receive_buffer: 8,
                 max_stream_buffer: 4,
+                max_stream_receive_buffer: 8,
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1444,6 +1705,7 @@ mod tests {
                 },
                 max_receive_buffer: 64,
                 max_stream_buffer: 8,
+                max_stream_receive_buffer: 64,
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1506,6 +1768,7 @@ mod tests {
                 },
                 max_receive_buffer: 256,
                 max_stream_buffer: 4,
+                max_stream_receive_buffer: 256,
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1567,35 +1830,31 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct DetachingHandler {
+    struct OwnedPendingHandler {
         ready: Notify,
     }
 
     #[async_trait]
-    impl TcpServerHandler for DetachingHandler {
+    impl TcpServerHandler for OwnedPendingHandler {
         async fn setup_server_stream(
             &self,
             stream: Box<dyn AsyncStream>,
         ) -> io::Result<TcpServerSetupResult> {
-            // What the h2mux magic-destination branch does: carry the logical
-            // stream off into a task of its own and report the work as handled.
-            // The session's own bookkeeping then sees that stream finish, while
-            // its drop-close permit and outbound sender stay alive somewhere
-            // the session cannot reach -- so nothing it cancels will close the
-            // channels its forwarder and writer are waiting on.
-            tokio::spawn(async move {
+            // The returned task owns the logical stream. Dropping the parent
+            // session therefore drops this future and closes the stream too.
+            self.ready.notify_one();
+            Ok(TcpServerSetupResult::connection_task(async move {
                 let _held = stream;
                 std::future::pending::<()>().await;
-            });
-            self.ready.notify_one();
-            Ok(TcpServerSetupResult::AlreadyHandled)
+                Ok(())
+            }))
         }
     }
 
     #[tokio::test]
-    async fn a_detached_inner_session_does_not_hold_the_sessions_teardown_open() {
+    async fn an_owned_pending_inner_session_is_cancelled_during_teardown() {
         let (mut client, server) = tokio::io::duplex(4096);
-        let handler = Arc::new(DetachingHandler::default());
+        let handler = Arc::new(OwnedPendingHandler::default());
         let session = tokio::spawn(serve_smux(
             Box::new(TestStream(server)),
             handler.clone(),
@@ -1613,7 +1872,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), session)
             .await
-            .expect("a detached inner session must not hold the session's teardown open")
+            .expect("an owned inner session must be cancelled during teardown")
             .expect("the session task must not panic");
 
         if let Err(error) = outcome {

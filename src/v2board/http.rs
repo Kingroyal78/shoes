@@ -157,7 +157,7 @@ impl V2RayHttp2ServerHandler {
         let connection = h2::server::handshake(server_stream)
             .await
             .map_err(h2_error)?;
-        spawn_h2_accept_loop(
+        Ok(TcpServerSetupResult::connection_task(run_h2_accept_loop(
             connection,
             H2TransportSettings {
                 hosts: self.hosts.clone(),
@@ -168,8 +168,7 @@ impl V2RayHttp2ServerHandler {
             self.handler.clone(),
             self.resolver.clone(),
             peer_addr,
-        );
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        )))
     }
 }
 
@@ -199,35 +198,39 @@ struct H2TransportSettings {
     response_headers: HashMap<String, String>,
 }
 
-fn spawn_h2_accept_loop<T>(
+async fn run_h2_accept_loop<T>(
     mut connection: h2::server::Connection<T, Bytes>,
     settings: H2TransportSettings,
     handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<SocketAddr>,
-) where
+) -> io::Result<()>
+where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
-        while let Some(result) = connection.accept().await {
-            let (request, respond) = match result {
-                Ok(parts) => parts,
-                Err(e) => {
-                    log::debug!("v2ray http2 transport connection stopped: {e}");
-                    break;
-                }
-            };
+    let mut requests = tokio::task::JoinSet::new();
+    while let Some(result) = connection.accept().await {
+        while requests.try_join_next().is_some() {}
+        let (request, respond) = match result {
+            Ok(parts) => parts,
+            Err(e) => {
+                log::debug!("v2ray http2 transport connection stopped: {e}");
+                break;
+            }
+        };
 
-            tokio::spawn(handle_h2_request(
-                request,
-                respond,
-                settings.clone(),
-                handler.clone(),
-                resolver.clone(),
-                peer_addr,
-            ));
-        }
-    });
+        requests.spawn(handle_h2_request(
+            request,
+            respond,
+            settings.clone(),
+            handler.clone(),
+            resolver.clone(),
+            peer_addr,
+        ));
+    }
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_h2_request(
@@ -278,9 +281,7 @@ async fn handle_h2_request_result(
     let mut setup_result = handler
         .setup_server_stream_with_peer_addr(stream, peer_addr)
         .await?;
-    if !matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-        setup_result.set_need_initial_flush(true);
-    }
+    setup_result.set_need_initial_flush(true);
     handle_server_setup_result(setup_result, resolver, peer_addr).await
 }
 
@@ -680,7 +681,7 @@ mod tests {
             server_stream.read_exact(&mut buf).await?;
             *self.captured.lock() = buf.to_vec();
             server_stream.shutdown().await?;
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 
@@ -767,10 +768,14 @@ mod tests {
         let (client, server) = tokio::io::duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            handler
+            let result = handler
                 .setup_server_stream(Box::new(TestStream(server)))
                 .await
                 .unwrap();
+            let TcpServerSetupResult::ConnectionTask(task) = result else {
+                panic!("HTTP/2 connection must return an owned connection task")
+            };
+            task.await.unwrap();
         });
 
         let (mut send_request, connection) =
@@ -814,10 +819,14 @@ mod tests {
         let (client, server) = tokio::io::duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            handler
+            let result = handler
                 .setup_server_stream(Box::new(TestStream(server)))
                 .await
                 .unwrap();
+            let TcpServerSetupResult::ConnectionTask(task) = result else {
+                panic!("HTTP/2 connection must return an owned connection task")
+            };
+            task.await.unwrap();
         });
 
         let (mut send_request, connection) =

@@ -683,7 +683,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     let udp_enabled = self.udp_enabled;
                     let outbound_dispatcher = self.outbound_dispatcher.clone();
 
-                    tokio::spawn(async move {
+                    return Ok(TcpServerSetupResult::connection_task(async move {
                         if let Err(e) = handle_h2mux_session(
                             Box::new(vmess_stream),
                             None, // initial data already fed to vmess_stream
@@ -696,9 +696,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
                         {
                             log::debug!("VMess h2mux session ended: {}", e);
                         }
-                    });
-
-                    return Ok(TcpServerSetupResult::AlreadyHandled);
+                        Ok(())
+                    }));
                 }
 
                 if !enable_chunk_stream {

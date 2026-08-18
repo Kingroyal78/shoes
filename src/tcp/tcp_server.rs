@@ -339,9 +339,27 @@ fn max_concurrent_streams() -> Option<usize> {
 struct LiveStreamGuard;
 
 impl LiveStreamGuard {
-    fn new() -> Self {
-        LIVE_STREAMS.fetch_add(1, Ordering::Relaxed);
-        Self
+    fn try_new() -> std::io::Result<Self> {
+        let limit = max_concurrent_streams();
+        LIVE_STREAMS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                if limit.is_some_and(|limit| at_stream_limit(live, limit)) {
+                    None
+                } else {
+                    Some(live + 1)
+                }
+            })
+            .map_err(|live| {
+                STREAMS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                let limit = limit.expect("fetch_update only refuses when a limit exists");
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "refused: already serving {live} streams, the configured maximum is {limit}"
+                    ),
+                )
+            })?;
+        Ok(Self)
     }
 }
 
@@ -360,16 +378,7 @@ pub async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
-    if let Some(limit) = max_concurrent_streams()
-        && at_stream_limit(LIVE_STREAMS.load(Ordering::Relaxed), limit)
-    {
-        STREAMS_REFUSED.fetch_add(1, Ordering::Relaxed);
-        return Err(StreamFailure::Handshake(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!("refused: already serving the configured maximum of {limit} streams"),
-        )));
-    }
-    let _live = LiveStreamGuard::new();
+    let _live = LiveStreamGuard::try_new().map_err(StreamFailure::Handshake)?;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
         setup_server_stream(stream, server_handler, peer_addr),
@@ -391,12 +400,24 @@ where
         }
     };
 
-    handle_server_setup_result(setup_result, resolver, peer_addr)
+    handle_server_setup_result_inner(setup_result, resolver, peer_addr)
         .await
         .map_err(StreamFailure::Proxy)
 }
 
 pub async fn handle_server_setup_result(
+    setup_result: TcpServerSetupResult,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    // Multiplexing adapters enter here with logical streams that did not pass
+    // through `process_stream`. Give them the same admission, accounting and
+    // cancellation lifetime as socket-accepted streams.
+    let _live = LiveStreamGuard::try_new()?;
+    handle_server_setup_result_inner(setup_result, resolver, peer_addr).await
+}
+
+async fn handle_server_setup_result_inner(
     mut setup_result: TcpServerSetupResult,
     resolver: Arc<dyn Resolver>,
     mut peer_addr: Option<SocketAddr>,
@@ -715,11 +736,7 @@ pub async fn handle_server_setup_result(
                 )
                 .await
             }
-            TcpServerSetupResult::AlreadyHandled => {
-                // Connection is being handled by a spawned task (e.g., Reality fallback).
-                // Nothing more to do here.
-                Ok(())
-            }
+            TcpServerSetupResult::ConnectionTask(task) => task.await,
         };
     }
 }
@@ -3304,6 +3321,40 @@ mod tests {
 
         assert_eq!(*recorder.alive_ips.lock(), vec![proxied_peer.ip()]);
         assert_eq!(*recorder.removed_ips.lock(), vec![proxied_peer.ip()]);
+    }
+
+    #[tokio::test]
+    async fn connection_task_is_owned_and_cancelled_by_the_accepting_path() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_dropped = dropped.clone();
+        let task_started = started.clone();
+        let owner = tokio::spawn(handle_server_setup_result(
+            TcpServerSetupResult::connection_task(async move {
+                let _drop_flag = DropFlag(task_dropped);
+                task_started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(())
+            }),
+            Arc::new(NoopResolver),
+            None,
+        ));
+
+        started.notified().await;
+        assert!(!dropped.load(Ordering::Acquire));
+        owner.abort();
+        let _ = owner.await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "cancelling the accepting path must drop the connection future"
+        );
     }
 
     #[test]

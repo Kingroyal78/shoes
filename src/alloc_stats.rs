@@ -93,12 +93,21 @@ pub fn start_allocator_stats_logger() {
                 crate::tcp::tcp_server::STREAMS_REFUSED.load(std::sync::atomic::Ordering::Relaxed);
             let backpressure_drops = crate::ss_plugins::transport::STREAMS_DROPPED_BY_BACKPRESSURE
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let stream_byte_drops = crate::ss_plugins::transport::STREAMS_DROPPED_BY_STREAM_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let session_byte_drops = crate::ss_plugins::transport::STREAMS_DROPPED_BY_SESSION_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let listener_byte_drops =
+                crate::ss_plugins::transport::STREAMS_DROPPED_BY_LISTENER_BYTES
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            let frame_queue_drops = crate::ss_plugins::transport::STREAMS_DROPPED_BY_FRAME_QUEUE
+                .load(std::sync::atomic::Ordering::Relaxed);
             let udp_routers =
                 crate::routing::LIVE_UDP_ROUTERS.load(std::sync::atomic::Ordering::Relaxed);
             let udp_routers_read_eof = crate::routing::LIVE_UDP_ROUTERS_READ_EOF
                 .load(std::sync::atomic::Ordering::Relaxed);
             log::info!(
-                "jemalloc bytes: allocated={allocated} active={active} resident={resident} mapped={mapped} retained={retained} streams={streams} refused={refused} backpressure_drops={backpressure_drops} udp_routers={udp_routers} udp_routers_read_eof={udp_routers_read_eof}"
+                "jemalloc bytes: allocated={allocated} active={active} resident={resident} mapped={mapped} retained={retained} streams={streams} refused={refused} backpressure_drops={backpressure_drops} stream_byte_drops={stream_byte_drops} session_byte_drops={session_byte_drops} listener_byte_drops={listener_byte_drops} frame_queue_drops={frame_queue_drops} udp_routers={udp_routers} udp_routers_read_eof={udp_routers_read_eof}"
             );
         }
     });

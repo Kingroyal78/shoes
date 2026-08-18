@@ -193,7 +193,7 @@ impl TcpServerHandler for SnellServerHandler {
                 let resolver = self.resolver.clone();
                 let udp_enabled = self.udp_enabled;
 
-                tokio::spawn(async move {
+                return Ok(TcpServerSetupResult::connection_task(async move {
                     if let Err(e) = handle_h2mux_session(
                         server_stream,
                         None,
@@ -206,9 +206,8 @@ impl TcpServerHandler for SnellServerHandler {
                     {
                         debug!("Snell h2mux session ended: {}", e);
                     }
-                });
-
-                return Ok(TcpServerSetupResult::AlreadyHandled);
+                    Ok(())
+                }));
             }
 
             Ok(TcpServerSetupResult::TcpForward {

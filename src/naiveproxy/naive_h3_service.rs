@@ -195,6 +195,7 @@ pub async fn start_naive_h3_server(
         peer_addr: None,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        connection_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
     });
 
     let mut join_handles = Vec::with_capacity(endpoints.len());

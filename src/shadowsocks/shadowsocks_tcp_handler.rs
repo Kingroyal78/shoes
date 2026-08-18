@@ -691,7 +691,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             let initial_data = stream_reader.unparsed_data_owned();
             let outbound_dispatcher = self.outbound_dispatcher.clone();
 
-            tokio::spawn(async move {
+            return Ok(TcpServerSetupResult::connection_task(async move {
                 if let Err(e) = handle_h2mux_session_with_context(
                     server_stream,
                     initial_data,
@@ -707,9 +707,8 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 {
                     debug!("Shadowsocks h2mux session ended: {}", e);
                 }
-            });
-
-            return Ok(TcpServerSetupResult::AlreadyHandled);
+                Ok(())
+            }));
         }
 
         // Checks for UDP-over-TCP (UoT) magic addresses

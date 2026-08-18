@@ -1,28 +1,21 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use log::{debug, error};
 use quinn::EndpointConfig;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 
-use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
-use crate::copy_bidirectional::copy_bidirectional;
 use crate::hysteria2_server::{Hysteria2ServerUser, Hysteria2ServerUsers, Hysteria2StartConfig};
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
-use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
+use crate::tcp::tcp_handler::TcpServerHandler;
+use crate::tcp::tcp_server::process_stream;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 use crate::tuic_server::{TuicServerUser, TuicServerUsers};
 use crate::uuid_util::parse_uuid;
@@ -82,6 +75,7 @@ async fn process_connection(
     conn: quinn::Incoming,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+    let peer_addr = connection.remote_address();
 
     loop {
         let stream = match connection.accept_bi().await {
@@ -97,193 +91,21 @@ async fn process_connection(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
+            let (send, recv) = stream;
+            if let Err(e) = process_stream(
+                QuicStream::from(send, recv),
+                cloned_handler,
+                cloned_resolver,
+                Some(peer_addr),
+            )
+            .await
+            {
                 error!("Failed to process streams: {e}");
             }
         });
     }
 
     Ok(())
-}
-
-async fn process_streams(
-    resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
-    (send, recv): (quinn::SendStream, quinn::RecvStream),
-) -> std::io::Result<()> {
-    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
-
-    let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
-        server_handler.setup_server_stream(quic_stream),
-    );
-
-    let setup_result = match setup_server_stream_future.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup server stream: {e}"),
-            ));
-        }
-        Err(elapsed) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {elapsed}"),
-            ));
-        }
-    };
-
-    let mut setup_result = setup_result;
-    loop {
-        return match setup_result {
-            TcpServerSetupResult::PeerAddressOverride { result, .. } => {
-                setup_result = *result;
-                continue;
-            }
-            TcpServerSetupResult::TcpForward {
-                remote_location,
-                stream: mut server_stream,
-                need_initial_flush: server_need_initial_flush,
-                proxy_selector,
-                outbound_dispatcher: _,
-                connection_success_response,
-                initial_remote_data,
-                authenticated_user: _,
-            } => {
-                let setup_client_stream_future = timeout(
-                    Duration::from_secs(60),
-                    setup_client_tcp_stream(
-                        &mut server_stream,
-                        proxy_selector,
-                        resolver,
-                        remote_location.clone(),
-                        None,
-                        None,
-                    ),
-                );
-
-                let mut client_stream = match setup_client_stream_future.await {
-                    Ok(Ok(Some(s))) => s,
-                    Ok(Ok(None)) => {
-                        // Must have been blocked.
-                        let _ = server_stream.shutdown().await;
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        let _ = server_stream.shutdown().await;
-                        return Err(std::io::Error::new(
-                            e.kind(),
-                            format!("failed to setup client stream to {remote_location}: {e}"),
-                        ));
-                    }
-                    Err(elapsed) => {
-                        let _ = server_stream.shutdown().await;
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!("client setup to {remote_location} timed out: {elapsed}"),
-                        ));
-                    }
-                };
-
-                if let Some(data) = connection_success_response {
-                    server_stream.write_all(&data).await?;
-                    // server_need_initial_flush should be set to true by the handler if
-                    // it's needed.
-                }
-
-                let client_need_initial_flush = match initial_remote_data {
-                    Some(data) => {
-                        client_stream.write_all(&data).await?;
-                        true
-                    }
-                    None => false,
-                };
-
-                let copy_result = copy_bidirectional(
-                    &mut server_stream,
-                    &mut client_stream,
-                    server_need_initial_flush,
-                    client_need_initial_flush,
-                )
-                .await;
-
-                let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
-
-                copy_result?;
-                Ok(())
-            }
-            TcpServerSetupResult::BidirectionalUdp {
-                remote_location,
-                stream: server_stream,
-                need_initial_flush: server_need_initial_flush,
-                proxy_selector,
-                outbound_dispatcher: _,
-                authenticated_user: _,
-            } => {
-                let action = proxy_selector
-                    .judge(remote_location.into(), &resolver)
-                    .await?;
-                match action {
-                    ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    } => {
-                        let client_stream = chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await?;
-
-                        run_udp_copy(
-                            server_stream,
-                            client_stream,
-                            server_need_initial_flush,
-                            false,
-                        )
-                        .await
-                    }
-                    ConnectDecision::Block => Ok(()),
-                }
-            }
-            TcpServerSetupResult::MultiDirectionalUdp {
-                stream: server_stream,
-                need_initial_flush,
-                proxy_selector,
-                outbound_dispatcher: _,
-                authenticated_user: _,
-            } => {
-                // Routes each packet based on its destination
-                run_udp_routing(
-                    ServerStream::Targeted(server_stream),
-                    proxy_selector,
-                    None,
-                    resolver,
-                    need_initial_flush,
-                )
-                .await
-            }
-            TcpServerSetupResult::SessionBasedUdp {
-                stream: server_stream,
-                need_initial_flush,
-                proxy_selector,
-                outbound_dispatcher: _,
-                authenticated_user: _,
-            } => {
-                // Routes each session based on its destination
-                run_udp_routing(
-                    ServerStream::Session(server_stream),
-                    proxy_selector,
-                    None,
-                    resolver,
-                    need_initial_flush,
-                )
-                .await
-            }
-            TcpServerSetupResult::AlreadyHandled => {
-                // Connection already handled by a spawned task (e.g., Reality fallback)
-                Ok(())
-            }
-        };
-    }
 }
 
 pub async fn start_quic_servers(

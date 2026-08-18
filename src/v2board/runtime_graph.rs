@@ -287,7 +287,7 @@ mod tests {
             &self,
             _: Box<dyn AsyncStream>,
         ) -> std::io::Result<TcpServerSetupResult> {
-            Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(TcpServerSetupResult::completed())
         }
     }
 

@@ -96,9 +96,7 @@ impl TcpServerHandler for GrpcServerHandler {
             .handler
             .setup_server_stream_with_peer_addr(grpc_stream, peer_addr)
             .await?;
-        if !matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
-            setup_result.set_need_initial_flush(true);
-        }
+        setup_result.set_need_initial_flush(true);
         Ok(setup_result)
     }
 }

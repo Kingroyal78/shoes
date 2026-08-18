@@ -174,9 +174,10 @@ Documented server-scope gaps compared with sibling `sing-box`/`singlink`:
 The implemented AnyTLS slice intentionally follows V2Board V1 UniProxy
 `v2_server_anytls`: the panel exposes `server_port`, `server_name`, and
 `padding_scheme` only. This backend supplies certificates from local config and
-meters each authenticated AnyTLS logical stream inside the AnyTLS session because
-the protocol handler owns multiplexed forwarding and returns
-`TcpServerSetupResult::AlreadyHandled`.
+meters each authenticated AnyTLS logical stream inside the AnyTLS session. The
+physical session is returned as an owned connection task, so cancellation,
+completion, errors, and live-stream accounting remain attached to the accepting
+path.
 
 V2Node runtime support is implemented through V2Board's separate V2 API, whose
 payload includes protocol, TLS, Reality, cipher/encryption, TUIC, Hysteria2,

@@ -845,7 +845,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             let resolver = self.resolver.clone().expect("resolver required for h2mux");
             let outbound_dispatcher = self.outbound_dispatcher.clone();
 
-            tokio::spawn(async move {
+            return Ok(TcpServerSetupResult::connection_task(async move {
                 if let Err(e) = handle_h2mux_session(
                     server_stream,
                     initial_data,
@@ -858,9 +858,8 @@ impl TcpServerHandler for TrojanTcpHandler {
                 {
                     debug!("Trojan h2mux session ended: {}", e);
                 }
-            });
-
-            return Ok(TcpServerSetupResult::AlreadyHandled);
+                Ok(())
+            }));
         }
 
         Ok(TcpServerSetupResult::TcpForward {

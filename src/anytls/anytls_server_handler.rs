@@ -314,14 +314,12 @@ impl AnyTlsServerHandler {
             },
         );
 
-        // Run the session in a background task
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             if let Err(e) = session.run().await {
                 log::debug!("AnyTLS session ended: {}", e);
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 
     /// Forward the connection to a fallback destination when authentication fails.
@@ -363,12 +361,9 @@ impl AnyTlsServerHandler {
             dest_stream.flush().await?;
         }
 
-        log::debug!("AnyTLS FALLBACK: Spawning bidirectional copy");
+        log::debug!("AnyTLS FALLBACK: Returning owned bidirectional copy task");
 
-        // Spawn the long-running bidirectional copy as a background task.
-        // This allows the setup to complete within the timeout while the actual
-        // data transfer runs indefinitely.
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::connection_task(async move {
             let result = copy_bidirectional(
                 &mut *client_stream,
                 &mut *dest_stream,
@@ -385,9 +380,8 @@ impl AnyTlsServerHandler {
             } else {
                 log::debug!("AnyTLS FALLBACK: Connection completed");
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+            Ok(())
+        }))
     }
 }
 

@@ -1,5 +1,7 @@
 use std::fmt::Debug;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,12 +94,29 @@ pub enum TcpServerSetupResult {
         outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         authenticated_user: Option<AuthenticatedUser>,
     },
-    /// Connection has been fully handled (e.g., spawned as a background task).
-    /// No further processing needed by the caller.
-    AlreadyHandled,
+    /// The handler consumed the stream and returned the rest of its connection
+    /// lifecycle to the caller.
+    ///
+    /// This future is deliberately owned and awaited by the same task that
+    /// accepted the stream. The old `AlreadyHandled` marker encouraged handlers
+    /// to detach work with `tokio::spawn`; callers then had no completion,
+    /// cancellation or error handle, and connection accounting ended while the
+    /// physical session was still alive.
+    ConnectionTask(Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'static>>),
 }
 
 impl TcpServerSetupResult {
+    pub fn connection_task<F>(future: F) -> Self
+    where
+        F: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        Self::ConnectionTask(Box::pin(future))
+    }
+
+    pub fn completed() -> Self {
+        Self::connection_task(std::future::ready(Ok(())))
+    }
+
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         match self {
             TcpServerSetupResult::PeerAddressOverride { result, .. } => {
@@ -121,7 +140,7 @@ impl TcpServerSetupResult {
             } => {
                 *flush = need_initial_flush;
             }
-            TcpServerSetupResult::AlreadyHandled => {}
+            TcpServerSetupResult::ConnectionTask(_) => {}
         }
     }
 }
