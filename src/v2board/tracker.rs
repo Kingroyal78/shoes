@@ -96,7 +96,21 @@ impl TrafficTracker {
         tokio::fs::create_dir_all(&data_dir).await?;
         let snapshot_path = data_dir.join("traffic-pending.json");
         let state: TrackerState = match tokio::fs::read(&snapshot_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(state) => state,
+                Err(error) => {
+                    // Starting empty is the only way forward, but doing it
+                    // quietly discards however much unreported traffic the file
+                    // held, and that is the one loss on this path nothing else
+                    // can reconstruct -- the panel was never told about it.
+                    log::warn!(
+                        "pending V2Board traffic snapshot at {} is unreadable; \
+                         starting with none, and whatever it held is not billable: {error}",
+                        snapshot_path.display()
+                    );
+                    TrackerState::default()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => TrackerState::default(),
             Err(e) => return Err(e),
         };
@@ -322,22 +336,52 @@ impl TrafficTracker {
 /// Mirrors the LKG persist pattern.
 async fn persist_atomic(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = temp_path(path);
-    tokio::fs::write(&temporary, bytes).await?;
-    tokio::fs::rename(&temporary, path).await
+    // Cleaned up on either failure: the name is unique per call now, so a
+    // temporary left behind is never reused and would accumulate instead.
+    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn persist_atomic_blocking(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = temp_path(path);
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(&temporary, path)
+    if let Err(error) = std::fs::write(&temporary, bytes) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
+/// A temporary name unique to this call, not merely to this process.
+///
+/// Two persists are routinely in flight at once -- the push loop and the
+/// connection-close flush -- and a name shared between them defeats the very
+/// atomicity this indirection exists for: one can rename the file away while
+/// the other is still writing it, publishing a truncated snapshot, and the
+/// loser's own rename then fails with ENOENT. The writer id keeps two shoes
+/// processes sharing a `data_dir` apart; the sequence keeps one process's own
+/// writers apart.
 fn temp_path(path: &std::path::Path) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "traffic-pending.json".to_string());
-    path.with_file_name(format!(".{file_name}.tmp-{}", super::writer_id()))
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{sequence}",
+        super::writer_id()
+    ))
 }
 
 impl TrafficRecorder for TrafficTracker {
@@ -487,6 +531,62 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
+
+    #[test]
+    fn concurrent_persists_do_not_share_a_temporary() {
+        let path = PathBuf::from("/tmp/shoes-test-traffic-pending.json");
+        let first = temp_path(&path);
+        let second = temp_path(&path);
+
+        assert_ne!(
+            first, second,
+            "a temporary shared between two in-flight persists lets one rename \
+             the file away while the other is still writing it"
+        );
+        for name in [&first, &second] {
+            assert_eq!(name.parent(), path.parent());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_racing_pair_of_persists_both_succeed() {
+        let directory = std::env::temp_dir().join(format!(
+            "shoes-persist-race-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let path = directory.join("traffic-pending.json");
+
+        // The push loop and the close flush, overlapping the way they do on a
+        // busy node. Before the temporary was made unique per call, one of
+        // these reliably lost its rename to ENOENT.
+        let bulky = vec![b'x'; 256 * 1024];
+        let (left, right) =
+            tokio::join!(persist_atomic(&path, &bulky), persist_atomic(&path, &bulky));
+        left.expect("first persist");
+        right.expect("second persist");
+
+        assert_eq!(
+            std::fs::read(&path).expect("published snapshot").len(),
+            bulky.len()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .expect("scratch directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporaries left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     fn tracker() -> TrafficTracker {
         TrafficTracker::empty(PathBuf::from("/tmp/shoes-test-traffic-pending.json"))
