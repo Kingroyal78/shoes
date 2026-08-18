@@ -421,8 +421,12 @@ async fn serve_smux(
         // `interval` ticks immediately; consume that tick so NOP is sent after
         // one complete keepalive period.
         ping.tick().await;
-        loop {
-            tokio::select! {
+        // The loop's `?` used to leave the async block outright, taking every
+        // queued command with it. Anything still in the channel has a stream
+        // waiting on it, so the exit has to be observed rather than taken.
+        let outcome: io::Result<()> = async {
+            loop {
+                tokio::select! {
                 update = updates_rx.recv(), if updates_open => {
                     match update {
                         Some(update) => {
@@ -482,15 +486,39 @@ async fn serve_smux(
                 _ = writer_shutdown_signal.notified(), if !closing => {
                     // Closing the receiver rather than breaking: it refuses new
                     // sends but still yields what is already queued, so the
-                    // barriers in flight are completed instead of dropped --
-                    // dropping them is the failure this whole teardown path was
-                    // rewritten to stop causing. The drain then ends the loop
-                    // through the ordinary `None` arm below.
+                    // barriers in flight are completed instead of dropped.
+                    // The drain then ends the loop through the `None` arm.
                     outbound_rx.close();
                     closing = true;
                 }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        // Answer whatever is still queued instead of dropping it. A stream
+        // whose flush was in flight when the peer went away was being told
+        // "the session writer dropped a flush barrier", which names the
+        // messenger rather than the failure -- and that is the ordinary case,
+        // not a rare one: a client closing its WebSocket mid-flush produced
+        // one of these for every stream that had a barrier outstanding. It
+        // now hears why.
+        outbound_rx.close();
+        while let Some(command) = outbound_rx.recv().await {
+            if let OutboundCommand::Barrier { complete } = command {
+                let reported = match &outcome {
+                    Ok(()) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("smux v{version} session ended before the flush completed"),
+                    )),
+                    Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+                };
+                let _ = complete.send(reported);
             }
         }
+
+        outcome?;
         writer.shutdown().await
     });
 
