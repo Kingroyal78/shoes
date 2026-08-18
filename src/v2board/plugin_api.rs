@@ -490,8 +490,11 @@ pub struct EchOptions {
 }
 
 impl EchOptions {
+    /// A config alone is one handed to the client directly; a query name alone
+    /// tells it to go find one over DNS. Either leaves a client hiding a name
+    /// this edge cannot recover, so neither counts as an unused block.
     fn is_requested(&self) -> bool {
-        self.enable || !self.config.trim().is_empty()
+        self.enable || !self.config.trim().is_empty() || !self.query_server_name.trim().is_empty()
     }
 }
 
@@ -547,6 +550,7 @@ impl V2rayPluginOptions {
         validate_tls_material(
             self.server_certificate.as_str(),
             self.server_private_key.as_ref(),
+            self.tls,
         )?;
         if self.v2ray_http_upgrade && self.mux {
             return Err(PluginManifestError::new(
@@ -604,6 +608,7 @@ impl GostPluginOptions {
         validate_tls_material(
             self.server_certificate.as_str(),
             self.server_private_key.as_ref(),
+            self.tls,
         )
     }
 }
@@ -838,15 +843,26 @@ fn validate_ech(ech: Option<&EchOptions>) -> Result<(), PluginManifestError> {
 /// A certificate without its key, or a key without its certificate, cannot
 /// serve anything. Applying half of it would start a listener that fails every
 /// handshake, so the generation is refused instead.
+///
+/// Both halves on a plugin serving cleartext is refused for the reason a
+/// client CA is: the edge reads the material only when the same plugin runs
+/// TLS, so applying it would leave the operator looking at a configured
+/// certificate on a node handing out plain WebSocket.
 fn validate_tls_material(
     certificate: &str,
     private_key: Option<&SecretString>,
+    tls: bool,
 ) -> Result<(), PluginManifestError> {
     let has_certificate = !certificate.trim().is_empty();
     let has_key = private_key.is_some_and(|key| !key.expose_secret().trim().is_empty());
     if has_certificate != has_key {
         return Err(PluginManifestError::new(
             "plugin TLS needs both a certificate and its private key",
+        ));
+    }
+    if has_certificate && !tls {
+        return Err(PluginManifestError::new(
+            "plugin certificate requires TLS on the same plugin",
         ));
     }
     Ok(())
@@ -1369,6 +1385,45 @@ mod tests {
         assert!(error.to_string().contains("client_ca"));
     }
 
+    /// The panel's node form is where the certificate an edge serves is
+    /// configured, but the edge reads it only when the same plugin runs TLS.
+    /// Accepting the pair on a cleartext plugin would show a node with a
+    /// certificate configured while it serves plain WebSocket.
+    #[test]
+    fn a_served_certificate_without_tls_is_refused() {
+        let certificate = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        let private_key = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----";
+
+        let with_tls = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket", "host": "gost.example", "path": "/gost",
+                "tls": true, "mux": true,
+                "server_certificate": certificate,
+                "server_private_key": private_key
+            }),
+        )))
+        .expect("the manifest parses");
+        assert!(
+            with_tls.validate(12).is_ok(),
+            "a served certificate belongs on a TLS plugin"
+        );
+
+        let error = parse(base_manifest(plugin(
+            "gost-plugin",
+            json!({
+                "mode": "websocket", "host": "gost.example", "path": "/gost",
+                "tls": false, "mux": true,
+                "server_certificate": certificate,
+                "server_private_key": private_key
+            }),
+        )))
+        .expect("the manifest parses")
+        .validate(12)
+        .expect_err("a served certificate without TLS must be refused");
+        assert!(error.to_string().contains("certificate"));
+    }
+
     /// ECH needs the server to decrypt what the client hid. Serving a node
     /// that publishes it would hand its clients a handshake this edge cannot
     /// answer, so the generation is refused -- and a node that merely carries
@@ -1391,6 +1446,7 @@ mod tests {
         for asking in [
             json!({"enable": true, "config": "", "query_server_name": ""}),
             json!({"enable": false, "config": "AEX+DQBB", "query_server_name": ""}),
+            json!({"enable": false, "config": "", "query_server_name": "ech.example"}),
         ] {
             let manifest = base_manifest(plugin(
                 "gost-plugin",

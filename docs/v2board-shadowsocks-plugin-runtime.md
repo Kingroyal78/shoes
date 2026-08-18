@@ -92,9 +92,22 @@ the candidate is refused whole, the last-known-good runtime keeps serving, the
 revision is not acknowledged, and the rejection reason names the cause instead
 of reporting a generic schema failure.
 
-For v2ray-plugin or GOST with `tls: true`, configure a readable certificate and
-private key in the node-level or top-level local `tls` block. V2Board never
-sends private certificate material through the plugin manifest.
+For v2ray-plugin or GOST with `tls: true`, the certificate the edge serves is
+the panel's `server_certificate`/`server_private_key` when the node form carries
+both; a readable certificate and private key in the node-level or top-level
+local `tls` block is the fallback for a node whose panel entry carries neither.
+These are the node's own identity and are distinct from the panel's
+`certificate`/`private_key`, which are the client certificate published to every
+subscriber and are never served. Half a pair is refused, and so is a pair on a
+plugin with `tls: false`: the edge reads the material only under TLS, so
+applying it would leave a certificate configured on a node serving plain
+WebSocket.
+
+A plugin that asks for ECH is refused, whether it sets `enable`, carries a
+`config`, or names a `query_server_name` for the client to resolve one over DNS.
+The edge cannot decrypt a hidden name, and publishing ECH to clients it cannot
+answer is a node whose clients cannot connect. An `ech_opts` block left at the
+panel's empty defaults asks for nothing and passes.
 
 ShadowTLS and Restls connect directly to the configured camouflage host on
 port 443. Their authentication-failure path relays to that host without
