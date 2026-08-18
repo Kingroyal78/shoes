@@ -24,6 +24,24 @@ const OPTION_DATA: u8 = 0x01;
 const OPTION_ERROR: u8 = 0x02;
 const NETWORK_TCP: u8 = 0x01;
 
+/// How long a finished session waits for its logical streams to wind down
+/// before cancelling them.
+///
+/// Their tasks own the drop-close permits and the outbound sender clones that
+/// the close forwarder and the writer block on, so waiting for those two is
+/// really waiting on a proxied peer that may never answer. Nothing bounded
+/// that wait before, so a single parked stream kept the session task -- and
+/// the physical connection's fd -- alive for good. Cancelling the streams
+/// directly ends the session in bounded time and lets the shared machinery
+/// close on its own terms instead.
+///
+/// A second rather than something tighter because this also covers the
+/// teardowns where the physical connection is still writable -- the reader
+/// breaking on a protocol violation, say -- and a stream mid-download there can
+/// still use the time. When the peer is simply gone, which is the common case,
+/// the streams fail fast and the grace never elapses at all.
+const STREAM_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug)]
 pub struct MuxCoolLimits {
     pub max_concurrent_streams: usize,
@@ -244,7 +262,7 @@ async fn serve_mux_cool(
         mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
     let (drop_close_tx, mut drop_close_rx) = mpsc::channel::<u32>(limits.max_concurrent_streams);
     let close_outbound = outbound_tx.clone();
-    let close_forwarder = tokio::spawn(async move {
+    let mut close_forwarder = tokio::spawn(async move {
         while let Some(stream_id) = drop_close_rx.recv().await {
             close_outbound
                 .send(OutboundCommand::Finished { stream_id })
@@ -253,27 +271,50 @@ async fn serve_mux_cool(
         }
         Ok::<(), io::Error>(())
     });
-    let writer_task = tokio::spawn(async move {
-        while let Some(command) = outbound_rx.recv().await {
-            match command {
-                OutboundCommand::Data { stream_id, data } => {
-                    let stream_id = u16::try_from(stream_id)
-                        .map_err(|_| invalid_error("Mux.Cool stream ID exceeds u16"))?;
-                    write_frame(&mut writer, stream_id, STATUS_KEEP, &data).await?;
+    // The writer cannot be ended by dropping senders alone: an inner handler
+    // that takes a logical stream, spawns it and returns `AlreadyHandled`
+    // keeps an outbound clone in a task this session cannot reach, so the
+    // channel never closes however much of its own work the session cancels.
+    // A signal ends it regardless of who else is still holding a sender.
+    let writer_shutdown = Arc::new(tokio::sync::Notify::new());
+    let writer_shutdown_signal = writer_shutdown.clone();
+    let mut writer_task = tokio::spawn(async move {
+        let mut closing = false;
+        loop {
+            tokio::select! {
+                command = outbound_rx.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        OutboundCommand::Data { stream_id, data } => {
+                            let stream_id = u16::try_from(stream_id)
+                                .map_err(|_| invalid_error("Mux.Cool stream ID exceeds u16"))?;
+                            write_frame(&mut writer, stream_id, STATUS_KEEP, &data).await?;
+                        }
+                        OutboundCommand::Finished { stream_id } => {
+                            let stream_id = u16::try_from(stream_id)
+                                .map_err(|_| invalid_error("Mux.Cool stream ID exceeds u16"))?;
+                            write_frame(&mut writer, stream_id, STATUS_END, &[]).await?;
+                        }
+                        OutboundCommand::Barrier { complete } => {
+                            let result = writer.flush().await;
+                            let reported = result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+                            let _ = complete.send(reported);
+                            result?;
+                        }
+                    }
                 }
-                OutboundCommand::Finished { stream_id } => {
-                    let stream_id = u16::try_from(stream_id)
-                        .map_err(|_| invalid_error("Mux.Cool stream ID exceeds u16"))?;
-                    write_frame(&mut writer, stream_id, STATUS_END, &[]).await?;
-                }
-                OutboundCommand::Barrier { complete } => {
-                    let result = writer.flush().await;
-                    let reported = result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| io::Error::new(error.kind(), error.to_string()));
-                    let _ = complete.send(reported);
-                    result?;
+                _ = writer_shutdown_signal.notified(), if !closing => {
+                    // Closing the receiver rather than breaking: it refuses new
+                    // sends but still yields what is already queued, so the
+                    // flush barriers in flight are completed instead of
+                    // dropped, and the End frames a cancelled stream's drop
+                    // emitted still reach the peer. The drain then ends the
+                    // loop through the ordinary `None` arm above.
+                    outbound_rx.close();
+                    closing = true;
                 }
             }
         }
@@ -281,6 +322,11 @@ async fn serve_mux_cool(
     });
 
     let mut streams: HashMap<u16, LogicalStreamState> = HashMap::new();
+    // Held rather than detached so the session can cancel what it started.
+    // Dropping this set aborts anything still running, which is the right end
+    // for a logical stream whose physical session is gone: it has no transport
+    // left to carry anything to the client.
+    let mut stream_tasks = tokio::task::JoinSet::new();
     let read_result = loop {
         let (metadata, data) = match read_frame(&mut reader, limits.max_metadata_bytes).await {
             Ok(Some(frame)) => frame,
@@ -289,6 +335,11 @@ async fn serve_mux_cool(
         };
         match metadata.status {
             STATUS_NEW => {
+                // Mux.Cool reclaims a map slot when the peer sends End, so
+                // this is the one point where the session's stream count is
+                // allowed to grow; reap here too, or a finished task would sit
+                // in the set for the life of the session.
+                while stream_tasks.try_join_next().is_some() {}
                 if streams.contains_key(&metadata.stream_id) {
                     break invalid("Mux.Cool New reused an active stream ID");
                 }
@@ -324,7 +375,7 @@ async fn serve_mux_cool(
                 logical.set_drop_close_permit(close_permit);
                 let inner = inner.clone();
                 let resolver = resolver.clone();
-                tokio::spawn(async move {
+                stream_tasks.spawn(async move {
                     if let Err(error) = process_stream(logical, inner, resolver, peer_addr).await {
                         log::debug!(
                             "Mux.Cool logical stream {} finished with error: {error}",
@@ -411,11 +462,60 @@ async fn serve_mux_cool(
     }
     drop(drop_close_tx);
     drop(outbound_tx);
-    let close_result = close_forwarder
+    // Wind the logical streams down before waiting on the forwarder and the
+    // writer, because those two cannot finish until every stream has released
+    // its drop-close permit and its outbound sender. The End events delivered
+    // above only unblock a stream's inbound half; one parked on its proxied
+    // peer needs cancelling. The grace lets a stream that is already finishing
+    // report its own outcome first.
+    if tokio::time::timeout(STREAM_SHUTDOWN_GRACE, async {
+        while stream_tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        stream_tasks.shutdown().await;
+    }
+    // Whatever still holds a drop-close permit here is out of this session's
+    // reach -- an inner handler that detached the logical stream it was given,
+    // most concretely -- so waiting on the forwarder is waiting on something
+    // the session can no longer influence. Bounded by the same grace for that
+    // reason. Aborting it cannot orphan anything: it only turns drop
+    // notifications into End frames, and the session is over.
+    let close_result =
+        match tokio::time::timeout(STREAM_SHUTDOWN_GRACE, &mut close_forwarder).await {
+            Ok(joined) => joined
+                .map_err(|error| io::Error::other(format!("Mux.Cool close task failed: {error}"))),
+            Err(_) => {
+                // Not a failure of this session. Having cancelled every stream it
+                // owns, a forwarder still waiting means a permit is held where the
+                // session cannot reach it, and reporting that as the outcome would
+                // bury the result that actually describes the session -- the read
+                // result -- under something it could do nothing about.
+                close_forwarder.abort();
+                log::debug!(
+                    "Mux.Cool close forwarder outlived the streams this session owns; \
+                 an inner handler kept one"
+                );
+                Ok(Ok(()))
+            }
+        };
+    // Tell the writer to drain and stop. Signalled after the streams were
+    // cancelled so the End frames their drops emit are already queued, and
+    // issued whether or not the forwarder finished, because the writer is held
+    // open by the same unreachable senders.
+    writer_shutdown.notify_one();
+    let close_result = close_result?;
+    // Bound only the writer drain: it may still be blocked on a physical
+    // stream that never completes a write, and aborting it only releases the
+    // write half (the fd is owned by the reader side, which has already
+    // finished and delivered per-stream End events above).
+    let writer_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer_task)
         .await
-        .map_err(|error| io::Error::other(format!("Mux.Cool close task failed: {error}")))?;
-    let writer_result = writer_task
-        .await
+        .map_err(|_| {
+            writer_task.abort();
+            io::Error::other("Mux.Cool writer task timed out")
+        })?
         .map_err(|error| io::Error::other(format!("Mux.Cool writer task failed: {error}")))?;
     read_result.and(close_result).and(writer_result)
 }
@@ -455,6 +555,7 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::io::{AsyncRead, AsyncReadExt, DuplexStream, ReadBuf};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::address::NetLocation;
@@ -554,6 +655,83 @@ mod tests {
     fn control_frame(stream_id: u16, status: u8) -> [u8; 6] {
         let [id_hi, id_lo] = stream_id.to_be_bytes();
         [0, 4, id_hi, id_lo, status, 0]
+    }
+
+    /// A minimal New frame: TCP to 127.0.0.1:80, which the handler never sees
+    /// because Mux.Cool logical streams are not routed on their metadata.
+    fn new_frame(stream_id: u16) -> [u8; 14] {
+        let [id_hi, id_lo] = stream_id.to_be_bytes();
+        [
+            0,
+            12,
+            id_hi,
+            id_lo,
+            STATUS_NEW,
+            0,
+            NETWORK_TCP,
+            0,
+            80,
+            0x01,
+            127,
+            0,
+            0,
+            1,
+        ]
+    }
+
+    #[derive(Debug, Default)]
+    struct ParkingHandler {
+        ready: Notify,
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for ParkingHandler {
+        async fn setup_server_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            self.ready.notify_one();
+            // Stands in for a logical stream parked on a proxied peer that
+            // never answers: nothing releases its drop-close permit or its
+            // outbound sender on its own.
+            std::future::pending::<()>().await;
+            unreachable!("the parked handler never resolves")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parked_stream_does_not_hold_the_sessions_teardown_open() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handler = Arc::new(ParkingHandler::default());
+        let session = tokio::spawn(serve_mux_cool(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(UnusedResolver),
+            None,
+            MuxCoolLimits::default(),
+        ));
+
+        client.write_all(&new_frame(1)).await.unwrap();
+        handler.ready.notified().await;
+        // The peer goes away while that stream is still parked, so nothing will
+        // release its drop-close permit or its outbound sender on its own.
+        drop(client);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), session)
+            .await
+            .expect("a parked stream must not hold the session's teardown open")
+            .expect("the session task must not panic");
+
+        // A write-half error is fair game -- the peer is already gone -- but
+        // teardown must not fall back on one of its own bounds, which would
+        // mean it gave up on the shared machinery instead of releasing it.
+        if let Err(error) = outcome {
+            let message = error.to_string();
+            assert!(
+                !message.contains("timed out"),
+                "teardown fell back to one of its own bounds: {message}"
+            );
+        }
     }
 
     #[test]
