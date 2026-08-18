@@ -103,26 +103,117 @@ pub async fn load(
     data_dir: &Path,
     node: &V2BoardNodeConfig,
 ) -> std::io::Result<Option<NodeLkgSnapshot>> {
-    let path = snapshot_path(data_dir, node);
-    let (path, legacy) = match tokio::fs::metadata(&path).await {
-        Ok(_) => (path, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Fall back to the pre-MessagePack file so an upgrade does not
-            // throw away the recovery point the previous build wrote.
-            let legacy = legacy_snapshot_path(data_dir, node);
-            match tokio::fs::metadata(&legacy).await {
-                Ok(_) => (legacy, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error),
+    let current_path = snapshot_path(data_dir, node);
+    let legacy_path = legacy_snapshot_path(data_dir, node);
+
+    match load_candidate(current_path.clone(), node.clone(), false).await {
+        Ok(Some(snapshot)) => {
+            // A validated current snapshot is the recovery point now. Keeping
+            // an older JSON beside it only creates a stale fallback if the MPK
+            // is later removed by hand, so retire it after validation rather
+            // than merely after observing that the MPK path exists.
+            retire_legacy_snapshot(legacy_path).await;
+            return Ok(Some(snapshot));
+        }
+        Ok(None) => {}
+        Err(current_error) if current_error.kind() == std::io::ErrorKind::InvalidData => {
+            // A partially written or otherwise corrupt current snapshot should
+            // not hide the last valid recovery point from the previous
+            // encoding. Other errors (permissions, non-regular files, I/O)
+            // remain visible instead of being silently bypassed.
+            match load_candidate(legacy_path.clone(), node.clone(), true).await {
+                Ok(Some(snapshot)) => {
+                    log::warn!(
+                        "current LKG snapshot for node `{}` is invalid; recovered from legacy JSON: {current_error}",
+                        node.tag
+                    );
+                    migrate_legacy_snapshot(data_dir, node, &snapshot, legacy_path).await;
+                    return Ok(Some(snapshot));
+                }
+                Ok(None) => return Err(current_error),
+                Err(legacy_error) => {
+                    return Err(invalid_data(format!(
+                        "current LKG snapshot is invalid ({current_error}); legacy snapshot is also unusable ({legacy_error})"
+                    )));
+                }
             }
         }
         Err(error) => return Err(error),
+    }
+
+    let Some(snapshot) = load_candidate(legacy_path.clone(), node.clone(), true).await? else {
+        return Ok(None);
     };
-    let node = node.clone();
+    migrate_legacy_snapshot(data_dir, node, &snapshot, legacy_path).await;
+    Ok(Some(snapshot))
+}
+
+async fn load_candidate(
+    path: PathBuf,
+    node: V2BoardNodeConfig,
+    legacy: bool,
+) -> std::io::Result<Option<NodeLkgSnapshot>> {
+    match tokio::fs::metadata(&path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
     tokio::task::spawn_blocking(move || load_blocking(&path, &node, legacy))
         .await
         .map_err(|error| std::io::Error::other(format!("LKG load task failed: {error}")))?
         .map(Some)
+}
+
+async fn migrate_legacy_snapshot(
+    data_dir: &Path,
+    node: &V2BoardNodeConfig,
+    snapshot: &NodeLkgSnapshot,
+    legacy_path: PathBuf,
+) {
+    if let Err(error) = persist(data_dir, node, snapshot.clone()).await {
+        // Recovery is more important than housekeeping. Keep serving the
+        // validated legacy snapshot and retry the migration on the next
+        // restart instead of turning a writable-state problem into downtime.
+        log::warn!(
+            "failed to migrate legacy LKG snapshot for node `{}` to MessagePack: {error}",
+            node.tag
+        );
+        return;
+    }
+
+    // `persist` fsyncs the file and directory. Decode the published bytes once
+    // more before deleting the only older recovery point, so success means the
+    // migration is durable *and* readable by this build.
+    match load_candidate(snapshot_path(data_dir, node), node.clone(), false).await {
+        Ok(Some(_)) => retire_legacy_snapshot(legacy_path).await,
+        Ok(None) => log::warn!(
+            "migrated LKG snapshot for node `{}` disappeared before verification; keeping legacy JSON",
+            node.tag
+        ),
+        Err(error) => log::warn!(
+            "migrated LKG snapshot for node `{}` failed read-back verification; keeping legacy JSON: {error}",
+            node.tag
+        ),
+    }
+}
+
+async fn retire_legacy_snapshot(path: PathBuf) {
+    let result = tokio::task::spawn_blocking(move || {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_data("legacy LKG snapshot path has no parent"))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => File::open(parent)?.sync_all(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("failed to retire legacy LKG snapshot: {error}"),
+        Err(error) => log::warn!("legacy LKG cleanup task failed: {error}"),
+    }
 }
 
 pub async fn persist(
@@ -224,8 +315,9 @@ fn snapshot_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
 
 /// Where snapshots were written before the encoding changed.
 ///
-/// Read-only: a node that restarts onto this build still recovers from the file
-/// its previous build left behind, and writes the new one from then on.
+/// A node that restarts onto this build recovers from the file its previous
+/// build left behind. A successful load migrates it transactionally and retires
+/// this path only after the MessagePack replacement passes read-back validation.
 fn legacy_snapshot_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
     data_dir.join(format!(
         "v2board-lkg-{}-{}.json",
@@ -378,6 +470,140 @@ mod tests {
             .expect("an upgrade must not discard the recovery point on disk");
         assert_eq!(loaded.users[0].id, 5);
         assert_eq!(loaded.server_config.server_port, 8443);
+        assert!(
+            snapshot_path(directory.path(), &node).is_file(),
+            "loading legacy state must publish its current-format replacement"
+        );
+        assert!(
+            !legacy_snapshot_path(directory.path(), &node).exists(),
+            "the legacy recovery point is retired only after read-back succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_current_snapshot_does_not_hide_valid_legacy_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "repair".to_string(),
+            node_id: 22,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            Some("server-etag".to_string()),
+            Some("user-etag".to_string()),
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 9443})).unwrap(),
+            vec![
+                serde_json::from_value::<UserInfo>(json!({
+                    "id": 6,
+                    "uuid": "00000000-0000-0000-0000-000000000006"
+                }))
+                .unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        std::fs::write(snapshot_path(directory.path(), &node), b"not messagepack").unwrap();
+        std::fs::write(
+            legacy_snapshot_path(directory.path(), &node),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(loaded.users[0].id, 6);
+        assert_eq!(loaded.server_config.server_port, 9443);
+        assert!(
+            !legacy_snapshot_path(directory.path(), &node).exists(),
+            "a verified repair must retire the stale fallback"
+        );
+
+        // The corrupt MPK was replaced, not merely bypassed for this process.
+        let reloaded = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(reloaded.users[0].id, 6);
+    }
+
+    #[tokio::test]
+    async fn a_valid_current_snapshot_retires_a_stale_legacy_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "current".to_string(),
+            node_id: 23,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            None,
+            None,
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 10443})).unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        persist(directory.path(), &node, snapshot).await.unwrap();
+        std::fs::write(
+            legacy_snapshot_path(directory.path(), &node),
+            b"stale and deliberately invalid",
+        )
+        .unwrap();
+
+        let loaded = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(loaded.server_config.server_port, 10443);
+        assert!(!legacy_snapshot_path(directory.path(), &node).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_cleanup_failure_does_not_hide_a_valid_current_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "cleanup-failure".to_string(),
+            node_id: 24,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            None,
+            None,
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 11443})).unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        persist(directory.path(), &node, snapshot).await.unwrap();
+        let legacy_path = legacy_snapshot_path(directory.path(), &node);
+        std::fs::create_dir(&legacy_path).unwrap();
+
+        let loaded = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(loaded.server_config.server_port, 11443);
+        assert!(
+            legacy_path.is_dir(),
+            "a cleanup error must not mutate an unexpected filesystem object"
+        );
     }
 
     #[tokio::test]

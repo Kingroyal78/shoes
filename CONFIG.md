@@ -125,8 +125,10 @@ Each node:
 
 ## `runtime`
 
-- `data_dir`: stores `traffic-pending.json` plus owner-only
-  `v2board-lkg-<node-type>-<node-id>.json` last-known-good snapshots.
+- `data_dir`: stores `traffic-pending.json` plus owner-only MessagePack
+  `v2board-lkg-<node-type>-<node-id>.mpk` last-known-good snapshots. Legacy
+  `.json` snapshots are validated, migrated with read-back verification, and
+  removed only after the `.mpk` replacement is durable.
   Snapshots are atomically replaced with mode `0600` on Unix and include
   credentials, so this directory must be private to the shoes service account.
   A validated snapshot is restored before the first panel request, allowing
