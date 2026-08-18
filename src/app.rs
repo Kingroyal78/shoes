@@ -308,6 +308,18 @@ impl NodeController {
         let mut next_users = self.users.clone();
         let mut next_plugin_candidate = self.plugin_candidate.clone();
 
+        // A successful pull used to produce no output at all, which left the
+        // routine case -- nothing moved -- indistinguishable from a panel that
+        // had stopped answering, or from a controller that was no longer
+        // ticking. These name what each fetch returned for the summary below,
+        // which is emitted at info because release builds compile `debug!`
+        // away entirely (`log`'s `release_max_level_info`), and a line only
+        // present in a debug build cannot answer "is this node still syncing".
+        let mut server_outcome = "not modified";
+        let mut plugin_outcome = "n/a";
+        let mut users_outcome = "not modified";
+        let mut alive_fetched = false;
+
         match self
             .client
             .get_server_config(&self.config, &self.node, self.server_etag.as_deref())
@@ -316,6 +328,11 @@ impl NodeController {
             FetchResult::NotModified => {}
             FetchResult::Updated { etag, value } => {
                 let config_changed = self.server_config.as_ref() != Some(&value);
+                server_outcome = if config_changed {
+                    "changed"
+                } else {
+                    "resent unchanged"
+                };
                 next_server_etag = etag;
                 next_server_config = Some(value);
                 changed |= config_changed;
@@ -335,8 +352,9 @@ impl NodeController {
                 .await
                 .map_err(plugin_io_error)?
             {
-                PluginConfigObserved::NotModified { .. } => {}
+                PluginConfigObserved::NotModified { .. } => plugin_outcome = "not modified",
                 PluginConfigObserved::Candidate(candidate) => {
+                    plugin_outcome = "changed";
                     next_plugin_candidate = Some(candidate);
                     changed = true;
                     non_user_changed = true;
@@ -357,6 +375,7 @@ impl NodeController {
         {
             UserListFetch::NotModified => {}
             UserListFetch::Unchanged { etag } => {
+                users_outcome = "resent unchanged";
                 // Same bytes as last time: nothing to decode, nothing to
                 // compare, nothing to apply. The validator is still taken, so a
                 // panel that does answer conditional requests can graduate to
@@ -369,6 +388,11 @@ impl NodeController {
                 body_hash,
             } => {
                 users_changed = self.users.as_ref() != Some(&value.users);
+                users_outcome = if users_changed {
+                    "changed"
+                } else {
+                    "resent unchanged"
+                };
                 next_user_etag = etag;
                 next_users = Some(value.users);
                 next_user_body_hash = Some(body_hash);
@@ -380,10 +404,22 @@ impl NodeController {
             .as_ref()
             .is_some_and(|users| users.iter().any(|user| user.device_limit.unwrap_or(0) > 0))
         {
+            alive_fetched = true;
             let alive = self.client.get_alive_list(&self.config, &self.node).await?;
             self.tracker
                 .replace_panel_alive(&self.node.tag, alive.alive);
         }
+
+        log::info!(
+            "node `{}` pull: config {server_outcome}, users {users_outcome}, plugin \
+             {plugin_outcome}{}",
+            self.node.tag,
+            if alive_fetched {
+                ", alivelist fetched"
+            } else {
+                ""
+            }
+        );
 
         if next_server_config.is_none() || next_users.is_none() {
             return Err(std::io::Error::other(format!(
@@ -412,6 +448,21 @@ impl NodeController {
             if !refreshed {
                 self.apply_runtime(server, users, next_plugin_candidate.as_ref())
                     .await?;
+            }
+            // At info, unlike the pull summary: this is the node changing what
+            // it serves, and info is what production runs at.
+            if refreshed {
+                log::info!(
+                    "node `{}` published {} user(s) into the running listeners",
+                    self.node.tag,
+                    users.len()
+                );
+            } else {
+                log::info!(
+                    "node `{}` applied a new runtime generation with {} user(s)",
+                    self.node.tag,
+                    users.len()
+                );
             }
         }
 
@@ -620,7 +671,27 @@ impl NodeController {
                 self.tracker.persist().await?;
                 return Err(e);
             }
+            // Logged before the persist, not after: by this point the panel
+            // has taken the traffic and the restore path is behind us, so a
+            // persist failure would drop the only record that billing did
+            // happen and leave nothing but a `push failed` line -- which reads
+            // as exactly the opposite of what occurred.
+            let (upload, download) =
+                payload
+                    .values()
+                    .fold((0u64, 0u64), |(up, down), [user_up, user_down]| {
+                        (up.saturating_add(*user_up), down.saturating_add(*user_down))
+                    });
+            log::info!(
+                "node `{}` reported {upload} bytes up / {download} bytes down for {} user(s)",
+                self.node.tag,
+                payload.len()
+            );
             self.tracker.persist().await?;
+        } else {
+            // Distinguishing "pushed nothing" from "never pushed" is the whole
+            // point of logging the quiet case.
+            log::info!("node `{}` had no traffic to report", self.node.tag);
         }
 
         let min_alive_traffic = self
@@ -635,6 +706,11 @@ impl NodeController {
             self.client
                 .push_alive(&self.config, &self.node, alive.payload())
                 .await?;
+            log::info!(
+                "node `{}` reported {} online user(s)",
+                self.node.tag,
+                alive.payload().len()
+            );
             self.tracker.commit_alive_snapshot(&self.node.tag, &alive);
         }
         self.tracker.persist().await
@@ -654,7 +730,21 @@ impl NodeController {
             .post_plugin_status(&self.config, &self.node, &report)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Naming what was acknowledged, not merely that something was.
+                // A node whose manifest never applied posts `ready: false`
+                // every interval and the panel takes it, so a bare "status
+                // acknowledged" reads identically on a healthy node and on one
+                // serving nothing but its last-known-good since startup --
+                // the stall this line exists to surface.
+                log::info!(
+                    "node `{}` acknowledged its plugin status: ready={}, applied revision `{}`",
+                    self.node.tag,
+                    report.is_ready(),
+                    report.applied_revision()
+                );
+                Ok(())
+            }
             Err(PluginApiError::RevisionMismatch { .. }) => {
                 self.force_plugin_refresh = true;
                 Err(std::io::Error::other(
