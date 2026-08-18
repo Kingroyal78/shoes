@@ -403,8 +403,16 @@ async fn serve_smux(
     } else {
         config.max_stream_receive_buffer
     };
+    // The writer cannot be ended by dropping senders alone: an inner handler
+    // that takes a logical stream, spawns it and returns `AlreadyHandled`
+    // keeps an outbound clone in a task this session cannot reach, so the
+    // channel never closes however much of its own work the session cancels.
+    // A signal ends it regardless of who else is still holding a sender.
+    let writer_shutdown = Arc::new(tokio::sync::Notify::new());
+    let writer_shutdown_signal = writer_shutdown.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut updates_open = true;
+        let mut closing = false;
         let ping_period = config
             .keepalive_interval
             .unwrap_or_else(|| std::time::Duration::from_secs(365 * 24 * 60 * 60));
@@ -470,6 +478,16 @@ async fn serve_smux(
                 }
                 _ = ping.tick(), if config.keepalive_interval.is_some() => {
                     write_frame(&mut writer, version, CMD_NOP, 0, &[]).await?;
+                }
+                _ = writer_shutdown_signal.notified(), if !closing => {
+                    // Closing the receiver rather than breaking: it refuses new
+                    // sends but still yields what is already queued, so the
+                    // barriers in flight are completed instead of dropped --
+                    // dropping them is the failure this whole teardown path was
+                    // rewritten to stop causing. The drain then ends the loop
+                    // through the ordinary `None` arm below.
+                    outbound_rx.close();
+                    closing = true;
                 }
             }
         }
@@ -695,27 +713,37 @@ async fn serve_smux(
     {
         stream_tasks.shutdown().await;
     }
-    // A backstop now rather than the normal path: with the streams gone the
-    // forwarder has no senders left and returns at once. It stays bounded so a
-    // future holder of one of these senders cannot hang a session's teardown,
-    // and aborting it cannot orphan copy tasks -- every logical stream was
-    // either finished or cancelled above.
-    let close_result =
-        tokio::time::timeout(std::time::Duration::from_secs(5), &mut close_forwarder)
-            .await
-            .map_err(|_| {
-                close_forwarder.abort();
-                io::Error::other("smux close task timed out")
-            })
-            .and_then(|res| {
-                res.map_err(|error| io::Error::other(format!("smux close task failed: {error}")))
-            });
-    // If the close forwarder failed, still drain/abort the writer so no
-    // background task is orphaned (a leaked writer holds the write half of
-    // the physical stream and its fd).
-    if close_result.is_err() {
-        writer_task.abort();
-    }
+    // Whatever is left holding a drop-close permit at this point is not
+    // reachable from here -- an inner handler that detached the stream it was
+    // given, most concretely -- so waiting on the forwarder is waiting on
+    // something this session can no longer influence. Bounded by the same
+    // grace rather than by five seconds for that reason. Aborting it cannot
+    // orphan copy tasks: it only forwards close notifications, and the session
+    // is over.
+    let close_result = match tokio::time::timeout(STREAM_SHUTDOWN_GRACE, &mut close_forwarder).await
+    {
+        Ok(joined) => {
+            joined.map_err(|error| io::Error::other(format!("smux close task failed: {error}")))
+        }
+        Err(_) => {
+            // Not a failure of this session. Having cancelled every stream
+            // it owns, a forwarder still waiting means a permit is held
+            // where it cannot reach, and reporting that as the session's
+            // outcome buried the real one -- the read result -- under a
+            // timeout the session could do nothing about.
+            close_forwarder.abort();
+            log::debug!(
+                "smux v{version} close forwarder outlived the streams this session owns; \
+                     an inner handler kept one"
+            );
+            Ok(Ok(()))
+        }
+    };
+    // Tell the writer to drain and stop. Signalled after the streams were
+    // cancelled so the FINs their drops emit are already queued, and issued
+    // whether or not the forwarder finished, because the writer is held open by
+    // the same unreachable senders.
+    writer_shutdown.notify_one();
     let close_result = close_result?;
     // Bound only the writer drain: the writer may be stuck behind a leaked
     // outbound sender, and aborting it only releases the write half of the
@@ -1507,6 +1535,64 @@ mod tests {
             // in when their physical connection went away.
             std::future::pending::<()>().await;
             unreachable!("the parked handler never resolves")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DetachingHandler {
+        ready: Notify,
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for DetachingHandler {
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            // What the h2mux magic-destination branch does: carry the logical
+            // stream off into a task of its own and report the work as handled.
+            // The session's own bookkeeping then sees that stream finish, while
+            // its drop-close permit and outbound sender stay alive somewhere
+            // the session cannot reach -- so nothing it cancels will close the
+            // channels its forwarder and writer are waiting on.
+            tokio::spawn(async move {
+                let _held = stream;
+                std::future::pending::<()>().await;
+            });
+            self.ready.notify_one();
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_detached_inner_session_does_not_hold_the_sessions_teardown_open() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handler = Arc::new(DetachingHandler::default());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            handler.clone(),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig::default(),
+            None,
+        ));
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        handler.ready.notified().await;
+        drop(client);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), session)
+            .await
+            .expect("a detached inner session must not hold the session's teardown open")
+            .expect("the session task must not panic");
+
+        if let Err(error) = outcome {
+            assert!(
+                !error.to_string().contains("close task timed out"),
+                "teardown fell back to the close-forwarder timeout: {error}"
+            );
         }
     }
 
