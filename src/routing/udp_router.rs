@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use lru::LruCache;
+use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::io::ReadBuf;
 use tokio::time::{Instant, Sleep};
@@ -114,6 +116,65 @@ const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max concurrent session creation attempts (limits resource usage under burst)
 const MAX_PENDING_CREATES: usize = 16;
+
+/// Distinct actionable UDP failures are surfaced periodically; ordinary
+/// connection teardown stays at DEBUG. The router used to emit every I/O error
+/// as WARN, so a client closing one multiplexed UDP stream could produce many
+/// identical warnings in the same millisecond.
+const UDP_WARNING_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const UDP_WARNING_REASONS: usize = 64;
+const UDP_WARNING_REASON_CHARS: usize = 160;
+
+static UDP_WARNINGS: LazyLock<Mutex<FxHashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+fn is_expected_udp_lifecycle_error(context: &str, error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    ) || ((context.starts_with("remote") || context == "session create")
+        && error.kind() == io::ErrorKind::ConnectionRefused)
+        || (context == "session create" && error.kind() == io::ErrorKind::PermissionDenied)
+}
+
+fn note_udp_warning(
+    seen: &mut FxHashMap<String, Instant>,
+    context: &str,
+    error: &io::Error,
+    now: Instant,
+) -> bool {
+    seen.retain(|_, reported| {
+        now.saturating_duration_since(*reported) < UDP_WARNING_REPORT_INTERVAL
+    });
+    let reason: String = error
+        .to_string()
+        .chars()
+        .take(UDP_WARNING_REASON_CHARS)
+        .collect();
+    let key = format!("{context}:{:?}:{reason}", error.kind());
+    if seen.contains_key(&key) || seen.len() >= UDP_WARNING_REASONS {
+        return false;
+    }
+    seen.insert(key, now);
+    true
+}
+
+fn report_udp_io_error(context: &str, error: &io::Error) {
+    if is_expected_udp_lifecycle_error(context, error) {
+        debug!("UDP {context}: {error}");
+    } else if note_udp_warning(&mut UDP_WARNINGS.lock(), context, error, Instant::now()) {
+        warn!(
+            "UDP {context}: {error} (identical failures are logged at debug for the next {}s)",
+            UDP_WARNING_REPORT_INTERVAL.as_secs()
+        );
+    } else {
+        debug!("UDP {context}: {error}");
+    }
+}
 
 /// How often to check if pings are needed
 const PING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
@@ -672,7 +733,7 @@ impl<'a> UdpRouter<'a> {
                     p
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server read error: {}", e);
+                    report_udp_io_error("server read error", &e);
                     self.set_server_read_eof();
                     break;
                 }
@@ -740,7 +801,7 @@ impl<'a> UdpRouter<'a> {
                             buf = new_buf;
                         }
                         Poll::Ready(Err(e)) => {
-                            warn!("remote write error: {}", e);
+                            report_udp_io_error("remote write error", &e);
                             session.remote_write_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(*id);
@@ -817,7 +878,7 @@ impl<'a> UdpRouter<'a> {
                         .push_back(PendingWrite { id, buf, len });
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("remote write error: {}", e);
+                    report_udp_io_error("remote write error", &e);
                     session.in_remote_write_queue -= 1;
                     self.remote_write_pool.release(buf);
                     session.remote_write_eof = true;
@@ -950,7 +1011,7 @@ impl<'a> UdpRouter<'a> {
                                 }
                             }
                             Poll::Ready(Err(e)) => {
-                                warn!("server write error: {}", e);
+                                report_udp_io_error("server write error", &e);
                                 self.server_write_pool.release(buf); // release in-hand buffer
                                 self.set_server_write_eof();
                                 return (remote_read_progress, server_write_progress);
@@ -1017,7 +1078,7 @@ impl<'a> UdpRouter<'a> {
                     break;
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server write error: {}", e);
+                    report_udp_io_error("server write error", &e);
                     session.in_server_write_queue -= 1; // last use of session borrow
                     self.server_write_pool.release(buf); // release current buffer
                     self.set_server_write_eof(); // clears remaining queue
@@ -1123,7 +1184,7 @@ impl<'a> UdpRouter<'a> {
                             }
                         }
                         Poll::Ready(Err(e)) => {
-                            warn!("remote write error: {}", e);
+                            report_udp_io_error("remote write error", &e);
                             session.remote_write_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(id);
@@ -1138,7 +1199,21 @@ impl<'a> UdpRouter<'a> {
                 true
             }
             Err(e) => {
-                warn!("Failed to create session for {}: {}", destination, e);
+                if is_expected_udp_lifecycle_error("session create", &e) {
+                    debug!("Failed to create UDP session for {destination}: {e}");
+                } else if note_udp_warning(
+                    &mut UDP_WARNINGS.lock(),
+                    "session create",
+                    &e,
+                    Instant::now(),
+                ) {
+                    warn!(
+                        "Failed to create UDP session for {destination}: {e} (identical failures are logged at debug for the next {}s)",
+                        UDP_WARNING_REPORT_INTERVAL.as_secs()
+                    );
+                } else {
+                    debug!("Failed to create UDP session for {destination}: {e}");
+                }
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
                     // Mark as blocked
                     self.blocked.put(destination.clone(), ());
@@ -1539,7 +1614,7 @@ impl UdpRouter<'_> {
                         server_write_progress = true;
                     }
                     Poll::Ready(Err(e)) => {
-                        warn!("server flush error: {}", e);
+                        report_udp_io_error("server flush error", &e);
                         self.set_server_write_eof();
                     }
                     Poll::Pending => {}
@@ -1585,6 +1660,47 @@ mod tests {
     use crate::async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
+
+    #[test]
+    fn udp_error_classification_separates_lifecycle_from_resource_faults() {
+        assert!(is_expected_udp_lifecycle_error(
+            "server read error",
+            &io::Error::new(io::ErrorKind::ConnectionAborted, "physical stream closed")
+        ));
+        assert!(is_expected_udp_lifecycle_error(
+            "remote write error",
+            &io::Error::new(io::ErrorKind::ConnectionRefused, "ICMP port unreachable")
+        ));
+        assert!(!is_expected_udp_lifecycle_error(
+            "server read error",
+            &io::Error::new(io::ErrorKind::OutOfMemory, "logical inbound queue is full")
+        ));
+        assert!(!is_expected_udp_lifecycle_error(
+            "server read error",
+            &io::Error::new(io::ErrorKind::InvalidData, "malformed transport frame")
+        ));
+    }
+
+    #[test]
+    fn identical_udp_warnings_are_bounded_by_reason_and_interval() {
+        let mut seen = FxHashMap::default();
+        let start = Instant::now();
+        let error = io::Error::new(io::ErrorKind::InvalidData, "malformed transport frame");
+
+        assert!(note_udp_warning(&mut seen, "server read", &error, start));
+        assert!(!note_udp_warning(
+            &mut seen,
+            "server read",
+            &error,
+            start + Duration::from_secs(1)
+        ));
+        assert!(note_udp_warning(
+            &mut seen,
+            "server read",
+            &error,
+            start + UDP_WARNING_REPORT_INTERVAL
+        ));
+    }
 
     struct PendingMessageStream;
 
