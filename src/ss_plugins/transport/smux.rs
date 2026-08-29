@@ -46,8 +46,24 @@ pub static STREAMS_DROPPED_BY_LISTENER_BYTES: std::sync::atomic::AtomicUsize =
 pub static STREAMS_DROPPED_BY_FRAME_QUEUE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub(super) fn record_backpressure_drop(cause: BackpressureCause) {
+/// Counts a dropped logical stream and says which one it was.
+///
+/// The stream cannot report this itself. Every caller aborts the stream's
+/// task, so the terminal event it sends afterwards arrives at a task that is
+/// already gone: 613 drops across four production nodes produced no log line
+/// at all, leaving the counters climbing with nothing naming a victim. The
+/// report belongs here anyway -- the session is what knows both the stream id
+/// and which budget refused it.
+///
+/// INFO rather than DEBUG because the release build compiles `debug!` out
+/// entirely, and this is the one record that a killed connection ever gets.
+pub(super) fn record_backpressure_drop(
+    protocol: impl std::fmt::Display,
+    stream_id: u32,
+    cause: BackpressureCause,
+) {
     use std::sync::atomic::Ordering::Relaxed;
+    log::info!("{protocol} dropped logical stream {stream_id}: {cause}");
     STREAMS_DROPPED_BY_BACKPRESSURE.fetch_add(1, Relaxed);
     match cause {
         BackpressureCause::Bytes(ReceiveBudgetScope::Stream) => {
@@ -67,6 +83,27 @@ pub(super) fn record_backpressure_drop(cause: BackpressureCause) {
 pub(super) enum BackpressureCause {
     Bytes(ReceiveBudgetScope),
     FrameQueue,
+}
+
+impl std::fmt::Display for BackpressureCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // A stream that outgrew its own ceiling is the only debtor it
+            // could be. At the wider scopes the budget was spent by the
+            // session or the listener as a whole, and this stream is merely
+            // the one holding the most of it.
+            Self::Bytes(ReceiveBudgetScope::Stream) => {
+                f.write_str("stream receive budget exhausted")
+            }
+            Self::Bytes(scope) => {
+                write!(
+                    f,
+                    "{scope} receive budget exhausted, this stream held the most"
+                )
+            }
+            Self::FrameQueue => f.write_str("logical inbound frame queue is full"),
+        }
+    }
 }
 
 /// Default ceiling on queued inbound bytes for one logical stream.
@@ -622,14 +659,19 @@ async fn serve_smux(
             biased;
             Some(eviction) = eviction_rx.recv() => {
                 if let Some(state) = streams.remove(&eviction.stream_id) {
-                    record_backpressure_drop(BackpressureCause::Bytes(eviction.scope));
+                    let cause = BackpressureCause::Bytes(eviction.scope);
+                    record_backpressure_drop(
+                        format_args!("smux v{version}"),
+                        eviction.stream_id,
+                        cause,
+                    );
                     if let Some(task) = state.task {
                         task.abort();
                     }
                     if let Some(terminal) = state.terminal {
                         let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
                             io::ErrorKind::OutOfMemory,
-                            format!("smux v{version} {} receive budget evicted the largest buffered stream", eviction.scope),
+                            format!("smux v{version} {cause}"),
                         )));
                     }
                 }
@@ -765,7 +807,11 @@ async fn serve_smux(
                     }
                 }
                 if let Some(cause) = backpressure {
-                    record_backpressure_drop(cause);
+                    record_backpressure_drop(
+                        format_args!("smux v{version}"),
+                        frame.stream_id,
+                        cause,
+                    );
                     // This stream is not draining as fast as its peer is
                     // sending, and smux v1 has no per-stream window to push
                     // back with. Dropping the frame would leave a hole in the
@@ -782,18 +828,7 @@ async fn serve_smux(
                         if let Some(terminal) = state.terminal {
                             let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
                                 io::ErrorKind::OutOfMemory,
-                                match cause {
-                                    BackpressureCause::Bytes(scope) => {
-                                        format!(
-                                            "smux v{version} {scope} receive buffer limit exceeded"
-                                        )
-                                    }
-                                    BackpressureCause::FrameQueue => {
-                                        format!(
-                                            "smux v{version} logical inbound frame queue is full"
-                                        )
-                                    }
-                                },
+                                format!("smux v{version} {cause}"),
                             )));
                         }
                     }
@@ -1155,6 +1190,34 @@ mod tests {
             .expect_err("oversized channel must be rejected");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    /// The drop counters have exactly one writer, and it logs. What an
+    /// operator can still get wrong is the wording, so pin the text that
+    /// names the debtor apart from the text that names a bystander holding
+    /// the most of a shared budget.
+    #[test]
+    fn a_drop_reason_distinguishes_the_debtor_from_the_largest_holder() {
+        assert_eq!(
+            BackpressureCause::Bytes(ReceiveBudgetScope::Stream).to_string(),
+            "stream receive budget exhausted"
+        );
+        for (scope, expected) in [
+            (
+                ReceiveBudgetScope::Session,
+                "session receive budget exhausted, this stream held the most",
+            ),
+            (
+                ReceiveBudgetScope::Listener,
+                "listener receive budget exhausted, this stream held the most",
+            ),
+        ] {
+            assert_eq!(BackpressureCause::Bytes(scope).to_string(), expected);
+        }
+        assert_eq!(
+            BackpressureCause::FrameQueue.to_string(),
+            "logical inbound frame queue is full"
+        );
     }
 
     #[test]

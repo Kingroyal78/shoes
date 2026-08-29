@@ -428,14 +428,15 @@ async fn serve_mux_cool(
             Some(eviction) = eviction_rx.recv() => {
                 let stream_id = eviction.stream_id as u16;
                 if let Some(state) = streams.remove(&stream_id) {
-                    record_backpressure_drop(BackpressureCause::Bytes(eviction.scope));
+                    let cause = BackpressureCause::Bytes(eviction.scope);
+                    record_backpressure_drop("Mux.Cool", eviction.stream_id, cause);
                     if let Some(task) = state.task {
                         task.abort();
                     }
                     if let Some(terminal) = state.terminal {
                         let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
-                        io::ErrorKind::OutOfMemory,
-                        format!("Mux.Cool {} receive budget evicted the largest buffered stream", eviction.scope),
+                            io::ErrorKind::OutOfMemory,
+                            format!("Mux.Cool {cause}"),
                         )));
                     }
                 }
@@ -477,7 +478,11 @@ async fn serve_mux_cool(
                     let tracked = match budget.track(data) {
                         Ok(data) => data,
                         Err(error) => {
-                            record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                            record_backpressure_drop(
+                                "Mux.Cool",
+                                u32::from(metadata.stream_id),
+                                BackpressureCause::Bytes(error.scope),
+                            );
                             let _ = outbound_tx.try_send(OutboundCommand::Finished {
                                 stream_id: u32::from(metadata.stream_id),
                             });
@@ -485,7 +490,11 @@ async fn serve_mux_cool(
                         }
                     };
                     if inbound_tx.try_send(InboundEvent::Data(tracked)).is_err() {
-                        record_backpressure_drop(BackpressureCause::FrameQueue);
+                        record_backpressure_drop(
+                            "Mux.Cool",
+                            u32::from(metadata.stream_id),
+                            BackpressureCause::FrameQueue,
+                        );
                         let _ = outbound_tx.try_send(OutboundCommand::Finished {
                             stream_id: u32::from(metadata.stream_id),
                         });
@@ -532,7 +541,11 @@ async fn serve_mux_cool(
                             let tracked = match state.budget.track(data) {
                                 Ok(data) => data,
                                 Err(error) => {
-                                    record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                                    record_backpressure_drop(
+                                        "Mux.Cool",
+                                        u32::from(metadata.stream_id),
+                                        BackpressureCause::Bytes(error.scope),
+                                    );
                                     let removed = streams.remove(&metadata.stream_id);
                                     if let Some(task) =
                                         removed.as_ref().and_then(|state| state.task.as_ref())
@@ -555,7 +568,11 @@ async fn serve_mux_cool(
                                 Ok(()) => {}
                                 Err(TrySendError::Closed(_)) => state.inbound = None,
                                 Err(TrySendError::Full(_)) => {
-                                    record_backpressure_drop(BackpressureCause::FrameQueue);
+                                    record_backpressure_drop(
+                                        "Mux.Cool",
+                                        u32::from(metadata.stream_id),
+                                        BackpressureCause::FrameQueue,
+                                    );
                                     let removed = streams.remove(&metadata.stream_id);
                                     if let Some(task) =
                                         removed.as_ref().and_then(|state| state.task.as_ref())
@@ -608,14 +625,22 @@ async fn serve_mux_cool(
                                     inbound.try_send(InboundEvent::Data(tracked)),
                                     Err(TrySendError::Full(_))
                                 ) {
-                                    record_backpressure_drop(BackpressureCause::FrameQueue);
+                                    record_backpressure_drop(
+                                        "Mux.Cool",
+                                        u32::from(metadata.stream_id),
+                                        BackpressureCause::FrameQueue,
+                                    );
                                     local_failure = Some(
                                         "Mux.Cool logical inbound frame queue is full".to_string(),
                                     );
                                 }
                             }
                             Err(error) => {
-                                record_backpressure_drop(BackpressureCause::Bytes(error.scope));
+                                record_backpressure_drop(
+                                    "Mux.Cool",
+                                    u32::from(metadata.stream_id),
+                                    BackpressureCause::Bytes(error.scope),
+                                );
                                 local_failure = Some(error.to_string());
                             }
                         }
