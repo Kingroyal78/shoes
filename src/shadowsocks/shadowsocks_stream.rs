@@ -255,14 +255,23 @@ const INITIAL_BUF_SIZE: usize = 4096;
 /// How far a peer's handshake timestamp may drift from ours, in either
 /// direction.
 ///
-/// AEAD-2022 specifies +/-30s, and the window has to be symmetric to honour
-/// it: a clock running a few seconds fast is as ordinary as one running slow,
-/// so a one-sided window refuses connections the spec allows -- which it did,
-/// at roughly 2300 handshakes a day on a single node, almost all of them off
-/// by under ten seconds. The salt-replay memory must outlive this whole span,
-/// or a handshake could be replayed once its salt was forgotten but before its
-/// timestamp went stale; see `SALT_REPLAY_WINDOW_SECS`.
-pub(super) const TIMESTAMP_SKEW_TOLERANCE_SECS: u64 = 30;
+/// Deliberately wider than the +/-30s AEAD-2022 specifies, and symmetric: a
+/// clock running fast is as ordinary as one running slow, so a one-sided
+/// window refuses connections for a reason the peer cannot see or fix.
+///
+/// 180s is where the observed drift stops looking like a clock and starts
+/// looking like a timezone. Eleven days across four nodes recorded 8199
+/// refusals whose drift clustered under 60s and again at 154-155s, then
+/// nothing until 8h and 15h -- devices serving local time as UTC, which no
+/// tolerance should admit. A 180s window accepts 97% of what was refused and
+/// still rejects every one of those. The clusters were not stray connections
+/// either: one held a steady 47-108 refusals an hour for eight hours without
+/// ever getting in, which is a device that simply cannot use the service.
+///
+/// The salt-replay memory must outlive this whole span, or a handshake could
+/// be replayed once its salt was forgotten but before its timestamp went
+/// stale; see `SALT_REPLAY_WINDOW_SECS`, which moves with this constant.
+pub(super) const TIMESTAMP_SKEW_TOLERANCE_SECS: u64 = 180;
 
 fn shadowsocks_message_too_large_error(len: usize, max_len: usize) -> std::io::Error {
     std::io::Error::new(
@@ -1521,6 +1530,27 @@ mod tests {
         for lead in 1..=TIMESTAMP_SKEW_TOLERANCE_SECS {
             check_timestamp_freshness(TEST_NOW_SECS + lead, TEST_NOW_SECS)
                 .unwrap_or_else(|e| panic!("{lead}s fast must be accepted: {e}"));
+        }
+    }
+
+    /// The window exists to separate a clock from a timezone, so pin it
+    /// against the shapes production actually produced rather than against
+    /// the number alone: a device 2.5 minutes out retried for eight hours
+    /// without ever connecting, while the drift beyond it was whole hours --
+    /// local time served as UTC, which widening must never start admitting.
+    #[test]
+    fn timestamp_window_admits_clock_drift_and_still_refuses_a_wrong_timezone() {
+        for drift in [39, 40, 44, 58, 92, 154, 155] {
+            for stamp in [TEST_NOW_SECS + drift, TEST_NOW_SECS - drift] {
+                check_timestamp_freshness(stamp, TEST_NOW_SECS)
+                    .unwrap_or_else(|e| panic!("{drift}s of clock drift must connect: {e}"));
+            }
+        }
+        for drift in [8 * 3600, 15 * 3600] {
+            assert!(
+                check_timestamp_freshness(TEST_NOW_SECS - drift, TEST_NOW_SECS).is_err(),
+                "a {drift}s offset is a timezone, not a clock"
+            );
         }
     }
 

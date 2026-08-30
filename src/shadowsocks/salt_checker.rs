@@ -11,13 +11,20 @@ pub trait SaltChecker: Send + Sync + Debug {
 /// replayed handshake.
 pub type SharedSaltChecker = Arc<dyn SaltChecker>;
 
-/// How long a salt is remembered. Must exceed the AEAD-2022 timestamp window,
+/// How long a salt is remembered. Must exceed the accepted timestamp window,
 /// or a handshake could be replayed after its salt was forgotten but before its
-/// timestamp went stale. That window is symmetric (+/-30s, so a 60s span), and
-/// retention equal to the span leaves no margin for the delay between a peer
-/// stamping a handshake and this side recording its salt -- hence the extra
-/// 30s here. Widening the timestamp tolerance means widening this too.
-pub(super) const SALT_REPLAY_WINDOW_SECS: u64 = 90;
+/// timestamp went stale. That window is symmetric (+/-180s, so a 360s span),
+/// and retention equal to the span leaves no margin for the delay between a
+/// peer stamping a handshake and this side recording its salt -- hence the
+/// extra 30s here. Widening the timestamp tolerance means widening this too;
+/// the test below is what stops the two from drifting apart.
+///
+/// Cost is the salts held resident, and it is small: entries are a keyed u64
+/// with no per-entry allocation, so the busiest measured node -- 6.3 handshakes
+/// a second -- holds about 2500 of them, on the order of 100KB. The set has no
+/// size cap though, only expiry, so retention is also the multiplier on how
+/// much memory a sustained handshake flood can pin.
+pub(super) const SALT_REPLAY_WINDOW_SECS: u64 = 390;
 
 /// Build a checker that several handler generations can share.
 ///
