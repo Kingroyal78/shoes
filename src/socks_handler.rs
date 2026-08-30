@@ -486,7 +486,7 @@ async fn run_udp_associate(
 
     // Runs per-destination routing in parallel with TCP monitoring.
     tokio::select! {
-        result = run_udp_routing(ServerStream::Targeted(server_stream), proxy_selector, None, resolver, false) => {
+        result = run_udp_routing(ServerStream::Targeted(server_stream), proxy_selector, None, resolver, false, None) => {
             result
         }
         _ = monitor_tcp_close(&mut tcp_stream) => {

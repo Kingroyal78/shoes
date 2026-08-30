@@ -18,6 +18,7 @@ use crate::tcp::tcp_server::{
     AuthenticatedConnectionScope, handle_server_setup_result, run_udp_copy,
 };
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
+use crate::v2board::egress::{self, DedicatedIpBinding};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
@@ -174,6 +175,19 @@ impl AnyTlsSession {
             peer_addr,
             initial_data: std::sync::Mutex::new(initial_data),
         })
+    }
+
+    /// The dedicated egress the authenticated buyer paid for, if any.
+    ///
+    /// Every outbound path in this session has to consult it -- TCP forward,
+    /// UoT single-destination and UoT multi-destination alike -- and the one
+    /// that read it straight off `authenticated_user` inline is the one the
+    /// others were written by copying. Naming it once is what makes a path
+    /// that forgets it visible.
+    fn dedicated_egress(&self) -> Option<DedicatedIpBinding> {
+        self.authenticated_user
+            .as_ref()
+            .and_then(|user| user.dedicated_ip.clone())
     }
 
     /// Create a minimal server session for testing protocol framing.
@@ -829,9 +843,21 @@ impl AnyTlsSession {
                     remote_location
                 );
 
+                // AnyTLS 多路复用逻辑流，出站在这里直接拨号，不经过
+                // tcp_server::setup_client_tcp_stream —— 专属出口绑定必须在这里
+                // 单独接一次，否则给 anytls 节点绑独立IP 会静默无效。
+                let egress_chain = egress::chain_group_for_dial(
+                    self.dedicated_egress().as_ref(),
+                    self.outbound_dispatcher.as_deref(),
+                    chain_group,
+                    &self.resolver,
+                    &remote_location,
+                );
+
                 // Node-side local routing takes over the dial when configured.
-                let client_result = match &self.outbound_dispatcher {
-                    Some(dispatcher) => dispatcher
+                let client_result = match (&self.outbound_dispatcher, egress_chain) {
+                    (_, Some(chain)) => chain.connect_tcp(remote_location, &self.resolver).await,
+                    (Some(dispatcher), None) => dispatcher
                         .dial_tcp(remote_location.location(), None, &self.resolver)
                         .await
                         .map(|client_stream| TcpClientSetupResult {
@@ -839,7 +865,7 @@ impl AnyTlsSession {
                             early_data: None,
                         })
                         .map_err(|e| std::io::Error::other(e.to_string())),
-                    None => {
+                    (None, None) => {
                         chain_group
                             .connect_tcp(remote_location, &self.resolver)
                             .await
@@ -993,35 +1019,46 @@ impl AnyTlsSession {
                     scope.wrap_message_stream(Box::new(VlessMessageStream::new(stream)));
 
                 // Connect through the proxy chain (local routing rules take
-                // over the dial when a dispatcher is configured)
-                let client_stream = match &self.outbound_dispatcher {
-                    Some(dispatcher) => {
-                        match dispatcher
-                            .connect_udp_bidirectional(&remote_location, None, &self.resolver)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => {
-                                // Send SYNACK with error (protocol v2)
-                                let error_msg = format!("UDP connect failed: {}", e);
-                                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                                return Err(e);
-                            }
-                        }
-                    }
-                    None => {
-                        match chain_group
+                // over the dial when a dispatcher is configured).
+                //
+                // The dedicated egress belongs here too. It did not use to:
+                // this is the single-destination shape, and while the
+                // multi-destination one below hands the binding to
+                // `run_udp_routing`, here the dial fell straight through to
+                // the selector's chain -- so a buyer's DNS or QUIC to one
+                // address left from the node's shared IP, which is the one
+                // thing the feature sells against.
+                let egress_chain = egress::chain_group_for_dial(
+                    self.dedicated_egress().as_ref(),
+                    self.outbound_dispatcher.as_deref(),
+                    chain_group,
+                    &self.resolver,
+                    &remote_location,
+                );
+                let dial = match (&self.outbound_dispatcher, &egress_chain) {
+                    (_, Some(chain)) => {
+                        chain
                             .connect_udp_bidirectional(&self.resolver, remote_location)
                             .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => {
-                                // Send SYNACK with error (protocol v2)
-                                let error_msg = format!("UDP connect failed: {}", e);
-                                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                                return Err(e);
-                            }
-                        }
+                    }
+                    (Some(dispatcher), None) => {
+                        dispatcher
+                            .connect_udp_bidirectional(&remote_location, None, &self.resolver)
+                            .await
+                    }
+                    (None, None) => {
+                        chain_group
+                            .connect_udp_bidirectional(&self.resolver, remote_location)
+                            .await
+                    }
+                };
+                let client_stream = match dial {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // Send SYNACK with error (protocol v2)
+                        let error_msg = format!("UDP connect failed: {}", e);
+                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                        return Err(e);
                     }
                 };
 
@@ -1093,6 +1130,7 @@ impl AnyTlsSession {
             self.outbound_dispatcher.clone(),
             self.resolver.clone(),
             false, // no initial flush needed
+            self.dedicated_egress(),
         )
         .await;
 

@@ -14,12 +14,38 @@ pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket = new_socket2_udp_socket(
-        is_ipv6,
-        bind_interface,
-        Some(get_unspecified_socket_addr(is_ipv6)),
-        false,
-    )?;
+    new_udp_socket_bound(is_ipv6, bind_interface, None)
+}
+
+/// `bind_source` picks the local address the socket sends from. `None` keeps the
+/// unspecified address, which is what every caller wanted before per-user egress
+/// binding existed. The family has to match `is_ipv6` -- a mismatch fails at bind
+/// time, so callers pick the source against the resolved target family.
+pub fn new_udp_socket_bound(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_source: Option<IpAddr>,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let bind_address = match bind_source {
+        // The same guard the TCP twin carries, and for the same reason: a v4
+        // source handed to a v6 socket fails inside `bind()` as a bare
+        // `EINVAL`, which tells whoever reads the log nothing about which of
+        // the two addresses was wrong. UDP needs it more, not less -- the
+        // dial resolved one target address and has no next one to fall back
+        // to, so this is where a mismatched dedicated egress ends.
+        Some(source) if source.is_ipv6() != is_ipv6 => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "egress source {source} does not match the {} target family",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                ),
+            ));
+        }
+        Some(ip) => SocketAddr::new(ip, 0),
+        None => get_unspecified_socket_addr(is_ipv6),
+    };
+    let socket = new_socket2_udp_socket(is_ipv6, bind_interface, Some(bind_address), false)?;
 
     into_tokio_udp_socket(socket)
 }
@@ -103,6 +129,21 @@ pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
 ) -> std::io::Result<tokio::net::TcpSocket> {
+    new_tcp_socket_bound(bind_interface, None, is_ipv6)
+}
+
+/// `bind_source` picks the local address the connection goes out from, which is
+/// what a per-user dedicated egress IP needs. Binding happens before `connect`,
+/// with port 0 so the kernel still picks the ephemeral port.
+///
+/// The family has to match `is_ipv6`: binding a v4 source on a v6 socket fails
+/// with EINVAL. Callers resolve the target first and only pass a source of the
+/// same family.
+pub fn new_tcp_socket_bound(
+    bind_interface: Option<String>,
+    bind_source: Option<IpAddr>,
+    is_ipv6: bool,
+) -> std::io::Result<tokio::net::TcpSocket> {
     let tcp_socket = if is_ipv6 {
         tokio::net::TcpSocket::new_v6()?
     } else {
@@ -116,6 +157,19 @@ pub fn new_tcp_socket(
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
+    }
+
+    if let Some(source) = bind_source {
+        if source.is_ipv6() != is_ipv6 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "egress source {source} does not match the {} target family",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                ),
+            ));
+        }
+        tcp_socket.bind(SocketAddr::new(source, 0))?;
     }
 
     Ok(tcp_socket)
@@ -347,6 +401,107 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of a dedicated egress IP: the peer has to see the
+    /// address we bound, not whatever the routing table would have picked.
+    /// 127.0.0.0/8 is routable in its entirety on Linux, so this needs no
+    /// interface setup.
+    #[tokio::test]
+    async fn a_bound_source_is_the_address_the_peer_observes() {
+        let listener = new_tcp_listener("127.0.0.1:0".parse().unwrap(), 128, None).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let source: IpAddr = "127.0.0.2".parse().unwrap();
+        let socket = new_tcp_socket_bound(None, Some(source), false).unwrap();
+        let connect = tokio::spawn(async move { socket.connect(addr).await });
+
+        let (_stream, peer) = listener.accept().await.unwrap();
+        connect.await.unwrap().unwrap();
+
+        assert_eq!(peer.ip(), source);
+        // Port 0 was requested, so the kernel still assigns an ephemeral one.
+        assert_ne!(peer.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_socket_keeps_the_default_source() {
+        let listener = new_tcp_listener("127.0.0.1:0".parse().unwrap(), 128, None).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let socket = new_tcp_socket_bound(None, None, false).unwrap();
+        let connect = tokio::spawn(async move { socket.connect(addr).await });
+
+        let (_stream, peer) = listener.accept().await.unwrap();
+        connect.await.unwrap().unwrap();
+
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn a_source_from_the_wrong_family_is_refused_before_binding() {
+        // A v4 egress address cannot serve a v6 target. The caller retries the
+        // next resolved address instead of failing the whole dial.
+        let err = new_tcp_socket_bound(None, Some("127.0.0.2".parse().unwrap()), true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = new_tcp_socket_bound(None, Some("::1".parse().unwrap()), false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// 和 TCP 那条一样，断言的是对端实际看到的源地址，而不是我们自己报告的
+    /// local_addr —— 后者绑没绑都"看起来对"。
+    /// UDP had no such guard, and needs it more than TCP does: the dial
+    /// resolves a single target address, so there is no next one to retry --
+    /// a mismatched family ended the dial inside `bind()` as a bare EINVAL
+    /// naming neither address.
+    #[test]
+    fn a_udp_source_from_the_wrong_family_is_refused_before_binding() {
+        let err = new_udp_socket_bound(true, None, Some("127.0.0.2".parse().unwrap())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("127.0.0.2"), "{err}");
+
+        let err = new_udp_socket_bound(false, None, Some("::1".parse().unwrap())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn a_bound_udp_source_is_what_the_peer_receives_from() {
+        let peer = new_udp_socket_bound(false, None, Some("127.0.0.1".parse().unwrap())).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let sender = new_udp_socket_bound(false, None, Some("127.0.0.2".parse().unwrap())).unwrap();
+        sender.send_to(b"ping", peer_addr).await.unwrap();
+
+        let mut buf = [0u8; 8];
+        let (len, observed) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"ping");
+        assert_eq!(observed.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unbound_udp_socket_keeps_the_default_source() {
+        let peer = new_udp_socket_bound(false, None, Some("127.0.0.1".parse().unwrap())).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let sender = new_udp_socket_bound(false, None, None).unwrap();
+        sender.send_to(b"ping", peer_addr).await.unwrap();
+
+        let mut buf = [0u8; 8];
+        let (_, observed) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(observed.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_udp_socket_can_be_bound_to_a_source_too() {
+        let socket = new_udp_socket_bound(false, None, Some("127.0.0.2".parse().unwrap())).unwrap();
+        assert_eq!(
+            socket.local_addr().unwrap().ip(),
+            "127.0.0.2".parse::<IpAddr>().unwrap()
+        );
+
+        let unbound = new_udp_socket_bound(false, None, None).unwrap();
+        assert!(unbound.local_addr().unwrap().ip().is_unspecified());
+    }
 
     #[tokio::test]
     async fn reuse_port_puts_every_accept_loop_on_the_same_port() {

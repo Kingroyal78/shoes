@@ -73,6 +73,78 @@ V2Board `device_limit_mode` affects the panel's cross-node alive aggregation ret
 
 Policy changes affect new connections after the next successful user/config sync. Existing long-lived connections continue until the client disconnects; traffic and alive accounting still flush periodically while they are open.
 
+## Dedicated Egress IP
+
+The panel may sell a user an exit address that is theirs alone and publish it on
+the user list as `dedicated_ip`. The panel-side contract is
+`docs/dedicated-ip-contract-v1.md` in the V2Board repository.
+
+**Inbound is untouched.** The buyer keeps connecting to the node they were
+already using and authenticates as themselves; the node owns its listener as
+before. Only that user's outbound changes, in one of two ways:
+
+| `mode` | What the panel sold | What the backend does |
+|---|---|---|
+| `egress` | An address the box itself holds | Binds every outbound socket for that user to it |
+| `proxy` | A bought SOCKS5/HTTP proxy | Dials that user's traffic through the proxy |
+
+Both are normalized into one `DedicatedEgress` in `src/v2board/egress.rs` and
+turn into a cached one-hop chain, so the dial path only ever swaps a
+`ClientChainGroup` rather than growing a branch per delivery.
+
+- Supported on the TCP-family protocols: VMess, VLESS, Trojan, Shadowsocks,
+  AnyTLS.
+- **Not supported on TUIC, Hysteria2, or NaiveProxy H3.** Their authenticated
+  connection scope keeps only whether the connection authenticated, not which user
+  it was, so there is no identity at the dial. Those paths pass no binding. The
+  panel refuses to bind a dedicated-IP pool to a QUIC node for the same reason.
+- AnyTLS multiplexes logical streams and dials inside its own session loop rather
+  than through the shared `setup_client_tcp_stream`, so the binding is applied
+  there separately. Missing that is why an AnyTLS node would otherwise accept a
+  dedicated-IP pool and silently ignore it.
+- A binding only applies to a direct dial. When a local outbound dispatcher or a
+  multi-hop chain is configured, the binding is skipped with a warning: node-side
+  routing has its own opinion about where traffic goes.
+- Missing `dedicated_ip` means no binding, which is what every user without one
+  gets. Older panels that never send the field are unaffected.
+
+### `egress` — source binding
+
+- `dedicated_ip.ip` becomes the source address of every outbound connection for
+  that user, **TCP and UDP alike**.
+- UDP covers all three server-side shapes: the single-destination
+  (`BidirectionalUdp`) path used by VMess/VLESS/Trojan, the per-destination router
+  used by SOCKS5 UDP ASSOCIATE and by UoT, and session-based UDP. Each UDP session
+  gets its own socket bound to the user's address.
+- Address families must match. A v4 source cannot serve a v6 target; that resolved
+  address is skipped and the next one is tried rather than failing the dial.
+
+### `proxy` — upstream proxy
+
+- `protocol` is `socks5` or `http`; `ip` and `port` address the upstream, and
+  `username`/`password` are the **backend's** dialing credentials. The panel never
+  publishes them to the buyer.
+- Chains are cached per full egress, credentials included, so two buyers on the
+  same upstream host with different accounts never share a chain.
+- **UDP is refused, not downgraded.** Neither the SOCKS5 nor the HTTP client hop
+  carries UDP-over-TCP here, so the chain reports `Unsupported` and the datagram
+  is dropped. Falling back to a direct dial would put the node's own address on
+  the wire, which is exactly what the buyer paid to avoid. The panel's purchase
+  page states this.
+
+### Malformed values
+
+Every case below is logged and drops that one user's binding. None of them fails
+the sync: losing one user's egress is a smaller failure than a node refusing its
+whole user list.
+
+- An unparseable `ip`.
+- An unknown `mode`. It is **not** treated as `egress` — binding the source
+  address would be flatly wrong for anything proxy-shaped.
+- `mode = proxy` with an unsupported `protocol`, or with no usable `port`.
+- `mode = proxy` with a username but no password, or the reverse. Half a
+  credential is a truncated row, and dialing with it authenticates as nobody.
+
 ## Routes
 
 V2Board `route_id` rules are applied before the default direct outbound:

@@ -4,7 +4,11 @@
 
 It talks to V2Board UniProxy APIs, pulls node configuration and users, starts local proxy listeners, records authenticated user traffic, and pushes traffic/alive data back to the panel.
 
-The production acceptance boundary is server-side only: V2Board control-plane integration, inbound protocol handling, user policy, routing, and accounting. Generic local-YAML clients, outbound proxy chaining, TUN, SOCKS/HTTP utility listeners, and client-side H2MUX/AnyTLS behavior are legacy code surfaces and are not production claims of this backend.
+The production acceptance boundary is server-side only: V2Board control-plane integration, inbound protocol handling, user policy, routing, accounting, and the panel-driven egress feature below. Generic local-YAML clients, locally configured outbound proxy *chains*, TUN, SOCKS/HTTP utility listeners, and client-side H2MUX/AnyTLS behavior remain legacy code surfaces and are not production claims of this backend.
+
+One panel-driven path is in scope even though it touches code that used to be legacy-only:
+
+- **Per-user dedicated egress** — the panel publishes `dedicated_ip` on the user list and that user's outbound is changed accordingly: either sent from a source address the box owns, or dialed through a SOCKS5/HTTP upstream the operator bought. Inbound is untouched; the buyer keeps using the node they were already on. Per-user egress driven by the panel is production; building outbound proxy chains from local YAML is still not.
 
 ## Supported Scope
 

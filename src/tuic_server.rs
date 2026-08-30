@@ -784,6 +784,11 @@ async fn process_tcp_stream(
             remote_location.clone(),
             sniffed_protocol,
             None,
+            // No dedicated egress binding: the QUIC session scope keeps only
+            // whether the connection authenticated, not which user it was, so
+            // there is nothing here to bind against. The panel refuses to bind
+            // a dedicated-IP pool to a QUIC node for the same reason.
+            None,
         ),
     );
 

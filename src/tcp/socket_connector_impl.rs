@@ -3,7 +3,7 @@
 //! Handles TCP and QUIC transports with bind_interface support.
 //! Created from the socket-related fields of any ClientConfig.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -20,7 +20,7 @@ use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
 use crate::rustls_config_util::create_client_config;
-use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
+use crate::socket_util::{new_tcp_socket_bound, new_udp_socket_bound, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
 
 use super::socket_connector::SocketConnector;
@@ -49,7 +49,25 @@ enum TransportConfig {
 #[derive(Debug)]
 pub struct SocketConnectorImpl {
     bind_interface: Option<String>,
+    /// Local address every outbound connection from this connector goes out
+    /// from. Set for a per-user dedicated egress IP; `None` everywhere else,
+    /// which leaves the kernel to pick the source as it always did.
+    bind_source: Option<IpAddr>,
     transport: TransportConfig,
+}
+
+impl SocketConnectorImpl {
+    /// A direct TCP connector that sends from `bind_source`.
+    ///
+    /// Used to build the one-hop chain a dedicated egress IP dials through, so
+    /// the binding never has to be threaded through the `SocketConnector` trait.
+    pub fn direct_tcp_from_source(bind_source: IpAddr) -> Self {
+        Self {
+            bind_interface: None,
+            bind_source: Some(bind_source),
+            transport: TransportConfig::Tcp { no_delay: true },
+        }
+    }
 }
 
 impl SocketConnectorImpl {
@@ -159,9 +177,10 @@ impl SocketConnectorImpl {
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
-                    let udp_socket = match new_udp_socket(
+                    let udp_socket = match new_udp_socket_bound(
                         target_address.address().is_ipv6(),
                         bind_interface.clone(),
+                        None,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -192,6 +211,7 @@ impl SocketConnectorImpl {
 
         Some(Self {
             bind_interface,
+            bind_source: None,
             transport,
         })
     }
@@ -203,6 +223,7 @@ impl SocketConnectorImpl {
     pub fn new_tcp(bind_interface: Option<String>, no_delay: bool) -> Self {
         Self {
             bind_interface,
+            bind_source: None,
             transport: TransportConfig::Tcp { no_delay },
         }
     }
@@ -224,8 +245,26 @@ impl SocketConnector for SocketConnectorImpl {
             TransportConfig::Tcp { no_delay } => {
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
-                    let tcp_socket =
-                        new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
+                    // Socket setup becomes per-address fallible once a source is
+                    // bound: a v4 egress address cannot serve a v6 target. Treat
+                    // that like a failed connect and move to the next address
+                    // rather than abandoning the whole set, so a dual-stack
+                    // hostname still reaches the family the source can use.
+                    let tcp_socket = match new_tcp_socket_bound(
+                        self.bind_interface.clone(),
+                        self.bind_source,
+                        target_addr.is_ipv6(),
+                    ) {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            debug!(
+                                "TCP socket setup for {} failed: {}, trying next",
+                                target_addr, e
+                            );
+                            last_err = Some(e);
+                            continue;
+                        }
+                    };
                     match tcp_socket.connect(*target_addr).await {
                         Ok(stream) => {
                             if i > 0 {
@@ -325,7 +364,11 @@ impl SocketConnector for SocketConnectorImpl {
         );
 
         let remote_addr = resolve_location(&mut target, resolver).await?;
-        let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
+        let client_socket = new_udp_socket_bound(
+            remote_addr.is_ipv6(),
+            self.bind_interface.clone(),
+            self.bind_source,
+        )?;
 
         // Don't use connect() - wrap in UnconnectedUdpSocket instead.
         // A connected UDP socket filters incoming packets by source address,

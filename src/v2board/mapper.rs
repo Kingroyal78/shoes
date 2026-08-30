@@ -2899,6 +2899,7 @@ fn shadowsocks_2022_server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
+                    dedicated_ip: user.dedicated_ip.clone(),
                 },
             ))
         })
@@ -3014,6 +3015,7 @@ fn server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
+                    dedicated_ip: user.dedicated_ip.clone(),
                 },
             })
         })
@@ -3071,6 +3073,7 @@ fn naiveproxy_user_lookup(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
+                    dedicated_ip: user.dedicated_ip.clone(),
                 }),
             ))
         })
@@ -3113,6 +3116,7 @@ fn tuic_server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
+                    dedicated_ip: user.dedicated_ip.clone(),
                 }),
             ))
         })
@@ -3150,6 +3154,7 @@ fn hysteria2_server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
+                    dedicated_ip: user.dedicated_ip.clone(),
                 }),
             )
         })
@@ -3666,6 +3671,7 @@ mod tests {
                 device_limit: None,
             },
             label: None,
+            dedicated_ip: None,
         }
     }
 

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::v2board::egress::DedicatedIpBinding;
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 pub trait TrafficRecorder: Send + Sync + Debug {
@@ -35,6 +36,10 @@ pub struct AuthenticatedUser {
     pub speed_limit: Option<u64>,
     pub device_limit: Option<u64>,
     pub recorder: Option<Arc<dyn TrafficRecorder>>,
+    /// Source address this user's outbound connections are sent from, when they
+    /// bought a dedicated egress IP. `None` leaves the kernel to pick, which is
+    /// what every user without one gets.
+    pub dedicated_ip: Option<DedicatedIpBinding>,
 }
 
 #[derive(Clone, Debug)]

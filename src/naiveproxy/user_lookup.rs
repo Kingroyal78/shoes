@@ -200,6 +200,7 @@ mod tests {
             speed_limit: Some(10),
             device_limit: Some(2),
             recorder: None,
+            dedicated_ip: None,
         };
         let lookup = UserLookup::new_with_authenticated_users(vec![(
             "alice".to_string(),

@@ -65,9 +65,15 @@ E2E scripts reach Redis via container name `v2board-docker-redis-1`.
 ## Production boundary (read before changing code)
 
 Only server-side behavior is in scope: inbound protocol handling, V2Board control
-plane/policy/routing/accounting. Generic local-YAML clients, outbound proxy
-chaining, TUN, SOCKS/HTTP utility listeners, and client-side H2MUX/AnyTLS are
-legacy surfaces — do not treat changes there as production work. See
+plane/policy/routing/accounting, plus one panel-driven egress feature:
+per-user dedicated egress (`src/v2board/egress.rs`, the panel's `dedicated_ip`
+user field), in both of its forms — binding the outbound source address, and
+dialing that user through a bought SOCKS5/HTTP upstream.
+Generic local-YAML clients, locally configured outbound proxy *chains*, TUN,
+SOCKS/HTTP utility listeners, and client-side H2MUX/AnyTLS remain legacy
+surfaces — do not treat changes there as production work. The distinction is
+where the intent comes from: driven by the panel it is production, configured
+by local YAML it is not. See
 `docs/v2board-alignment-audit.md` and `docs/v2board-runtime-support.md`
 (acceptance matrix) for what is claimed vs rejected.
 

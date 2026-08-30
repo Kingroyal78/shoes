@@ -46,6 +46,7 @@ use crate::tcp::tcp_handler::{
 #[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
+use crate::v2board::egress::{self, DedicatedIpBinding};
 use crate::v2board::outbound::dispatcher::{DialError, OutboundDispatcher};
 
 const TCP_STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -485,6 +486,13 @@ async fn handle_server_setup_result_inner(
                     None
                 };
 
+                // The dedicated egress binding lives on the authenticated user;
+                // it is read here because this is the last scope that still has
+                // the user before the dial path takes over.
+                let dedicated_egress = authenticated_user
+                    .as_ref()
+                    .and_then(|user| user.dedicated_ip.clone());
+
                 let setup_client_stream_future = timeout(
                     Duration::from_secs(60),
                     setup_client_tcp_stream(
@@ -494,6 +502,7 @@ async fn handle_server_setup_result_inner(
                         remote_location.clone(),
                         sniffed_protocol,
                         outbound_dispatcher.as_deref(),
+                        dedicated_egress,
                     ),
                 );
 
@@ -590,6 +599,11 @@ async fn handle_server_setup_result_inner(
                     server_stream =
                         Box::new(SpeedLimitedMessageStream::new(server_stream, speed_limiter));
                 }
+                // Same read as the TCP branch: this is the last scope that
+                // still has the user before the dial.
+                let dedicated_egress = authenticated_user
+                    .as_ref()
+                    .and_then(|user| user.dedicated_ip.clone());
                 let (sniffed_protocol, initial_udp_data) = if proxy_selector
                     .requires_protocol_sniff()
                     || outbound_dispatcher
@@ -608,8 +622,38 @@ async fn handle_server_setup_result_inner(
                         chain_group,
                         remote_location,
                     } => {
-                        let mut client_stream = match &outbound_dispatcher {
-                            Some(dispatcher) => {
+                        // A dedicated egress replaces the dial, exactly as on
+                        // the TCP path. An upstream-proxy egress has no UDP to
+                        // offer -- neither SOCKS5 nor HTTP client hops carry
+                        // UDP-over-TCP here -- so its chain refuses the dial
+                        // and the datagram is dropped rather than sent out of
+                        // the node's own address, which is what the buyer paid
+                        // not to happen.
+                        let egress_chain = egress::chain_group_for_dial(
+                            dedicated_egress.as_ref(),
+                            outbound_dispatcher.as_deref(),
+                            chain_group,
+                            &resolver,
+                            &remote_location,
+                        );
+
+                        let mut client_stream = match (&outbound_dispatcher, &egress_chain) {
+                            (_, Some(chain)) => {
+                                let target_desc = remote_location.to_string();
+                                let dial =
+                                    chain.connect_udp_bidirectional(&resolver, remote_location);
+                                tokio::time::timeout(Duration::from_secs(60), dial)
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            format!(
+                                                "timed out dialing dedicated egress UDP to {target_desc}"
+                                            ),
+                                        )
+                                    })??
+                            }
+                            (Some(dispatcher), None) => {
                                 let dial = dispatcher.connect_udp_bidirectional(
                                     &remote_location,
                                     sniffed_protocol,
@@ -626,7 +670,7 @@ async fn handle_server_setup_result_inner(
                                         )
                                     })??
                             }
-                            None => {
+                            (None, None) => {
                                 let target_desc = remote_location.to_string();
                                 let dial = chain_group
                                     .connect_udp_bidirectional(&resolver, remote_location);
@@ -696,6 +740,9 @@ async fn handle_server_setup_result_inner(
                     outbound_dispatcher,
                     resolver,
                     need_initial_flush,
+                    authenticated_user
+                        .as_ref()
+                        .and_then(|user| user.dedicated_ip.clone()),
                 )
                 .await
             }
@@ -733,6 +780,9 @@ async fn handle_server_setup_result_inner(
                     outbound_dispatcher,
                     resolver,
                     need_initial_flush,
+                    authenticated_user
+                        .as_ref()
+                        .and_then(|user| user.dedicated_ip.clone()),
                 )
                 .await
             }
@@ -2110,6 +2160,7 @@ pub async fn setup_client_tcp_stream(
     remote_location: NetLocation,
     sniffed_protocol: Option<SniffedProtocol>,
     outbound_dispatcher: Option<&OutboundDispatcher>,
+    dedicated_egress: Option<DedicatedIpBinding>,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
     let action = client_proxy_selector
         .judge_with_protocol(remote_location.clone().into(), &resolver, sniffed_protocol)
@@ -2120,6 +2171,28 @@ pub async fn setup_client_tcp_stream(
             chain_group,
             remote_location,
         } => {
+            // A dedicated egress IP replaces the dial with a one-hop direct
+            // chain bound to that source address.
+            if let Some(egress_chain) = egress::chain_group_for_dial(
+                dedicated_egress.as_ref(),
+                outbound_dispatcher,
+                chain_group,
+                &resolver,
+                &remote_location,
+            ) {
+                let TcpClientSetupResult {
+                    client_stream,
+                    early_data,
+                } = egress_chain.connect_tcp(remote_location, &resolver).await?;
+
+                if let Some(data) = early_data {
+                    server_stream.write_all(&data).await?;
+                    server_stream.flush().await?;
+                }
+
+                return Ok(Some(client_stream));
+            }
+
             // Node-side local routing: when an outbound dispatcher is
             // configured it takes over the dial (its chain groups include
             // direct), keeping the v2board selector as the block gate.
@@ -2510,6 +2583,7 @@ mod tests {
     use crate::address::{Address, NetLocationMask};
     use crate::client_proxy_selector::{ConnectAction, ConnectMatcher, ConnectRule};
     use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::v2board::egress::DedicatedEgress;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -2836,6 +2910,7 @@ mod tests {
             speed_limit,
             device_limit: None,
             recorder: None,
+            dedicated_ip: None,
         })
     }
 
@@ -2894,6 +2969,7 @@ mod tests {
             speed_limit,
             device_limit: None,
             recorder: None,
+            dedicated_ip: None,
         })
     }
 
@@ -2908,7 +2984,185 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder),
+            dedicated_ip: None,
         })
+    }
+
+    fn authenticated_user_with_egress(uid: u64, egress: &str) -> Option<AuthenticatedUser> {
+        Some(AuthenticatedUser {
+            node_tag: "node-a".into(),
+            uid,
+            user_key: format!("user-{uid}"),
+            speed_limit: None,
+            device_limit: None,
+            recorder: None,
+            dedicated_ip: Some(Arc::new(DedicatedEgress::Source(egress.parse().unwrap()))),
+        })
+    }
+
+    /// Reports the source address the peer connected from, which is the only
+    /// thing that actually proves a dedicated egress took effect.
+    async fn start_tcp_peer_probe() -> (NetLocation, JoinHandle<SocketAddr>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+            peer
+        });
+        let remote_location = NetLocation::new(
+            match addr.ip() {
+                IpAddr::V4(ip) => Address::Ipv4(ip),
+                IpAddr::V6(ip) => Address::Ipv6(ip),
+            },
+            addr.port(),
+        );
+        (remote_location, handle)
+    }
+
+    async fn forward_and_observe_source(
+        authenticated_user: Option<AuthenticatedUser>,
+    ) -> SocketAddr {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoopResolver);
+        let (remote_location, probe) = start_tcp_peer_probe().await;
+
+        handle_server_setup_result(
+            TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(TestStream::new(Vec::new())),
+                need_initial_flush: false,
+                connection_success_response: None,
+                initial_remote_data: Some(b"ping".to_vec().into_boxed_slice()),
+                proxy_selector: direct_allow_selector(resolver.clone(), false),
+                outbound_dispatcher: None,
+                authenticated_user,
+            },
+            resolver,
+            Some("127.0.0.1:50000".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        probe.await.unwrap()
+    }
+
+    /// The end-to-end claim of the feature: a user who bought a dedicated IP
+    /// leaves the box from that address, and one who did not is unaffected.
+    #[tokio::test]
+    async fn a_dedicated_egress_makes_the_connection_come_from_the_bought_address() {
+        let peer =
+            forward_and_observe_source(authenticated_user_with_egress(2001, "127.0.0.2")).await;
+        assert_eq!(peer.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn two_buyers_leave_from_their_own_addresses() {
+        let first =
+            forward_and_observe_source(authenticated_user_with_egress(2002, "127.0.0.4")).await;
+        let second =
+            forward_and_observe_source(authenticated_user_with_egress(2003, "127.0.0.5")).await;
+
+        assert_eq!(first.ip(), "127.0.0.4".parse::<IpAddr>().unwrap());
+        assert_eq!(second.ip(), "127.0.0.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_user_without_a_dedicated_egress_keeps_the_default_source() {
+        let recorder = Arc::new(TestRecorder::default());
+        let peer =
+            forward_and_observe_source(authenticated_user_with_recorder(2004, recorder)).await;
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_connection_keeps_the_default_source() {
+        let peer = forward_and_observe_source(None).await;
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    /// Reports the source address a datagram arrived from.
+    async fn start_udp_peer_probe() -> (NetLocation, JoinHandle<SocketAddr>) {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+            peer
+        });
+        let remote_location = NetLocation::new(
+            match addr.ip() {
+                IpAddr::V4(ip) => Address::Ipv4(ip),
+                IpAddr::V6(ip) => Address::Ipv6(ip),
+            },
+            addr.port(),
+        );
+        (remote_location, handle)
+    }
+
+    /// Drives one datagram through the `BidirectionalUdp` path, which is what
+    /// VMess, VLESS and Trojan hand back for a UDP request.
+    async fn udp_forward_and_observe_source(
+        authenticated_user: Option<AuthenticatedUser>,
+    ) -> SocketAddr {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoopResolver);
+        let (remote_location, probe) = start_udp_peer_probe().await;
+
+        // A connected socket pair stands in for the client-facing side of the
+        // session: whatever we send on `client_side` is the message shoes
+        // relays to the probe.
+        let server_side = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let client_side = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        server_side
+            .connect(client_side.local_addr().unwrap())
+            .await
+            .unwrap();
+        client_side
+            .connect(server_side.local_addr().unwrap())
+            .await
+            .unwrap();
+        client_side.send(b"ping").await.unwrap();
+
+        let forward = tokio::spawn(handle_server_setup_result(
+            TcpServerSetupResult::BidirectionalUdp {
+                need_initial_flush: false,
+                remote_location,
+                stream: Box::new(server_side),
+                proxy_selector: direct_allow_selector(resolver.clone(), false),
+                outbound_dispatcher: None,
+                authenticated_user,
+            },
+            resolver,
+            Some("127.0.0.1:50000".parse().unwrap()),
+        ));
+
+        // The relay loop runs until the session ends, which a UDP socket never
+        // signals, so the probe firing is the completion signal.
+        let peer = probe.await.unwrap();
+        forward.abort();
+        peer
+    }
+
+    /// The UDP half of the same claim. VMess UDP does not go through
+    /// `setup_client_tcp_stream`, so it needs its own binding and its own
+    /// proof.
+    #[tokio::test]
+    async fn a_dedicated_egress_binds_bidirectional_udp_too() {
+        let peer =
+            udp_forward_and_observe_source(authenticated_user_with_egress(2005, "127.0.0.6")).await;
+        assert_eq!(peer.ip(), "127.0.0.6".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bidirectional_udp_without_a_dedicated_egress_keeps_the_default_source() {
+        let peer = udp_forward_and_observe_source(None).await;
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
     }
 
     fn direct_allow_selector(
@@ -3163,6 +3417,7 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder.clone()),
+            dedicated_ip: None,
         });
 
         {
@@ -3187,6 +3442,7 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder.clone()),
+            dedicated_ip: None,
         });
 
         {
@@ -3300,6 +3556,7 @@ mod tests {
             speed_limit: None,
             device_limit: Some(1),
             recorder: Some(recorder.clone()),
+            dedicated_ip: None,
         });
         let setup_result = TcpServerSetupResult::PeerAddressOverride {
             peer_addr: Some(proxied_peer),

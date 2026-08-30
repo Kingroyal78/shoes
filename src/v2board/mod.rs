@@ -1,4 +1,5 @@
 pub mod client;
+pub mod egress;
 pub mod grpc;
 pub mod http;
 pub mod httpupgrade;

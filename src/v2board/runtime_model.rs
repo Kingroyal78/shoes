@@ -8,6 +8,7 @@ use crate::backend_config::{
     AppConfig, Hysteria2MasqueradeConfig, NodeType, RouteRuleSetsConfig, V2BoardNodeConfig,
 };
 
+use super::egress::{self, DedicatedIpBinding};
 use super::types::{ServerConfig, UserInfo};
 use super::xhttp::{XHttpConfig, XHttpConfigParts, XHttpDataPlacement, XHttpMode, XHttpPlacement};
 
@@ -201,6 +202,9 @@ pub struct RuntimeUser {
     pub user_key: String,
     pub policy: UserPolicy,
     pub label: Option<String>,
+    /// The egress address this user bought, when the panel published a usable
+    /// one. `None` for everyone else, which is the overwhelming majority.
+    pub dedicated_ip: Option<DedicatedIpBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,6 +1166,10 @@ fn normalize_users(
                     device_limit: user.device_limit,
                 },
                 label: user.label.clone(),
+                dedicated_ip: user
+                    .dedicated_ip
+                    .as_ref()
+                    .and_then(|wire| egress::binding_from_wire(wire, &node.tag, user.id)),
             })
         })
         .collect()
@@ -1690,7 +1698,67 @@ mod tests {
             max_connections: None,
             max_ips: None,
             quota_bytes: None,
+            dedicated_ip: None,
         }]
+    }
+
+    /// A user who bought a dedicated IP has to arrive at the dial path with a
+    /// usable binding, and a user who did not must not gain one.
+    #[test]
+    fn a_dedicated_ip_reaches_the_runtime_user() {
+        let (app, node) = app_config(NodeType::Vmess);
+        let server = server("tcp");
+        let mut users = users();
+        users[0].dedicated_ip = Some(crate::v2board::types::DedicatedIp {
+            assignment_id: Some(7),
+            ip: "198.51.100.7".to_string(),
+            mode: Some("egress".to_string()),
+            protocol: None,
+            port: None,
+            username: None,
+            password: None,
+            expires_at: Some(1790182099),
+        });
+
+        let spec = normalize_node(&app, &node, &server, &users).unwrap();
+
+        let binding = spec.users[0].dedicated_ip.clone().expect("binding");
+        assert_eq!(
+            *binding,
+            crate::v2board::egress::DedicatedEgress::Source(
+                "198.51.100.7".parse::<std::net::IpAddr>().unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn a_user_without_a_dedicated_ip_gets_no_binding() {
+        let (app, node) = app_config(NodeType::Vmess);
+        let spec = normalize_node(&app, &node, &server("tcp"), &users()).unwrap();
+        assert!(spec.users[0].dedicated_ip.is_none());
+    }
+
+    /// One malformed row must not take the node's whole user list down with it:
+    /// the user keeps working, just without the egress binding.
+    #[test]
+    fn an_unusable_dedicated_ip_does_not_fail_the_sync() {
+        let (app, node) = app_config(NodeType::Vmess);
+        let mut users = users();
+        users[0].dedicated_ip = Some(crate::v2board::types::DedicatedIp {
+            assignment_id: Some(7),
+            ip: "definitely-not-an-ip".to_string(),
+            mode: Some("egress".to_string()),
+            protocol: None,
+            port: None,
+            username: None,
+            password: None,
+            expires_at: None,
+        });
+
+        let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();
+
+        assert_eq!(spec.users.len(), 1);
+        assert!(spec.users[0].dedicated_ip.is_none());
     }
 
     #[test]
@@ -1827,6 +1895,7 @@ mod tests {
             max_connections: None,
             max_ips: None,
             quota_bytes: None,
+            dedicated_ip: None,
         });
         users.push(UserInfo {
             id: 12,
@@ -1843,6 +1912,7 @@ mod tests {
             max_connections: None,
             max_ips: None,
             quota_bytes: None,
+            dedicated_ip: None,
         });
 
         let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();

@@ -39,6 +39,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::protocol_sniff::sniff_udp_protocol;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::util::allocate_vec;
+use crate::v2board::egress::{self, DedicatedIpBinding};
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 
 /// Timeout for inactive sessions
@@ -576,6 +577,8 @@ pub struct UdpRouter<'a> {
     selector: Arc<ClientProxySelector>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
+    /// 这个连接的用户买到的专属出口地址；每条 UDP 会话都从它发出去。
+    dedicated_egress: Option<DedicatedIpBinding>,
 }
 
 impl<'a> UdpRouter<'a> {
@@ -586,6 +589,7 @@ impl<'a> UdpRouter<'a> {
         outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
         resolver: Arc<dyn Resolver>,
         need_initial_flush: bool,
+        dedicated_egress: Option<DedicatedIpBinding>,
     ) -> Self {
         LIVE_UDP_ROUTERS.fetch_add(1, Ordering::Relaxed);
 
@@ -620,6 +624,7 @@ impl<'a> UdpRouter<'a> {
             selector,
             outbound_dispatcher,
             resolver,
+            dedicated_egress,
         }
     }
 
@@ -1269,6 +1274,7 @@ impl<'a> UdpRouter<'a> {
             None
         };
         let outbound_dispatcher = self.outbound_dispatcher.clone();
+        let dedicated_egress = self.dedicated_egress.clone();
 
         let future: SessionCreateFuture = Box::pin(async move {
             let create = async move {
@@ -1285,8 +1291,21 @@ impl<'a> UdpRouter<'a> {
                         chain_group,
                         remote_location,
                     } => {
-                        let client_stream = match &outbound_dispatcher {
-                            Some(dispatcher) => {
+                        let egress_chain = egress::chain_group_for_dial(
+                            dedicated_egress.as_ref(),
+                            outbound_dispatcher.as_deref(),
+                            chain_group,
+                            &resolver,
+                            &remote_location,
+                        );
+
+                        let client_stream = match (&outbound_dispatcher, &egress_chain) {
+                            (_, Some(chain)) => {
+                                chain
+                                    .connect_udp_bidirectional(&resolver, remote_location)
+                                    .await?
+                            }
+                            (Some(dispatcher), None) => {
                                 dispatcher
                                     .connect_udp_bidirectional(
                                         &remote_location,
@@ -1295,7 +1314,7 @@ impl<'a> UdpRouter<'a> {
                                     )
                                     .await?
                             }
-                            None => {
+                            (None, None) => {
                                 chain_group
                                     .connect_udp_bidirectional(&resolver, remote_location)
                                     .await?
@@ -1641,6 +1660,7 @@ pub async fn run_udp_routing(
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     resolver: Arc<dyn Resolver>,
     need_initial_flush: bool,
+    dedicated_egress: Option<DedicatedIpBinding>,
 ) -> io::Result<()> {
     let result = UdpRouter::new(
         &mut server,
@@ -1648,6 +1668,7 @@ pub async fn run_udp_routing(
         outbound_dispatcher,
         resolver,
         need_initial_flush,
+        dedicated_egress,
     )
     .await;
     let _ = tokio::time::timeout(session_shutdown_timeout(), server.shutdown_message()).await;
@@ -1875,6 +1896,7 @@ mod tests {
             None,
             Arc::new(crate::resolver::NativeResolver::new()),
             false,
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(5), router)
@@ -1892,6 +1914,7 @@ mod tests {
             None,
             Arc::new(crate::resolver::NativeResolver::new()),
             false,
+            None,
         );
 
         let destination = NetLocation::new(Address::UNSPECIFIED, 53);
@@ -1929,6 +1952,7 @@ mod tests {
             None,
             Arc::new(crate::resolver::NativeResolver::new()),
             false,
+            None,
         );
 
         let now = Instant::now();
@@ -1983,6 +2007,7 @@ mod tests {
             None,
             Arc::new(crate::resolver::NativeResolver::new()),
             false,
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(5), router)

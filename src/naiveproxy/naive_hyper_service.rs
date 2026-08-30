@@ -540,6 +540,10 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
                 outbound_dispatcher.clone(),
                 resolver,
                 false,
+                // No dedicated egress: NaiveProxy is not in the panel's supported
+                // list for dedicated IPs (its H3 path keeps no user identity at the
+                // dial), so a binding can never reach this node type.
+                None,
             )
             .await;
         } else if host == UOT_V2_MAGIC_ADDRESS {
@@ -606,6 +610,8 @@ pub(super) async fn handle_naive_stream<S: AsyncStream + 'static>(
                     outbound_dispatcher.clone(),
                     resolver,
                     false,
+                    // 同上：NaiveProxy 不在支持列表内。
+                    None,
                 )
                 .await;
             }

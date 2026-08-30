@@ -667,6 +667,7 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             recorder: None,
+            dedicated_ip: None,
         }
     }
 

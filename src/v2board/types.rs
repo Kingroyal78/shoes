@@ -174,6 +174,36 @@ pub struct UserInfo {
     pub max_ips: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
+    /// The dedicated egress IP this user bought. Absent for everyone who did
+    /// not buy one -- the panel omits the key rather than sending a null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_ip: Option<DedicatedIp>,
+}
+
+/// The panel's `dedicated_ip` object.
+///
+/// Deliberately not `deny_unknown_fields`: the panel adds fields for delivery
+/// methods this backend has not implemented yet, and a node must not fall out
+/// of sync over one. `ip` is the only field the egress path needs.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct DedicatedIp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<u64>,
+    pub ip: String,
+    /// `egress` binds the outbound source address; `ingress_egress` additionally
+    /// requires the client to have arrived on that same address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 impl UserInfo {
