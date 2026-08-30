@@ -3,3 +3,8 @@
 /*.yaml
 *.pem
 __pycache__/
+
+# Exported session transcripts. They land at the repo root, carry infrastructure
+# addresses verbatim, and nothing above matches them, so `git add -A` publishes
+# them into history.
+/*.txt
