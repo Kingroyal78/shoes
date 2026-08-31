@@ -185,6 +185,11 @@ pub struct UserInfo {
 /// Deliberately not `deny_unknown_fields`: the panel adds fields for delivery
 /// methods this backend has not implemented yet, and a node must not fall out
 /// of sync over one. `ip` is the only field the egress path needs.
+///
+/// The tolerance stops at the object: an unknown *field* here is one this
+/// build does not need, but a `mode` or `protocol` it does not know describes
+/// a delivery it cannot perform, and `egress::binding_from_wire` refuses those
+/// rather than approximate them.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct DedicatedIp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +197,11 @@ pub struct DedicatedIp {
     pub ip: String,
     /// `egress` binds the outbound source address; `ingress_egress` additionally
     /// requires the client to have arrived on that same address.
+    ///
+    /// This backend implements `egress` and `proxy`. `ingress_egress` is
+    /// refused outright -- it constrains inbound too, and nothing here does,
+    /// so binding only the egress half would deliver a different product than
+    /// the one sold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +212,11 @@ pub struct DedicatedIp {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// When this *assignment* lapses, in unix seconds -- not the buyer's
+    /// account expiry, which is `UserInfo::expires_at`. The address returns to
+    /// the pool and is re-sold at that point, so a node still binding it would
+    /// be putting two customers on one exclusive address; enforced in
+    /// `egress::binding_from_wire`. 0 or absent means the panel set no term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }

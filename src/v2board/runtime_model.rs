@@ -234,7 +234,7 @@ pub fn normalize_node(
 ) -> std::io::Result<RuntimeNodeSpec> {
     let node_type = runtime_node_type(node, server)?;
     validate_local_protocol_overrides(node, node_type, server)?;
-    let users = normalize_users(node, users)?;
+    let users = normalize_users(node, node_type, users)?;
 
     // A zero server_port would bind an ephemeral port (or a permanent
     // port-0 retry loop on TCP); reject it so the node fails loudly during
@@ -1141,10 +1141,12 @@ fn anytls_padding_scheme(value: Option<&Value>) -> std::io::Result<Vec<String>> 
 
 fn normalize_users(
     node: &V2BoardNodeConfig,
+    node_type: NodeType,
     users: &[UserInfo],
 ) -> std::io::Result<Vec<RuntimeUser>> {
     let now = Utc::now();
-    users
+    let mut rejections = Vec::new();
+    let normalized: Vec<RuntimeUser> = users
         .iter()
         .filter(|user| panel_user_active(user, now))
         .map(|user| {
@@ -1154,6 +1156,16 @@ fn normalize_users(
                     node.tag, user.id
                 ))
             })?;
+            let dedicated_ip =
+                user.dedicated_ip.as_ref().and_then(|wire| {
+                    match dedicated_binding(node_type, wire, now.timestamp()) {
+                        Ok(binding) => Some(binding),
+                        Err(rejection) => {
+                            rejections.push((user.id, rejection));
+                            None
+                        }
+                    }
+                });
             Ok(RuntimeUser {
                 uid: user.id,
                 credential: credential.to_string(),
@@ -1166,13 +1178,58 @@ fn normalize_users(
                     device_limit: user.device_limit,
                 },
                 label: user.label.clone(),
-                dedicated_ip: user
-                    .dedicated_ip
-                    .as_ref()
-                    .and_then(|wire| egress::binding_from_wire(wire, &node.tag, user.id)),
+                dedicated_ip,
             })
         })
-        .collect()
+        .collect::<std::io::Result<Vec<RuntimeUser>>>()?;
+
+    // A refused binding is a buyer paying for an exclusive address and getting
+    // the node's shared one, so it cannot end here as a `None` nobody sees.
+    // Reported after the whole list, once per distinct reason, because this
+    // function runs on nearly every pull and one line per bad row per pull is
+    // a flood that hides the very thing it is reporting.
+    egress::report_rejections(&node.tag, &rejections);
+    Ok(normalized)
+}
+
+/// The binding a user's `dedicated_ip` row asks for, or why this node refuses
+/// it.
+fn dedicated_binding(
+    node_type: NodeType,
+    wire: &crate::v2board::types::DedicatedIp,
+    now: i64,
+) -> Result<DedicatedIpBinding, egress::EgressRejection> {
+    // The QUIC node types authenticate a session, then keep only the fact that
+    // it authenticated: `tuic_server`, `hysteria2_server` and the NaiveProxy
+    // H3 service reach their dial sites with no user in hand and pass `None`
+    // for the binding by construction. Carrying one into their user tables
+    // would be a purchase the panel records as delivered and the node drops at
+    // every single dial. Refuse it here, where an operator is told once, and
+    // leave the tables honest.
+    if !node_type_can_bind_egress(node_type) {
+        return Err(egress::EgressRejection::NodeKindCannotBind(
+            node_type.as_uniproxy(),
+        ));
+    }
+    egress::binding_from_wire(wire, now)
+}
+
+/// Matched exhaustively rather than by a `matches!` on the QUIC arms, so a
+/// node type added later cannot inherit a promise its dial path cannot keep
+/// without someone answering this question for it.
+fn node_type_can_bind_egress(node_type: NodeType) -> bool {
+    match node_type {
+        NodeType::Tuic | NodeType::Hysteria | NodeType::Naiveproxy => false,
+        NodeType::Shadowsocks
+        | NodeType::Vmess
+        | NodeType::Vless
+        | NodeType::Trojan
+        | NodeType::Anytls => true,
+        // Resolved to one of the concrete types above by `runtime_node_type`
+        // before any user is normalized, so this arm is unreachable in
+        // practice; refusing is the safe reading of a type nobody has mapped.
+        NodeType::V2Node => false,
+    }
 }
 
 fn panel_user_active(user: &UserInfo, now: DateTime<Utc>) -> bool {
@@ -1702,6 +1759,23 @@ mod tests {
         }]
     }
 
+    /// A `dedicated_ip` row the panel would send, dated relative to the clock
+    /// the normalizer reads: now that the assignment's term is enforced, a
+    /// hard-coded timestamp here would be a test that starts failing on the
+    /// day it names.
+    fn dedicated_wire(ip: &str, mode: &str, expires_in: i64) -> crate::v2board::types::DedicatedIp {
+        crate::v2board::types::DedicatedIp {
+            assignment_id: Some(7),
+            ip: ip.to_string(),
+            mode: Some(mode.to_string()),
+            protocol: None,
+            port: None,
+            username: None,
+            password: None,
+            expires_at: Some(Utc::now().timestamp() + expires_in),
+        }
+    }
+
     /// A user who bought a dedicated IP has to arrive at the dial path with a
     /// usable binding, and a user who did not must not gain one.
     #[test]
@@ -1709,16 +1783,7 @@ mod tests {
         let (app, node) = app_config(NodeType::Vmess);
         let server = server("tcp");
         let mut users = users();
-        users[0].dedicated_ip = Some(crate::v2board::types::DedicatedIp {
-            assignment_id: Some(7),
-            ip: "198.51.100.7".to_string(),
-            mode: Some("egress".to_string()),
-            protocol: None,
-            port: None,
-            username: None,
-            password: None,
-            expires_at: Some(1790182099),
-        });
+        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", 3600));
 
         let spec = normalize_node(&app, &node, &server, &users).unwrap();
 
@@ -1759,6 +1824,131 @@ mod tests {
 
         assert_eq!(spec.users.len(), 1);
         assert!(spec.users[0].dedicated_ip.is_none());
+    }
+
+    /// The panel sells the address for a term and returns it to the pool after
+    /// it. The dangerous case is the one where nothing can correct the node:
+    /// restarted onto a last-known-good snapshot with the panel unreachable,
+    /// it would keep binding an address the pool has since re-sold, so the
+    /// lapsed buyer and the new one share the address each was told was theirs
+    /// alone.
+    #[test]
+    fn an_expired_assignment_stops_binding() {
+        let (app, node) = app_config(NodeType::Vmess);
+        let mut users = users();
+        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", -60));
+
+        let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();
+
+        // The user keeps working; only the address they no longer own is gone.
+        assert_eq!(spec.users.len(), 1);
+        assert!(spec.users[0].dedicated_ip.is_none());
+    }
+
+    /// The QUIC node types authenticate a session and keep only the fact that
+    /// it authenticated, so their dial sites pass no binding and never can.
+    /// Carrying one into their user tables is the worst of both: the panel
+    /// records a delivered purchase and every dial quietly drops it.
+    #[test]
+    fn a_quic_node_refuses_a_dedicated_ip_it_could_only_drop() {
+        for node_type in [NodeType::Tuic, NodeType::Hysteria, NodeType::Naiveproxy] {
+            let (app, node) = app_config(node_type);
+            let mut server = server("tcp");
+            server.server_name = Some("quic.example.com".to_string());
+            // Hysteria v1 has no runtime here at all, so the node has to be
+            // the v2 one for this to be a test about the binding.
+            server.version = Some(2);
+            let mut users = users();
+            users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", 3600));
+
+            let spec = normalize_node(&app, &node, &server, &users).unwrap();
+
+            assert_eq!(spec.users.len(), 1, "{node_type:?}");
+            assert!(
+                spec.users[0].dedicated_ip.is_none(),
+                "{node_type:?} cannot honour a dedicated egress and must not carry one"
+            );
+        }
+    }
+
+    /// Counting log lines is the only way to see this: a refusal that is
+    /// repeated on every pull is a flood, and a flood hides the one line an
+    /// operator needed. Nothing else about a refused binding is observable.
+    #[test]
+    fn a_refused_dedicated_ip_is_reported_once_per_node_not_once_per_pull() {
+        install_capturing_logger();
+
+        // Its own tag: refusals are remembered per node, and every other test
+        // in this file normalizes `node-a`.
+        let (mut app, mut node) = app_config(NodeType::Vmess);
+        node.tag = "node-refusal-flood".to_string();
+        app.v2board.nodes[0].tag = node.tag.clone();
+
+        let mut users = users();
+        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "ingress_egress", 3600));
+        let mut second = users[0].clone();
+        second.id = 11;
+        second.uuid = Some("00000000-0000-0000-0000-000000000002".to_string());
+        second.dedicated_ip = Some(dedicated_wire("198.51.100.8", "ingress_egress", 3600));
+        users.push(second);
+
+        // Two users on one bad reason, and the node pulled twice: four lines
+        // before this was one.
+        for _ in 0..2 {
+            let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();
+            assert!(spec.users.iter().all(|user| user.dedicated_ip.is_none()));
+        }
+
+        let reported = captured_lines_for(&node.tag);
+        assert_eq!(reported.len(), 1, "{reported:#?}");
+        assert!(
+            reported[0].contains("ingress_egress"),
+            "the refusal has to name the mode it refused: {}",
+            reported[0]
+        );
+    }
+
+    static CAPTURED_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Keeps only what these tests assert on, so it does not accumulate the
+    /// whole test binary's logging.
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            let line = record.args().to_string();
+            if self.enabled(record.metadata()) && line.contains("dedicated") {
+                CAPTURED_LOGS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(line);
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_capturing_logger() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            static LOGGER: CapturingLogger = CapturingLogger;
+            log::set_logger(&LOGGER).expect("no other test installs a global logger");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    fn captured_lines_for(node_tag: &str) -> Vec<String> {
+        CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|line| line.contains(node_tag))
+            .cloned()
+            .collect()
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! untouched. A chain is a couple of small allocations and is cached for the
 //! process lifetime, so a node with a /24 of sold addresses holds 256 of them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -92,76 +92,152 @@ pub enum UpstreamProtocol {
 /// Per-connection copies are one atomic increment rather than a string clone.
 pub type DedicatedIpBinding = Arc<DedicatedEgress>;
 
-/// `None` when the panel sent something unusable.
+/// Why a `dedicated_ip` the panel published is not honoured on this node.
 ///
-/// A bad value is logged and dropped rather than failing the sync: losing one
-/// user's dedicated egress is a far smaller problem than a whole node refusing
-/// to load its user list because of one malformed row.
+/// Every variant is a row the buyer is being billed for: refusing one means
+/// their traffic keeps leaving from the node's shared address, so the reason
+/// has to survive as a value that reaches the log once, rather than as a
+/// `None` nobody ever sees.
+///
+/// Only values from the panel's closed vocabulary are carried in a variant --
+/// a mode or protocol name is worth telling an operator and there are a
+/// handful of them. Per-user values (the address, the credentials) are
+/// deliberately absent: rejections are deduplicated by reason, and a payload
+/// that differs per user would make every bad row its own reason and bring
+/// back the flood this type exists to end. The reported user id is the handle
+/// for finding the offending row in the panel.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EgressRejection {
+    /// `dedicated_ip.ip` is not an address.
+    UnparseableAddress,
+    /// The assignment's term is over; see `binding_from_wire`.
+    Expired,
+    /// The panel's `ingress_egress` also promises the buyer *arrives* on the
+    /// address, which this backend does not implement.
+    IngressEgressUnimplemented,
+    /// A `dedicated_ip.mode` this build predates.
+    UnknownMode(String),
+    /// A `dedicated_ip.protocol` no client hop here speaks.
+    UnsupportedUpstreamProtocol(String),
+    /// `dedicated_ip.port` is missing or zero on an upstream.
+    UnusableUpstreamPort,
+    /// Half of an upstream credential, which is a truncated row.
+    HalfFilledCredential,
+    /// This node type cannot carry a binding at all; holds its panel name.
+    NodeKindCannotBind(&'static str),
+}
+
+impl EgressRejection {
+    /// The half of the log line that says what is wrong and what it costs.
+    fn describe(&self) -> String {
+        match self {
+            Self::UnparseableAddress => {
+                "dedicated_ip.ip is not an IP address, so there is nothing to bind".to_string()
+            }
+            Self::Expired => {
+                "the assignment's dedicated_ip.expires_at has passed, so the address may already \
+                 be re-sold and is no longer bound"
+                    .to_string()
+            }
+            Self::IngressEgressUnimplemented => {
+                "dedicated_ip.mode `ingress_egress` also requires the client to arrive on that \
+                 address, which this build does not enforce; binding only the egress would \
+                 deliver something other than what was sold, so the whole binding is refused"
+                    .to_string()
+            }
+            Self::UnknownMode(mode) => format!(
+                "dedicated_ip.mode `{mode}` is not known to this build, and binding the source \
+                 address would be wrong for anything proxy-shaped"
+            ),
+            Self::UnsupportedUpstreamProtocol(protocol) => format!(
+                "dedicated_ip.protocol `{protocol}` is not a proxy this node can dial through"
+            ),
+            Self::UnusableUpstreamPort => {
+                "dedicated_ip.port is missing or zero, so the upstream proxy cannot be dialed"
+                    .to_string()
+            }
+            Self::HalfFilledCredential => {
+                "dedicated_ip carries half a credential, which authenticates as nobody".to_string()
+            }
+            Self::NodeKindCannotBind(node_type) => format!(
+                "a `{node_type}` node cannot bind a dedicated egress: its QUIC session scope \
+                 keeps only whether the connection authenticated, not which user it was, so the \
+                 dial has nothing to bind against"
+            ),
+        }
+    }
+}
+
+/// The binding this row asks for, or the reason the node will not honour it.
+///
+/// A rejected row is dropped rather than failing the sync: losing one user's
+/// dedicated egress is a far smaller problem than a whole node refusing to
+/// load its user list because of one malformed row. The caller is expected to
+/// hand the reason to `report_rejections` so the drop is not silent.
+///
+/// `now` is the unix time the pull was normalized at, matching how
+/// `panel_user_active` ages out a user.
 pub fn binding_from_wire(
     wire: &DedicatedIp,
-    node_tag: &str,
-    uid: u64,
-) -> Option<DedicatedIpBinding> {
-    let addr = match wire.ip.trim().parse::<IpAddr>() {
-        Ok(addr) => addr,
-        Err(_) => {
-            warn!(
-                "node `{}` user {} has an unparseable dedicated_ip.ip `{}`, ignoring it",
-                node_tag, uid, wire.ip
-            );
-            return None;
-        }
-    };
+    now: i64,
+) -> Result<DedicatedIpBinding, EgressRejection> {
+    // The panel sells the address for a term and returns it to the pool when
+    // the term ends, so an expired assignment is not this buyer's address any
+    // more. This matters most exactly when it cannot be checked with the
+    // panel: a node restarted onto its last-known-good snapshot with the
+    // panel unreachable would otherwise keep binding an address that has
+    // since been re-sold, putting two customers on one "exclusive" IP.
+    // Checked before the rest of the row parses, because a lapsed assignment
+    // is over whatever shape it has. A zero or negative value is the panel's
+    // "no term", the same reading `panel_user_active` gives `expires_at`.
+    if let Some(expires_at) = wire.expires_at
+        && expires_at > 0
+        && expires_at <= now
+    {
+        return Err(EgressRejection::Expired);
+    }
+
+    let addr = wire
+        .ip
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| EgressRejection::UnparseableAddress)?;
 
     let egress = match wire.mode.as_deref().map(str::trim) {
         // The historical default, and what a panel that predates upstream
         // pools sends.
         None | Some("") | Some("egress") => DedicatedEgress::Source(addr),
-        Some("proxy") => upstream_from_wire(wire, addr, node_tag, uid)?,
-        Some(other) => {
-            // Forward compatibility: a mode this build predates cannot be
-            // guessed at. Binding the source address would be wrong for
-            // anything proxy-shaped, so drop it and say why.
-            warn!(
-                "node `{}` user {} has an unknown dedicated_ip.mode `{}`, ignoring the binding",
-                node_tag, uid, other
-            );
-            return None;
-        }
+        Some("proxy") => upstream_from_wire(wire, addr)?,
+        // A named contract value, not an unknown one: the panel means an
+        // address the buyer both arrives on and leaves from, and this backend
+        // constrains neither inbound listener nor accepted peer address to it.
+        Some("ingress_egress") => return Err(EgressRejection::IngressEgressUnimplemented),
+        // Forward compatibility: a mode this build predates cannot be guessed
+        // at. Binding the source address would be wrong for anything
+        // proxy-shaped, so drop it and say which mode it was.
+        Some(other) => return Err(EgressRejection::UnknownMode(other.to_string())),
     };
 
-    Some(Arc::new(egress))
+    Ok(Arc::new(egress))
 }
 
 fn upstream_from_wire(
     wire: &DedicatedIp,
     addr: IpAddr,
-    node_tag: &str,
-    uid: u64,
-) -> Option<DedicatedEgress> {
+) -> Result<DedicatedEgress, EgressRejection> {
     let protocol = match wire.protocol.as_deref().map(str::trim) {
         Some("socks5") | Some("socks") => UpstreamProtocol::Socks5,
         Some("http") => UpstreamProtocol::Http,
         other => {
-            warn!(
-                "node `{}` user {} has an unsupported dedicated_ip.protocol `{}`, ignoring the binding",
-                node_tag,
-                uid,
-                other.unwrap_or("")
-            );
-            return None;
+            return Err(EgressRejection::UnsupportedUpstreamProtocol(
+                other.unwrap_or("").to_string(),
+            ));
         }
     };
 
     let port = match wire.port {
         Some(port) if port > 0 => port,
-        _ => {
-            warn!(
-                "node `{}` user {} has no usable dedicated_ip.port for its upstream proxy, ignoring the binding",
-                node_tag, uid
-            );
-            return None;
-        }
+        _ => return Err(EgressRejection::UnusableUpstreamPort),
     };
 
     // A username with no password is a truncated credential, not an anonymous
@@ -170,20 +246,127 @@ fn upstream_from_wire(
     let username = non_empty(wire.username.as_deref());
     let password = non_empty(wire.password.as_deref());
     if username.is_some() != password.is_some() {
-        warn!(
-            "node `{}` user {} has a half-filled dedicated_ip credential, ignoring the binding",
-            node_tag, uid
-        );
-        return None;
+        return Err(EgressRejection::HalfFilledCredential);
     }
 
-    Some(DedicatedEgress::Upstream(UpstreamProxy {
+    Ok(DedicatedEgress::Upstream(UpstreamProxy {
         protocol,
         addr,
         port,
         username,
         password,
     }))
+}
+
+/// What was last reported for each node, so a reason that is still there on
+/// the next pull stays quiet.
+///
+/// Normalization runs on nearly every pull because a busy node's user list
+/// changes constantly, so warning per rejected row turned one bad panel row
+/// into a permanent flood that buried everything else in the log -- which is
+/// how a rejection ends up as good as silent. Keyed by node, so the map is
+/// bounded by the node count rather than by the user count, and the entry is
+/// dropped when the node comes back clean so an operator who fixes a row and
+/// later breaks it again is told a second time.
+static REPORTED_REJECTIONS: LazyLock<RwLock<HashMap<String, BTreeSet<EgressRejection>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Say once, per node, every distinct reason a dedicated egress was refused on
+/// this pull, and return the reasons actually reported.
+///
+/// The return value is what a test can assert on: whether the second pull with
+/// the same bad row says anything is the whole point of this function, and it
+/// is not observable from the log.
+/// Nodes already told that their own routing makes every binding inert.
+static ROUTING_OVERRIDE_REPORTED: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Says once per node that this node's own configuration, not the panel, is
+/// what stops every dedicated egress on it from applying.
+///
+/// Nothing was rejected here: the bindings are valid and the buyers are real.
+/// A dispatcher takes over the dial, and one `default_out` or a single
+/// `route_rules` entry anywhere in the backend YAML builds a dispatcher for
+/// every node -- so an operator adding one routing rule silently stops
+/// delivering an exit IP that every one of these users pays for.
+///
+/// It has to be said at this level. The per-dial skip is `debug!`, and the
+/// release build sets `release_max_level_info`, which compiles that call out
+/// of the binary entirely: without this line the most likely way for the
+/// feature to be inert is invisible in every official image. Once per node
+/// rather than per dial, because the condition is a static property of the
+/// configuration and identical for every connection.
+///
+/// Returns whether it reported, which is what a test can assert on.
+pub fn report_local_routing_override(node_tag: &str, bound_users: usize) -> bool {
+    let mut reported = ROUTING_OVERRIDE_REPORTED
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if bound_users == 0 {
+        // Say it again if the condition returns after the node comes back
+        // clean, the same way a rejection reason is re-reported.
+        reported.remove(node_tag);
+        return false;
+    }
+    if !reported.insert(node_tag.to_string()) {
+        return false;
+    }
+    warn!(
+        "node `{node_tag}` has local outbound routing configured, so the dedicated egress sold to \
+         {bound_users} user(s) on it does not apply: their traffic leaves from this node's own \
+         address until the routing is removed"
+    );
+    true
+}
+
+pub fn report_rejections(
+    node_tag: &str,
+    rejections: &[(u64, EgressRejection)],
+) -> Vec<EgressRejection> {
+    // One representative user id and a count per reason: the id is enough to
+    // find the row in the panel, and the count says whether this is one stale
+    // assignment or the whole node's worth of buyers getting nothing.
+    let mut current: BTreeMap<EgressRejection, (u64, usize)> = BTreeMap::new();
+    for (uid, rejection) in rejections {
+        let entry = current.entry(rejection.clone()).or_insert((*uid, 0));
+        entry.1 += 1;
+    }
+
+    let reasons: BTreeSet<EgressRejection> = current.keys().cloned().collect();
+    let mut reported = REPORTED_REJECTIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = if reasons.is_empty() {
+        reported.remove(node_tag)
+    } else {
+        reported.insert(node_tag.to_string(), reasons)
+    }
+    .unwrap_or_default();
+    drop(reported);
+
+    let fresh: Vec<(EgressRejection, u64, usize)> = current
+        .into_iter()
+        .filter(|(rejection, _)| !previous.contains(rejection))
+        .map(|(rejection, (uid, count))| (rejection, uid, count))
+        .collect();
+
+    for (rejection, uid, count) in &fresh {
+        let others = match count - 1 {
+            0 => String::new(),
+            others => format!(" and {others} other user(s)"),
+        };
+        warn!(
+            "node `{}` refuses the dedicated egress bought by user {}{}: {}. Reported once until this node reports a pull without it.",
+            node_tag,
+            uid,
+            others,
+            rejection.describe()
+        );
+    }
+    fresh
+        .into_iter()
+        .map(|(rejection, _, _)| rejection)
+        .collect()
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -237,8 +420,9 @@ pub fn chain_group_for(
 /// Skips report at debug because the condition is a static property of the
 /// node's configuration, identical for every connection and every
 /// destination; warning per dial buries the log without telling an operator
-/// anything a single line at startup would not. Saying it once per node, at
-/// map time, is the missing half and does not belong here.
+/// anything a single line at startup would not. The other half -- saying it
+/// once per node, before any connection arrives -- is `report_rejections`,
+/// called from normalization.
 pub fn chain_group_for_dial(
     binding: Option<&DedicatedIpBinding>,
     outbound_dispatcher: Option<&OutboundDispatcher>,
@@ -307,6 +491,10 @@ fn address_of(addr: IpAddr) -> Address {
 mod tests {
     use super::*;
 
+    /// A fixed "now" for rows with no term, so nothing here depends on the
+    /// clock. Tests about expiry place their `expires_at` either side of it.
+    const NOW: i64 = 1_800_000_000;
+
     fn wire(ip: &str, mode: Option<&str>) -> DedicatedIp {
         DedicatedIp {
             assignment_id: Some(1),
@@ -338,7 +526,7 @@ mod tests {
 
     #[test]
     fn egress_mode_binds_the_source_address() {
-        let binding = binding_from_wire(&wire("198.51.100.7", Some("egress")), "n", 1).unwrap();
+        let binding = binding_from_wire(&wire("198.51.100.7", Some("egress")), NOW).unwrap();
         assert_eq!(
             *binding,
             DedicatedEgress::Source("198.51.100.7".parse().unwrap())
@@ -348,13 +536,13 @@ mod tests {
     /// A panel that predates upstream pools sends no mode at all.
     #[test]
     fn missing_mode_defaults_to_source_binding() {
-        let binding = binding_from_wire(&wire("198.51.100.7", None), "n", 1).unwrap();
+        let binding = binding_from_wire(&wire("198.51.100.7", None), NOW).unwrap();
         assert!(matches!(*binding, DedicatedEgress::Source(_)));
     }
 
     #[test]
     fn ipv6_sources_are_accepted() {
-        let binding = binding_from_wire(&wire("2001:db8::1", Some("egress")), "n", 1).unwrap();
+        let binding = binding_from_wire(&wire("2001:db8::1", Some("egress")), NOW).unwrap();
         assert_eq!(
             *binding,
             DedicatedEgress::Source("2001:db8::1".parse().unwrap())
@@ -363,15 +551,15 @@ mod tests {
 
     #[test]
     fn an_unparseable_address_is_dropped_rather_than_failing_the_user() {
-        assert!(binding_from_wire(&wire("not-an-ip", None), "n", 1).is_none());
-        assert!(binding_from_wire(&wire("", None), "n", 1).is_none());
+        assert!(binding_from_wire(&wire("not-an-ip", None), NOW).is_err());
+        assert!(binding_from_wire(&wire("", None), NOW).is_err());
     }
 
     // ------------------------------------------------------------ 上游代理
 
     #[test]
     fn proxy_mode_carries_the_upstream_the_node_dials_through() {
-        let binding = binding_from_wire(&proxy_wire("203.0.113.9", "socks5", Some(1080)), "n", 1)
+        let binding = binding_from_wire(&proxy_wire("203.0.113.9", "socks5", Some(1080)), NOW)
             .expect("binding");
         assert_eq!(
             *binding,
@@ -394,7 +582,7 @@ mod tests {
         wire.username = Some("operator".to_string());
         wire.password = Some("hunter2".to_string());
         let binding =
-            binding_from_wire(&wire, "node", 7).expect("a complete proxy wire builds a binding");
+            binding_from_wire(&wire, NOW).expect("a complete proxy wire builds a binding");
         let rendered = format!("{binding:?}");
 
         for secret in ["hunter2", "operator"] {
@@ -415,7 +603,7 @@ mod tests {
         let mut wire = proxy_wire("198.51.100.7", "socks5", Some(1080));
         wire.username = None;
         wire.password = None;
-        let binding = binding_from_wire(&wire, "node", 7).expect("credentials are optional");
+        let binding = binding_from_wire(&wire, NOW).expect("credentials are optional");
 
         assert!(format!("{binding:?}").contains("\"none\""));
     }
@@ -423,7 +611,7 @@ mod tests {
     #[test]
     fn an_http_upstream_is_accepted_too() {
         let binding =
-            binding_from_wire(&proxy_wire("203.0.113.9", "http", Some(8080)), "n", 1).unwrap();
+            binding_from_wire(&proxy_wire("203.0.113.9", "http", Some(8080)), NOW).unwrap();
         assert!(matches!(
             *binding,
             DedicatedEgress::Upstream(UpstreamProxy {
@@ -435,23 +623,18 @@ mod tests {
 
     #[test]
     fn an_upstream_without_a_port_is_dropped() {
-        assert!(binding_from_wire(&proxy_wire("203.0.113.9", "socks5", None), "n", 1).is_none());
-        assert!(binding_from_wire(&proxy_wire("203.0.113.9", "socks5", Some(0)), "n", 1).is_none());
+        assert!(binding_from_wire(&proxy_wire("203.0.113.9", "socks5", None), NOW).is_err());
+        assert!(binding_from_wire(&proxy_wire("203.0.113.9", "socks5", Some(0)), NOW).is_err());
     }
 
     #[test]
     fn an_upstream_with_an_unsupported_protocol_is_dropped() {
         assert!(
-            binding_from_wire(
-                &proxy_wire("203.0.113.9", "shadowsocks", Some(1080)),
-                "n",
-                1
-            )
-            .is_none()
+            binding_from_wire(&proxy_wire("203.0.113.9", "shadowsocks", Some(1080)), NOW).is_err()
         );
         let mut no_protocol = proxy_wire("203.0.113.9", "socks5", Some(1080));
         no_protocol.protocol = None;
-        assert!(binding_from_wire(&no_protocol, "n", 1).is_none());
+        assert!(binding_from_wire(&no_protocol, NOW).is_err());
     }
 
     /// Half a credential means the row was truncated somewhere. Dialing with
@@ -460,11 +643,11 @@ mod tests {
     fn a_half_filled_upstream_credential_is_dropped() {
         let mut no_password = proxy_wire("203.0.113.9", "socks5", Some(1080));
         no_password.password = None;
-        assert!(binding_from_wire(&no_password, "n", 1).is_none());
+        assert!(binding_from_wire(&no_password, NOW).is_err());
 
         let mut no_username = proxy_wire("203.0.113.9", "socks5", Some(1080));
         no_username.username = None;
-        assert!(binding_from_wire(&no_username, "n", 1).is_none());
+        assert!(binding_from_wire(&no_username, NOW).is_err());
     }
 
     #[test]
@@ -472,7 +655,7 @@ mod tests {
         let mut anonymous = proxy_wire("203.0.113.9", "socks5", Some(1080));
         anonymous.username = None;
         anonymous.password = None;
-        let binding = binding_from_wire(&anonymous, "n", 1).expect("binding");
+        let binding = binding_from_wire(&anonymous, NOW).expect("binding");
         assert_eq!(
             *binding,
             DedicatedEgress::Upstream(UpstreamProxy {
@@ -489,7 +672,171 @@ mod tests {
     /// be flatly wrong for anything proxy-shaped.
     #[test]
     fn an_unknown_mode_is_dropped_rather_than_assumed_to_be_a_source_bind() {
-        assert!(binding_from_wire(&wire("198.51.100.7", Some("teleport")), "n", 1).is_none());
+        assert!(binding_from_wire(&wire("198.51.100.7", Some("teleport")), NOW).is_err());
+    }
+
+    /// `ingress_egress` is a contract value the panel really sends, and it
+    /// sells more than an exit address: the buyer is also promised they arrive
+    /// on it. This backend constrains nothing about inbound, so honouring the
+    /// egress half alone would hand the buyer something other than what they
+    /// bought while the panel counts the assignment as delivered. It has to be
+    /// refused, and refused under its own name rather than as "unknown", or
+    /// the day someone implements it they will find nothing that says why.
+    #[test]
+    fn ingress_egress_is_refused_under_its_own_name_not_downgraded_to_an_egress_bind() {
+        assert_eq!(
+            binding_from_wire(&wire("198.51.100.7", Some("ingress_egress")), NOW),
+            Err(EgressRejection::IngressEgressUnimplemented)
+        );
+    }
+
+    // ------------------------------------------------------------ 到期
+
+    /// The pool re-sells an address once its term ends. A node that keeps
+    /// binding it -- most easily after a restart onto a last-known-good
+    /// snapshot with the panel unreachable -- puts the lapsed buyer on an
+    /// address someone else now pays to have to themselves, which is the one
+    /// property the product is.
+    #[test]
+    fn an_expired_assignment_stops_binding() {
+        let mut expired = wire("198.51.100.7", Some("egress"));
+        expired.expires_at = Some(NOW - 1);
+        assert_eq!(
+            binding_from_wire(&expired, NOW),
+            Err(EgressRejection::Expired)
+        );
+
+        // Expiry is the term ending, not a grace period: the second it is
+        // reached the address is the pool's again.
+        expired.expires_at = Some(NOW);
+        assert_eq!(
+            binding_from_wire(&expired, NOW),
+            Err(EgressRejection::Expired)
+        );
+    }
+
+    #[test]
+    fn an_assignment_still_in_its_term_binds() {
+        let mut live = wire("198.51.100.7", Some("egress"));
+        live.expires_at = Some(NOW + 1);
+        assert!(binding_from_wire(&live, NOW).is_ok());
+    }
+
+    /// The same reading `panel_user_active` gives a user's own `expires_at`:
+    /// a panel that does not date an assignment sends 0, not a timestamp in
+    /// 1970, and must not have every one of its buyers cut off.
+    #[test]
+    fn a_zero_or_negative_expiry_means_no_term_at_all() {
+        let mut undated = wire("198.51.100.7", Some("egress"));
+        undated.expires_at = Some(0);
+        assert!(binding_from_wire(&undated, NOW).is_ok());
+
+        undated.expires_at = Some(-1);
+        assert!(binding_from_wire(&undated, NOW).is_ok());
+    }
+
+    /// An upstream assignment is sold on the same terms as a bound one.
+    #[test]
+    fn an_expired_upstream_assignment_stops_dialing_too() {
+        let mut expired = proxy_wire("203.0.113.9", "socks5", Some(1080));
+        expired.expires_at = Some(NOW - 1);
+        assert_eq!(
+            binding_from_wire(&expired, NOW),
+            Err(EgressRejection::Expired)
+        );
+    }
+
+    // ------------------------------------------------------------ 拒绝上报
+
+    /// Normalization runs on nearly every pull, so a reason reported per pull
+    /// is a permanent flood and a flood is as good as silence. Report each
+    /// distinct reason once per node instead.
+    /// The condition this reports is the likeliest way for the whole feature
+    /// to be inert, and the per-dial skip that used to be the only trace of
+    /// it is `debug!` -- which the release build compiles out. So the node
+    /// has to say it, and say it where an official image still prints it.
+    #[test]
+    fn local_routing_that_overrides_every_binding_is_reported_once_per_node() {
+        let node = "routing-override-node";
+
+        assert!(
+            report_local_routing_override(node, 3),
+            "an operator has to learn that three buyers are getting nothing"
+        );
+        assert!(
+            !report_local_routing_override(node, 3),
+            "every pull repeating it would bury the log it belongs in"
+        );
+
+        // The routing came out, or the last buyer left: nothing to say.
+        assert!(!report_local_routing_override(node, 0));
+        assert!(
+            report_local_routing_override(node, 1),
+            "the condition coming back is news again"
+        );
+        report_local_routing_override(node, 0);
+    }
+
+    #[test]
+    fn a_reason_is_reported_once_per_node_not_once_per_pull() {
+        let node = "report-once-per-node";
+        let pull = [
+            (1, EgressRejection::IngressEgressUnimplemented),
+            (2, EgressRejection::IngressEgressUnimplemented),
+            (3, EgressRejection::Expired),
+        ];
+
+        // Two users share a reason: an operator needs the reason, not one line
+        // per buyer.
+        assert_eq!(
+            report_rejections(node, &pull),
+            vec![
+                EgressRejection::Expired,
+                EgressRejection::IngressEgressUnimplemented,
+            ]
+        );
+        assert!(report_rejections(node, &pull).is_empty());
+
+        // A reason that is new on a later pull is still worth saying.
+        let mut grown = pull.to_vec();
+        grown.push((4, EgressRejection::UnparseableAddress));
+        assert_eq!(
+            report_rejections(node, &grown),
+            vec![EgressRejection::UnparseableAddress]
+        );
+    }
+
+    /// Reporting once must not mean reporting once ever: an operator who fixes
+    /// the panel row and later breaks it again gets told the second time too.
+    #[test]
+    fn a_reason_is_reported_again_after_the_node_comes_back_clean() {
+        let node = "report-again-after-clean";
+        let pull = [(1, EgressRejection::Expired)];
+
+        assert_eq!(
+            report_rejections(node, &pull),
+            vec![EgressRejection::Expired]
+        );
+        assert!(report_rejections(node, &[]).is_empty());
+        assert_eq!(
+            report_rejections(node, &pull),
+            vec![EgressRejection::Expired]
+        );
+    }
+
+    /// Nodes do not silence each other: one node's bad row says nothing about
+    /// the next node's.
+    #[test]
+    fn reporting_is_remembered_per_node() {
+        let pull = [(1, EgressRejection::Expired)];
+        assert_eq!(
+            report_rejections("report-node-one", &pull),
+            vec![EgressRejection::Expired]
+        );
+        assert_eq!(
+            report_rejections("report-node-two", &pull),
+            vec![EgressRejection::Expired]
+        );
     }
 
     // ------------------------------------------------------------ 链路缓存

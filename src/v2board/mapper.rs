@@ -67,6 +67,7 @@ use crate::tls_server_handler::{
 };
 use crate::trojan_handler::{TrojanTcpHandler, TrojanUsers};
 use crate::tuic_server::{TuicServerUser, TuicServerUsers, TuicUserTable, start_tuic_server};
+use crate::v2board::egress;
 use crate::v2board::grpc::GrpcServerHandler;
 use crate::v2board::http::{V2RayHttp2ServerHandler, V2RayHttpServerHandler};
 use crate::v2board::httpupgrade::HttpUpgradeServerHandler;
@@ -501,6 +502,7 @@ pub fn map_node(
     }
     let spec = normalize_node(app_config, node, server, users)?;
     let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
+    report_egress_routing_override(&node.tag, &spec, outbound_dispatcher.is_some());
     build_runtime_node(
         spec,
         tracker,
@@ -560,6 +562,7 @@ pub fn map_shadowsocks_plugin_nodes(
         ));
     }
     let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
+    report_egress_routing_override(&node.tag, &spec, outbound_dispatcher.is_some());
     let raw_public = build_runtime_node_with_shadowsocks_mux(
         spec,
         tracker,
@@ -956,6 +959,25 @@ fn plugin_bind_location(host: &str, port: u16, tag: &str) -> std::io::Result<Bin
 /// Returns `None` when no routing is configured (outbounds, route rules,
 /// rule providers, or `default_out` all absent), preserving the legacy
 /// direct-only dial path.
+/// The half of the egress refusal story that `normalize_node` cannot tell.
+///
+/// Normalization sees the panel's rows and refuses the ones this node cannot
+/// honour. It does not see the backend's own YAML, so the case where every
+/// binding on the node is valid and still never applies -- because local
+/// routing took over the dial -- has to be reported from here, where the
+/// dispatcher and the users are both in hand.
+fn report_egress_routing_override(node_tag: &str, spec: &RuntimeNodeSpec, has_dispatcher: bool) {
+    let bound_users = if has_dispatcher {
+        spec.users
+            .iter()
+            .filter(|user| user.dedicated_ip.is_some())
+            .count()
+    } else {
+        0
+    };
+    egress::report_local_routing_override(node_tag, bound_users);
+}
+
 fn build_outbound_dispatcher(
     app_config: &AppConfig,
     node_tag: &str,
@@ -3073,7 +3095,13 @@ fn naiveproxy_user_lookup(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
-                    dedicated_ip: user.dedicated_ip.clone(),
+                    // This protocol's dial sites reach the outbound with no
+                    // user in hand, so a dedicated binding carried into this
+                    // table would be dropped at every dial while the panel
+                    // counted it as delivered. Normalization refuses it and
+                    // says so once per node; this is that refusal, kept true
+                    // of the table a live listener actually reads.
+                    dedicated_ip: None,
                 }),
             ))
         })
@@ -3116,7 +3144,13 @@ fn tuic_server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
-                    dedicated_ip: user.dedicated_ip.clone(),
+                    // This protocol's dial sites reach the outbound with no
+                    // user in hand, so a dedicated binding carried into this
+                    // table would be dropped at every dial while the panel
+                    // counted it as delivered. Normalization refuses it and
+                    // says so once per node; this is that refusal, kept true
+                    // of the table a live listener actually reads.
+                    dedicated_ip: None,
                 }),
             ))
         })
@@ -3154,7 +3188,13 @@ fn hysteria2_server_users(
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
-                    dedicated_ip: user.dedicated_ip.clone(),
+                    // This protocol's dial sites reach the outbound with no
+                    // user in hand, so a dedicated binding carried into this
+                    // table would be dropped at every dial while the panel
+                    // counted it as delivered. Normalization refuses it and
+                    // says so once per node; this is that refusal, kept true
+                    // of the table a live listener actually reads.
+                    dedicated_ip: None,
                 }),
             )
         })
