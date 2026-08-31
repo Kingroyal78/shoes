@@ -496,7 +496,6 @@ async fn handle_server_setup_result_inner(
                 let setup_client_stream_future = timeout(
                     Duration::from_secs(60),
                     setup_client_tcp_stream(
-                        &mut server_stream,
                         proxy_selector,
                         resolver,
                         remote_location.clone(),
@@ -506,8 +505,11 @@ async fn handle_server_setup_result_inner(
                     ),
                 );
 
-                let mut client_stream = match setup_client_stream_future.await {
-                    Ok(Ok(Some(s))) => s,
+                let TcpClientSetupResult {
+                    mut client_stream,
+                    early_data: upstream_early_data,
+                } = match setup_client_stream_future.await {
+                    Ok(Ok(Some(result))) => result,
                     Ok(Ok(None)) => {
                         // Must have been blocked.
                         let _ = server_stream.shutdown().await;
@@ -533,6 +535,16 @@ async fn handle_server_setup_result_inner(
                     write_all(&mut server_stream, &data).await?;
                     // server_need_initial_flush should be set to true by the handler if
                     // it's needed.
+                }
+
+                // Strictly after the protocol response: these are the target's
+                // own first bytes, handed over by an upstream proxy alongside
+                // its connect reply. Ahead of the response they would be read
+                // as one -- a VLESS client parses the first byte as a version
+                // and gives up.
+                if let Some(data) = upstream_early_data {
+                    write_all(&mut server_stream, &data).await?;
+                    server_stream.flush().await?;
                 }
 
                 let client_need_initial_flush = match initial_remote_data {
@@ -2153,15 +2165,31 @@ impl AsyncWriteSessionMessage for SpeedLimitedSessionMessageStream {
 
 impl_message_common!(SpeedLimitedSessionMessageStream, AsyncSessionMessageStream);
 
+/// Dials the client side and hands back whatever the dial produced, without
+/// touching the server stream.
+///
+/// It used to take `&mut server_stream` for one purpose: writing the upstream's
+/// `early_data` -- the bytes a SOCKS5 or HTTP proxy returns alongside its
+/// connect reply when the target has already started speaking. Writing them
+/// here put them on the wire *before* the caller's own protocol response, and
+/// VLESS sends a two-byte response header, so the client read the target's
+/// first byte as a VLESS version and dropped the connection. That was
+/// unreachable while every panel dial was direct, because a direct hop never
+/// produces early data; a dedicated egress in `mode: proxy` is what made it
+/// reachable.
+///
+/// Returning the bytes instead of writing them leaves the ordering to the
+/// caller, which is the only place that knows what else has to go first. The
+/// server stream is not a parameter any more, so this function cannot get that
+/// ordering wrong again.
 pub async fn setup_client_tcp_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
     sniffed_protocol: Option<SniffedProtocol>,
     outbound_dispatcher: Option<&OutboundDispatcher>,
     dedicated_egress: Option<DedicatedIpBinding>,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+) -> std::io::Result<Option<TcpClientSetupResult>> {
     let action = client_proxy_selector
         .judge_with_protocol(remote_location.clone().into(), &resolver, sniffed_protocol)
         .await?;
@@ -2180,17 +2208,9 @@ pub async fn setup_client_tcp_stream(
                 &resolver,
                 &remote_location,
             ) {
-                let TcpClientSetupResult {
-                    client_stream,
-                    early_data,
-                } = egress_chain.connect_tcp(remote_location, &resolver).await?;
-
-                if let Some(data) = early_data {
-                    server_stream.write_all(&data).await?;
-                    server_stream.flush().await?;
-                }
-
-                return Ok(Some(client_stream));
+                return Ok(Some(
+                    egress_chain.connect_tcp(remote_location, &resolver).await?,
+                ));
             }
 
             // Node-side local routing: when an outbound dispatcher is
@@ -2211,20 +2231,15 @@ pub async fn setup_client_tcp_stream(
                             format!("failed to dispatch outbound to {remote_location}: {e}"),
                         )
                     })?;
-                return Ok(Some(client_stream));
+                return Ok(Some(TcpClientSetupResult {
+                    client_stream,
+                    early_data: None,
+                }));
             }
 
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
-
-            if let Some(data) = early_data {
-                server_stream.write_all(&data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
+            Ok(Some(
+                chain_group.connect_tcp(remote_location, &resolver).await?,
+            ))
         }
         ConnectDecision::Block => Ok(None),
     }
@@ -2986,6 +3001,145 @@ mod tests {
             recorder: Some(recorder),
             dedicated_ip: None,
         })
+    }
+
+    /// A server stream whose writes are observable after it is handed away.
+    struct RecordingStream(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            // Immediate EOF: the direction under test is server-bound.
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for RecordingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for RecordingStream {}
+
+    /// A SOCKS5 server that answers CONNECT and the target's opening bytes in
+    /// one write, which is what makes a client hand them back as `early_data`.
+    async fn start_coalescing_socks5_upstream(payload: &'static [u8]) -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut head = [0u8; 4];
+            stream.read_exact(&mut head).await.unwrap();
+            let rest = match head[3] {
+                0x01 => 6,
+                0x04 => 18,
+                _ => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).await.unwrap();
+                    len[0] as usize + 2
+                }
+            };
+            let mut discard = vec![0u8; rest];
+            stream.read_exact(&mut discard).await.unwrap();
+
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            reply.extend_from_slice(payload);
+            stream.write_all(&reply).await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+        addr
+    }
+
+    /// A buyer on `mode: proxy` gets a real client hop, and a client hop can
+    /// return the target's first bytes alongside its connect reply. Those
+    /// bytes are stream payload; the handler's response is protocol. Sent in
+    /// the wrong order a VLESS client reads the target's first byte as a
+    /// version number and drops the connection -- which was unreachable until
+    /// a dedicated egress made a proxy hop possible on a panel node.
+    #[tokio::test]
+    async fn upstream_early_data_follows_the_protocol_response() {
+        let upstream = start_coalescing_socks5_upstream(b"SSH-2.0-OpenSSH_9.6").await;
+        let resolver: Arc<dyn Resolver> = Arc::new(NoopResolver);
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        handle_server_setup_result(
+            TcpServerSetupResult::TcpForward {
+                remote_location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 9),
+                stream: Box::new(RecordingStream(written.clone())),
+                need_initial_flush: false,
+                connection_success_response: Some(b"VLESS-RESP".to_vec().into_boxed_slice()),
+                initial_remote_data: None,
+                proxy_selector: direct_allow_selector(resolver.clone(), false),
+                outbound_dispatcher: None,
+                authenticated_user: Some(AuthenticatedUser {
+                    node_tag: "node-a".into(),
+                    uid: 4242,
+                    user_key: "user-4242".into(),
+                    speed_limit: None,
+                    device_limit: None,
+                    recorder: None,
+                    dedicated_ip: Some(Arc::new(DedicatedEgress::Upstream(
+                        crate::v2board::egress::UpstreamProxy {
+                            protocol: crate::v2board::egress::UpstreamProtocol::Socks5,
+                            addr: upstream.ip(),
+                            port: upstream.port(),
+                            username: None,
+                            password: None,
+                        },
+                    ))),
+                }),
+            },
+            resolver,
+            Some("127.0.0.1:50000".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let observed = written.lock().unwrap().clone();
+        let rendered = String::from_utf8_lossy(&observed).to_string();
+        assert!(
+            rendered.starts_with("VLESS-RESP"),
+            "the protocol response has to reach the client first: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("SSH-2.0-OpenSSH_9.6"),
+            "the target's opening bytes must not be dropped: {rendered:?}"
+        );
     }
 
     fn authenticated_user_with_egress(uid: u64, egress: &str) -> Option<AuthenticatedUser> {

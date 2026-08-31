@@ -31,7 +31,7 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::AuthenticatedUser;
+use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult};
 use crate::tcp::tcp_server::{AuthenticatedConnectionScope, setup_client_tcp_stream};
 use crate::util::{allocate_vec, write_all};
 use crate::v2board::outbound::dispatcher::OutboundDispatcher;
@@ -778,7 +778,6 @@ async fn process_tcp_stream(
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(
-            &mut server_stream,
             client_proxy_selector,
             resolver,
             remote_location.clone(),
@@ -792,8 +791,11 @@ async fn process_tcp_stream(
         ),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
+    let TcpClientSetupResult {
+        mut client_stream,
+        early_data: upstream_early_data,
+    } = match setup_client_stream_future.await {
+        Ok(Ok(Some(result))) => result,
         Ok(Ok(None)) => {
             // Must have been blocked.
             let _ = server_stream.shutdown().await;
@@ -814,6 +816,16 @@ async fn process_tcp_stream(
             ));
         }
     };
+
+    // Bytes the target had already sent when the dial completed. Nothing
+    // else goes to the client first on this path -- unlike the TCP server,
+    // which owes a protocol response before them -- so they go out as soon as
+    // they exist. Always `None` today: only an upstream-proxy hop produces
+    // early data, and this path never carries a dedicated egress.
+    if let Some(data) = upstream_early_data {
+        write_all(&mut server_stream, &data).await?;
+        server_stream.flush().await?;
+    }
 
     let unparsed_before_wrap_len = stream_reader.unparsed_data().len();
     if unparsed_before_wrap_len > 0 {

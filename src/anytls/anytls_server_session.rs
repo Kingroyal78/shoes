@@ -880,7 +880,10 @@ impl AnyTlsSession {
                         return Err(e);
                     }
                 };
-                let mut client_stream = client_result.client_stream;
+                let TcpClientSetupResult {
+                    mut client_stream,
+                    early_data: upstream_early_data,
+                } = client_result;
 
                 // Send successful SYNACK (protocol v2)
                 if let Err(e) = self.send_synack(stream_id, None).await {
@@ -892,6 +895,18 @@ impl AnyTlsSession {
 
                 // Bidirectional copy
                 let mut server_stream = scope.wrap_stream(Box::new(stream));
+
+                // The target's own first bytes, handed back by an upstream
+                // proxy alongside its connect reply. They used to be dropped
+                // here, which was invisible while every dial was direct -- a
+                // direct hop never produces early data. A dedicated egress in
+                // `mode: proxy` does, so the buyer lost the opening of every
+                // response whose server speaks first. After the SYNACK,
+                // because they are stream payload and it is protocol.
+                if let Some(data) = upstream_early_data {
+                    server_stream.write_all(&data).await?;
+                    server_stream.flush().await?;
+                }
                 let result =
                     copy_bidirectional(&mut server_stream, &mut *client_stream, false, false).await;
 
