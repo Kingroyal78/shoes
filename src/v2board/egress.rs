@@ -197,8 +197,14 @@ pub fn binding_from_wire(
         return Err(EgressRejection::Expired);
     }
 
+    // A missing `ip` lands here rather than at deserialization on purpose: see
+    // the field's note in `types.rs`. `UnparseableAddress` covers it because
+    // the operator's problem is identical either way -- the row names no
+    // address to bind.
     let addr = wire
         .ip
+        .as_deref()
+        .unwrap_or("")
         .trim()
         .parse::<IpAddr>()
         .map_err(|_| EgressRejection::UnparseableAddress)?;
@@ -495,10 +501,133 @@ mod tests {
     /// clock. Tests about expiry place their `expires_at` either side of it.
     const NOW: i64 = 1_800_000_000;
 
+    /// Every other test in this module hand-builds a `DedicatedIp`, which
+    /// proves what the binding logic does with a value but says nothing about
+    /// whether the panel's bytes ever become that value. The deserialization
+    /// boundary is the one place the two repositories actually meet, and a
+    /// renamed field or a changed type there would leave every test in this
+    /// file green while production nodes hand buyers the shared address.
+    ///
+    /// So these two cases pin whole rows captured from a live panel
+    /// (`GET /api/v1/server/UniProxy/user`), byte for byte, one per delivery
+    /// method. Update them by capturing again, never by editing to taste.
+    mod panel_wire {
+        use super::*;
+        use crate::v2board::types::UserList;
+
+        /// These rows carry real timestamps, so they get a clock of their own
+        /// rather than the module's synthetic `NOW` -- which happens to sit
+        /// after the captured term and would read a live row as lapsed.
+        const BEFORE_CAPTURED_TERM: i64 = 1_790_000_000;
+
+        /// `node_egress`: the panel binds the buyer's outbound source address
+        /// on this node. A term is set, so `expires_at` is a number.
+        #[test]
+        fn a_node_egress_row_from_the_panel_binds_the_source_address() {
+            let body = r#"{"users":[{"id":40034,"uuid":"11111111-2222-4333-8444-555555555555","dedicated_ip":{"assignment_id":34,"ip":"198.51.100.77","mode":"egress","expires_at":1790859302}}]}"#;
+
+            let list: UserList = serde_json::from_str(body).expect("the panel's row must parse");
+            let wire = list.users[0]
+                .dedicated_ip
+                .as_ref()
+                .expect("the row carries a dedicated_ip");
+
+            assert_eq!(wire.ip.as_deref(), Some("198.51.100.77"));
+            assert_eq!(wire.mode.as_deref(), Some("egress"));
+            assert_eq!(wire.expires_at, Some(1_790_859_302));
+
+            match &*binding_from_wire(wire, BEFORE_CAPTURED_TERM).expect("a live egress row binds")
+            {
+                DedicatedEgress::Source(addr) => {
+                    assert_eq!(addr, &"198.51.100.77".parse::<IpAddr>().unwrap());
+                }
+                other => panic!("egress mode must bind a source address, got {other:?}"),
+            }
+        }
+
+        /// `upstream_proxy`: the panel dials out through a bought proxy, and
+        /// the credentials on the row are the *node's*, never the buyer's.
+        /// `expires_at` is null here because a one-time purchase never lapses
+        /// -- the shape a term-based row cannot exercise.
+        #[test]
+        fn an_upstream_proxy_row_from_the_panel_carries_the_dial_target() {
+            let body = r#"{"users":[{"id":40034,"uuid":"11111111-2222-4333-8444-555555555555","dedicated_ip":{"assignment_id":35,"ip":"203.0.113.88","mode":"proxy","protocol":"socks5","port":3128,"username":"proxy-user","password":"s3cr3t-pass","expires_at":null}}]}"#;
+
+            let list: UserList = serde_json::from_str(body).expect("the panel's row must parse");
+            let wire = list.users[0]
+                .dedicated_ip
+                .as_ref()
+                .expect("the row carries a dedicated_ip");
+
+            // A one-time purchase: no term, so nothing to expire against.
+            assert_eq!(wire.expires_at, None);
+
+            match &*binding_from_wire(wire, BEFORE_CAPTURED_TERM).expect("a live proxy row binds") {
+                DedicatedEgress::Upstream(upstream) => {
+                    assert_eq!(upstream.protocol, UpstreamProtocol::Socks5);
+                    assert_eq!(upstream.addr, "203.0.113.88".parse::<IpAddr>().unwrap());
+                    assert_eq!(upstream.port, 3128);
+                    assert_eq!(upstream.username.as_deref(), Some("proxy-user"));
+                    assert_eq!(upstream.password.as_deref(), Some("s3cr3t-pass"));
+                }
+                other => panic!("proxy mode must dial an upstream, got {other:?}"),
+            }
+        }
+
+        /// A buyer with no assignment gets no key at all -- not a null. The
+        /// panel filters nulls out of the user row, and a `None` here is what
+        /// makes "everyone else keeps the shared egress" the default.
+        #[test]
+        fn a_row_without_an_assignment_omits_the_key_entirely() {
+            let body = r#"{"users":[{"id":40035,"uuid":"22222222-2222-4333-8444-555555555555"}]}"#;
+
+            let list: UserList = serde_json::from_str(body).expect("a plain row must parse");
+            assert!(list.users[0].dedicated_ip.is_none());
+        }
+
+        /// One malformed row must cost exactly one binding. The whole list is
+        /// what feeds every user on the node, so a row the panel should never
+        /// send still has to leave the others untouched -- the tolerance the
+        /// contract asks for is worthless if it is applied after a failure
+        /// that already dropped everyone.
+        ///
+        /// Also captured rather than written: a panel whose
+        /// `v2_dedicated_ip_assignment.ip_snapshot` was blanked really does
+        /// publish `"ip": null` next to a healthy row, which is how a
+        /// required `String` here used to take an entire node offline.
+        #[test]
+        fn a_malformed_row_does_not_take_the_rest_of_the_list_down() {
+            let body = r#"{"users":[
+                {"id":40035,"uuid":"00000001-2222-4333-8444-555555555555","dedicated_ip":{"assignment_id":38,"ip":null,"mode":"egress","expires_at":1790859961}},
+                {"id":40036,"uuid":"00000002-2222-4333-8444-555555555555","dedicated_ip":{"assignment_id":39,"ip":"198.51.100.91","mode":"egress","expires_at":1790859961}}
+            ]}"#;
+
+            let list: UserList =
+                serde_json::from_str(body).expect("a null ip must not fail the whole list");
+            assert_eq!(list.users.len(), 2);
+            // The bad row loses its binding here, at the same place every
+            // other malformed value loses it.
+            assert!(
+                binding_from_wire(
+                    list.users[0].dedicated_ip.as_ref().unwrap(),
+                    BEFORE_CAPTURED_TERM
+                )
+                .is_err()
+            );
+            assert!(
+                binding_from_wire(
+                    list.users[1].dedicated_ip.as_ref().unwrap(),
+                    BEFORE_CAPTURED_TERM
+                )
+                .is_ok()
+            );
+        }
+    }
+
     fn wire(ip: &str, mode: Option<&str>) -> DedicatedIp {
         DedicatedIp {
             assignment_id: Some(1),
-            ip: ip.to_string(),
+            ip: Some(ip.to_string()),
             mode: mode.map(ToString::to_string),
             protocol: None,
             port: None,

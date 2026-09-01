@@ -194,7 +194,18 @@ pub struct UserInfo {
 pub struct DedicatedIp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_id: Option<u64>,
-    pub ip: String,
+    /// Optional only so that a null cannot cost more than the row it is on.
+    ///
+    /// The contract makes `ip` required and the panel always sends one, so an
+    /// absent value is a row that should not exist. But a required `String`
+    /// here fails the *whole* user list at deserialization, and that list is
+    /// what feeds every user on the node -- one hand-edited row would take an
+    /// entire node's users offline, which is the opposite of what the
+    /// contract's "warn and drop this binding" table asks for. Refused in
+    /// `egress::binding_from_wire` instead, alongside every other malformed
+    /// value, so the blast radius stays at one buyer's binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
     /// `egress` binds the outbound source address; `ingress_egress` additionally
     /// requires the client to have arrived on that same address.
     ///

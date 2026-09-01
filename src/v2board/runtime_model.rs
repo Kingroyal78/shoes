@@ -1766,7 +1766,7 @@ mod tests {
     fn dedicated_wire(ip: &str, mode: &str, expires_in: i64) -> crate::v2board::types::DedicatedIp {
         crate::v2board::types::DedicatedIp {
             assignment_id: Some(7),
-            ip: ip.to_string(),
+            ip: Some(ip.to_string()),
             mode: Some(mode.to_string()),
             protocol: None,
             port: None,
@@ -1811,7 +1811,7 @@ mod tests {
         let mut users = users();
         users[0].dedicated_ip = Some(crate::v2board::types::DedicatedIp {
             assignment_id: Some(7),
-            ip: "definitely-not-an-ip".to_string(),
+            ip: Some("definitely-not-an-ip".to_string()),
             mode: Some("egress".to_string()),
             protocol: None,
             port: None,
