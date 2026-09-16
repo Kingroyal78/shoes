@@ -48,7 +48,7 @@ E2E_PUSH_INTERVAL_SECS="${E2E_PUSH_INTERVAL_SECS:-5}"
 E2E_WAIT_TIMEOUT_SECS="${E2E_WAIT_TIMEOUT_SECS:-45}"
 E2E_KEEP_FIXTURES="${E2E_KEEP_FIXTURES:-1}"
 E2E_SHOES_LOG_LEVEL="${E2E_SHOES_LOG_LEVEL:-info}"
-E2E_MATRIX_CASES="${E2E_MATRIX_CASES:-vmess_tcp,vmess_ws,vmess_ws_path_ed,vmess_tls,vmess_grpc,vmess_grpc_authority,vmess_httpupgrade,vmess_httpupgrade_headers,vmess_http,vmess_http_tls,vmess_xhttp_tls,vmess_xhttp_auto_tls,vmess_tcp_http_header,vmess_zero_security,vless_tcp,vless_ws,vless_tls,vless_grpc,vless_httpupgrade,vless_http,vless_http_tls,vless_xhttp_tls,vless_xhttp_stream_up_tls,vless_xhttp_stream_one_tls,vless_splithttp_tls,vless_xhttp_reality,vless_http_reality,vless_vision_tls,vless_reality,vless_vision_reality,shadowsocks_aead,shadowsocks_aead_aes192,shadowsocks_aead_aes256,shadowsocks_aead_chacha20,shadowsocks_obfs_http,shadowsocks_2022_aes128,shadowsocks_2022_aes256,trojan_tls,trojan_ws,trojan_grpc,trojan_httpupgrade,anytls_tls,tuic_tls,tuic_tls_newreno_zero_rtt,hysteria2_tls,vless_ws_proxy_protocol_v1,v2node_anytls_tls_proxy_protocol_v2,v2node_vmess_ws_proxy_protocol_v1,v2node_vmess_tcp,v2node_vmess_ws,v2node_vmess_http,v2node_vmess_http_tls,v2node_vmess_grpc,v2node_vmess_httpupgrade,v2node_vmess_xhttp_tls,v2node_vless_tcp,v2node_vless_ws,v2node_vless_tls,v2node_vless_http,v2node_vless_http_tls,v2node_vless_grpc,v2node_vless_httpupgrade,v2node_vless_xhttp_tls,v2node_vless_splithttp_tls,v2node_vless_xhttp_reality,v2node_vless_vision_tls,v2node_vless_reality,v2node_shadowsocks_aead,v2node_shadowsocks_aead_aes192,v2node_shadowsocks_aead_aes256,v2node_shadowsocks_aead_chacha20,v2node_shadowsocks_2022_aes128,v2node_shadowsocks_2022_aes256,v2node_trojan_tls,v2node_trojan_ws,v2node_trojan_grpc,v2node_trojan_httpupgrade,v2node_tuic_tls,v2node_hysteria2_tls,v2node_anytls_tls,v2node_anytls_reality}"
+E2E_MATRIX_CASES="${E2E_MATRIX_CASES:-vmess_tcp,vmess_ws,vmess_ws_path_ed,vmess_tls,vmess_grpc,vmess_grpc_authority,vmess_httpupgrade,vmess_httpupgrade_headers,vmess_http,vmess_http_tls,vmess_xhttp_tls,vmess_xhttp_auto_tls,vmess_tcp_http_header,vmess_zero_security,vless_tcp,vless_uuid_v1,vless_ws,vless_tls,vless_grpc,vless_httpupgrade,vless_http,vless_http_tls,vless_xhttp_tls,vless_xhttp_stream_up_tls,vless_xhttp_stream_one_tls,vless_splithttp_tls,vless_xhttp_reality,vless_http_reality,vless_vision_tls,vless_reality,vless_vision_reality,shadowsocks_aead,shadowsocks_aead_aes192,shadowsocks_aead_aes256,shadowsocks_aead_chacha20,shadowsocks_obfs_http,shadowsocks_2022_aes128,shadowsocks_2022_aes256,trojan_tls,trojan_ws,trojan_grpc,trojan_httpupgrade,anytls_tls,tuic_tls,tuic_tls_newreno_zero_rtt,hysteria2_tls,vless_ws_proxy_protocol_v1,v2node_anytls_tls_proxy_protocol_v2,v2node_vmess_ws_proxy_protocol_v1,v2node_vmess_tcp,v2node_vmess_ws,v2node_vmess_http,v2node_vmess_http_tls,v2node_vmess_grpc,v2node_vmess_httpupgrade,v2node_vmess_xhttp_tls,v2node_vless_tcp,v2node_vless_ws,v2node_vless_tls,v2node_vless_http,v2node_vless_http_tls,v2node_vless_grpc,v2node_vless_httpupgrade,v2node_vless_xhttp_tls,v2node_vless_splithttp_tls,v2node_vless_xhttp_reality,v2node_vless_vision_tls,v2node_vless_reality,v2node_shadowsocks_aead,v2node_shadowsocks_aead_aes192,v2node_shadowsocks_aead_aes256,v2node_shadowsocks_aead_chacha20,v2node_shadowsocks_2022_aes128,v2node_shadowsocks_2022_aes256,v2node_trojan_tls,v2node_trojan_ws,v2node_trojan_grpc,v2node_trojan_httpupgrade,v2node_tuic_tls,v2node_hysteria2_tls,v2node_anytls_tls,v2node_anytls_reality}"
 E2E_CURL_CONNECT_TIMEOUT_SECS="${E2E_CURL_CONNECT_TIMEOUT_SECS:-5}"
 E2E_CURL_MAX_TIME_SECS="${E2E_CURL_MAX_TIME_SECS:-45}"
 
@@ -127,7 +127,7 @@ Runs a local production-oriented V2Board interop matrix against sibling
   vmess_tcp, vmess_ws, vmess_ws_path_ed, vmess_tls, vmess_grpc, vmess_grpc_authority,
   vmess_httpupgrade, vmess_httpupgrade_headers, vmess_http, vmess_http_tls,
   vmess_xhttp_tls, vmess_xhttp_auto_tls, vmess_tcp_http_header, vmess_zero_security,
-  vless_tcp, vless_ws, vless_tls, vless_grpc, vless_httpupgrade,
+  vless_tcp, vless_uuid_v1, vless_ws, vless_tls, vless_grpc, vless_httpupgrade,
   vless_http, vless_http_tls, vless_xhttp_tls, vless_xhttp_stream_up_tls,
   vless_xhttp_stream_one_tls, vless_splithttp_tls, vless_xhttp_reality, vless_http_reality,
   vless_vision_tls, vless_reality, vless_vision_reality,
@@ -615,6 +615,15 @@ case_config() {
       CASE_UUID=22222222-2222-4222-8222-222222222201
       CASE_NODE_PORT=18111
       CASE_PROXY_PORT=18211
+      CASE_NETWORK=tcp
+      ;;
+    vless_uuid_v1)
+      CASE_NODE_TYPE=vless
+      CASE_NODE_ID=9220
+      CASE_USER_ID=19220
+      CASE_UUID=22222222-2222-1222-8222-222222222220
+      CASE_NODE_PORT=18520
+      CASE_PROXY_PORT=18620
       CASE_NETWORK=tcp
       ;;
     vless_ws)
@@ -2565,7 +2574,7 @@ SQL
   local user_id
   for user_id in \
     19101 19102 19103 19104 19105 19106 19107 19108 19109 19110 19111 19112 19113 \
-    19201 19202 19203 19204 19205 19206 19207 19208 19209 19210 19211 19212 \
+    19201 19202 19203 19204 19205 19206 19207 19208 19209 19210 19211 19212 19220 \
     19301 19302 19303 19304 19305 19306 19307 \
     19401 19402 19403 19404 19451 19452 19453 19461 19462 19463 19464 19465 19466 19467 19471 19472 19473 \
     19481 19482 19483 19484 19485 19486 19487 19488 19489 19490 19491 19492 \

@@ -2,10 +2,7 @@ use std::fmt::Write;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
-/// Parse a UUID v4 string (with or without dashes) into 16 bytes.
-/// Validates that the UUID has version 4 and RFC 4122 variant.
-#[inline]
-pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
+fn parse_uuid_bytes(uuid_str: &str) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(16);
     let mut first_nibble: Option<u8> = None;
     for &c in uuid_str.as_bytes() {
@@ -17,7 +14,7 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid uuid: {uuid_str}"),
+                    "UUID must contain only hexadecimal digits and dashes",
                 ));
             }
         };
@@ -30,15 +27,24 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
     if first_nibble.is_some() || bytes.len() != 16 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Invalid uuid: {uuid_str}"),
+            "UUID must contain exactly 32 hexadecimal digits",
         ));
     }
+
+    Ok(bytes)
+}
+
+/// Parse a UUID v4 string (with or without dashes) into 16 bytes.
+/// Validates that the UUID has version 4 and RFC 4122 variant.
+#[inline]
+pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
+    let bytes = parse_uuid_bytes(uuid_str)?;
 
     // Validate version 4: upper nibble of byte 6 must be 4
     if (bytes[6] >> 4) != 4 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("UUID is not version 4: {uuid_str}"),
+            "UUID is not version 4",
         ));
     }
 
@@ -46,11 +52,22 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
     if (bytes[8] >> 6) != 2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("UUID does not have RFC 4122 variant: {uuid_str}"),
+            "UUID does not have RFC 4122 variant",
         ));
     }
 
     Ok(bytes)
+}
+
+/// Parse the 16-byte user ID carried by VLESS.
+///
+/// VLESS does not require the identifier to be UUID v4: deployed clients and
+/// servers accept other UUID versions, including UUID v1 and the UUID v5 form
+/// used for mapped custom IDs. Keep syntax and length validation here without
+/// imposing the UUID generation policy used by [`generate_uuid`].
+#[inline]
+pub fn parse_vless_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
+    parse_uuid_bytes(uuid_str)
 }
 
 /// Generate a random UUID v4 and return it as a formatted string.
@@ -148,5 +165,24 @@ mod tests {
         // Wrong variant (upper 2 bits of byte 8 = 11 instead of 10)
         let uuid = "550e8400-e29b-41d4-c716-446655440000";
         assert!(parse_uuid(uuid).is_err());
+    }
+
+    #[test]
+    fn test_parse_vless_uuid_accepts_non_v4_versions() {
+        let v1 = parse_vless_uuid("550e8400-e29b-11d4-a716-446655440000").unwrap();
+        let v5 = parse_vless_uuid("5783a3e7-e373-51cd-8642-c83782b807c5").unwrap();
+
+        assert_eq!(v1.len(), 16);
+        assert_eq!(v1[6] >> 4, 1);
+        assert_eq!(v5.len(), 16);
+        assert_eq!(v5[6] >> 4, 5);
+    }
+
+    #[test]
+    fn test_parse_vless_uuid_rejects_malformed_ids_without_echoing_them() {
+        let credential = "not-a-vless-credential";
+        let error = parse_vless_uuid(credential).unwrap_err().to_string();
+
+        assert!(!error.contains(credential));
     }
 }

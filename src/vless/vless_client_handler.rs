@@ -7,7 +7,7 @@ use crate::async_stream::AsyncStream;
 use crate::crypto::CryptoTlsStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
-use crate::uuid_util::parse_uuid;
+use crate::uuid_util::parse_vless_uuid;
 use crate::xudp::XudpFixedMessageStream;
 
 use super::vision_stream::VisionStream;
@@ -23,7 +23,7 @@ pub struct VlessTcpClientHandler {
 impl std::fmt::Debug for VlessTcpClientHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VlessTcpClientHandler")
-            .field("user_id", &self.user_id)
+            .field("user_id", &"[REDACTED]")
             .field("udp_enabled", &self.udp_enabled)
             .finish()
     }
@@ -32,7 +32,7 @@ impl std::fmt::Debug for VlessTcpClientHandler {
 impl VlessTcpClientHandler {
     pub fn new(user_id: &str, udp_enabled: bool) -> Self {
         Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            user_id: parse_vless_uuid(user_id).unwrap().into_boxed_slice(),
             udp_enabled,
         }
     }
@@ -299,9 +299,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn client_handler_debug_redacts_the_user_id() {
+        let credential = "550e8400-e29b-11d4-a716-446655440000";
+        let handler = VlessTcpClientHandler::new(credential, true);
+
+        let rendered = format!("{handler:?}");
+
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(credential));
+    }
+
     #[tokio::test]
     async fn write_vless_mux_header_includes_vision_flow_and_no_destination() {
-        let user_id = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
+        let user_id = parse_vless_uuid("11111111-1111-4111-8111-111111111111").unwrap();
         let addon = vision_flow_addon_data();
         let (mut writer, mut reader) = duplex(128);
 

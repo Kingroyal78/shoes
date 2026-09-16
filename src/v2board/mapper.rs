@@ -3233,10 +3233,10 @@ fn parse_vless_user_id(
     spec: &RuntimeNodeSpec,
     user: &crate::v2board::runtime_model::RuntimeUser,
 ) -> std::io::Result<Vec<u8>> {
-    crate::uuid_util::parse_uuid(&user.credential).map_err(|e| {
+    crate::uuid_util::parse_vless_uuid(&user.credential).map_err(|e| {
         invalid_error(format!(
-            "node `{}` user {} has invalid VLESS uuid `{}`: {e}",
-            spec.tag, user.uid, user.credential
+            "node `{}` user {} has invalid VLESS uuid: {e}",
+            spec.tag, user.uid
         ))
     })
 }
@@ -3430,6 +3430,39 @@ mod tests {
             routes: Vec::<RuntimeRoute>::new(),
             route_rule_sets: Default::default(),
         }
+    }
+
+    #[test]
+    fn v2board_vless_accepts_non_v4_uuid_credentials() {
+        let mut spec = vless_reality_spec(runtime_reality());
+        spec.users = vec![runtime_user(
+            1,
+            "550e8400-e29b-11d4-a716-446655440000",
+            None,
+        )];
+
+        build_runtime_node(
+            spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &NodeUserTables::new(),
+        )
+        .expect("VLESS accepts any syntactically valid 16-byte UUID");
+    }
+
+    #[test]
+    fn v2board_vless_invalid_uuid_error_redacts_the_credential() {
+        let credential = "not-a-vless-credential";
+        let mut spec = vless_reality_spec(runtime_reality());
+        spec.users = vec![runtime_user(42, credential, None)];
+
+        let err = expect_build_err(spec).to_string();
+
+        assert!(err.contains("node `vless-reality` user 42"));
+        assert!(err.contains("invalid VLESS uuid"));
+        assert!(!err.contains(credential));
     }
 
     fn vmess_tls_spec(tls: RuntimeTls) -> RuntimeNodeSpec {

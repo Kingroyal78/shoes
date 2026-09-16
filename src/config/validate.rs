@@ -7,7 +7,7 @@ use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
-use crate::uuid_util::parse_uuid;
+use crate::uuid_util::{parse_uuid, parse_vless_uuid};
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
@@ -1001,7 +1001,7 @@ fn validate_server_proxy_config(
             ));
         }
         ServerProxyConfig::Vless { user_id, .. } => {
-            parse_uuid(user_id)?;
+            parse_vless_uuid(user_id)?;
         }
         ServerProxyConfig::Vmess { user_id, .. } => {
             parse_uuid(user_id)?;

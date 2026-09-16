@@ -19,7 +19,7 @@ use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::write_all;
-use crate::uuid_util::parse_uuid;
+use crate::uuid_util::parse_vless_uuid;
 use crate::xudp::XudpMessageStream;
 
 use super::vision_stream::VisionStream;
@@ -43,11 +43,11 @@ impl VlessUsers {
     pub fn new(users: Vec<ServerUser>) -> std::io::Result<Self> {
         let mut by_user_id = FxHashMap::default();
         for user in users {
-            let id: [u8; 16] = parse_uuid(&user.credential)
+            let id: [u8; 16] = parse_vless_uuid(&user.credential)
                 .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("invalid VLESS uuid `{}`: {e}", user.credential),
+                        format!("invalid VLESS uuid: {e}"),
                     )
                 })?
                 .try_into()
@@ -148,7 +148,7 @@ impl VlessTcpServerHandler {
     ) -> Self {
         Self {
             users: SharedUsers::new(VlessUsers::single(
-                parse_uuid(user_id).unwrap().try_into().unwrap(),
+                parse_vless_uuid(user_id).unwrap().try_into().unwrap(),
             )),
             udp_enabled,
             proxy_selector,
@@ -785,8 +785,8 @@ mod tests {
 
     #[tokio::test]
     async fn custom_tls_vision_vless_returns_matched_authenticated_user_from_multi_user_lookup() {
-        let user1 = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
-        let user2 = parse_uuid("22222222-2222-4222-8222-222222222222").unwrap();
+        let user1 = parse_vless_uuid("11111111-1111-1111-8111-111111111111").unwrap();
+        let user2 = parse_vless_uuid("22222222-2222-5222-8222-222222222222").unwrap();
         let users = shared_users(vec![(user1.clone(), 101), (user2.clone(), 202)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;
@@ -823,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_tls_vision_vless_rejects_command_udp() {
-        let user = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
+        let user = parse_vless_uuid("11111111-1111-4111-8111-111111111111").unwrap();
         let users = shared_users(vec![(user.clone(), 101)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;
@@ -856,7 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_tls_vision_vless_rejects_empty_flow_mux() {
-        let user = parse_uuid("11111111-1111-4111-8111-111111111111").unwrap();
+        let user = parse_vless_uuid("11111111-1111-4111-8111-111111111111").unwrap();
         let users = shared_users(vec![(user.clone(), 101)]);
 
         let (server_tls, mut client_tls) = tls_pair().await;

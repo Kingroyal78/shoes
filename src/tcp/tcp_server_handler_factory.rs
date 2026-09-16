@@ -32,7 +32,7 @@ use crate::tls_server_handler::{
     InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
 };
 use crate::trojan_handler::TrojanTcpHandler;
-use crate::uuid_util::parse_uuid;
+use crate::uuid_util::parse_vless_uuid;
 use crate::vless::vless_server_handler::VlessTcpServerHandler;
 use crate::vless::vless_server_handler::VlessUsers;
 use crate::vmess::VmessTcpServerHandler;
@@ -378,7 +378,7 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes: [u8; 16] = parse_uuid(user_id)
+            let user_id_bytes: [u8; 16] = parse_vless_uuid(user_id)
                 .expect("Invalid user_id UUID")
                 .try_into()
                 .expect("VLESS user id must be 16 bytes");
@@ -541,7 +541,7 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes: [u8; 16] = parse_uuid(user_id)
+            let user_id_bytes: [u8; 16] = parse_vless_uuid(user_id)
                 .expect("Invalid user_id UUID")
                 .try_into()
                 .expect("VLESS user id must be 16 bytes");
