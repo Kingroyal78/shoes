@@ -21,6 +21,14 @@ log() {
   printf '[ss-plugin-interop] %s\n' "$*"
 }
 
+log_mihomo_source_commit() {
+  local revision
+
+  [[ -n "${MIHOMO_SOURCE}" && -d "${MIHOMO_SOURCE}" ]] || return 0
+  revision="$(git -C "${MIHOMO_SOURCE}" rev-parse --verify HEAD 2>/dev/null)" || return 0
+  log "Mihomo source commit: ${revision}"
+}
+
 die() {
   log "FAIL: $*"
   if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
@@ -64,8 +72,7 @@ PY
 
 wait_http() {
   local url="$1"
-  local attempt
-  for attempt in $(seq 1 100); do
+  for _ in $(seq 1 100); do
     if curl --silent --show-error --fail --max-time 1 "${url}" >/dev/null 2>&1; then
       return 0
     fi
@@ -76,8 +83,7 @@ wait_http() {
 
 wait_tcp() {
   local port="$1"
-  local attempt
-  for attempt in $(seq 1 100); do
+  for _ in $(seq 1 100); do
     if python3 - "${port}" <<'PY'
 import socket
 import sys
@@ -98,8 +104,7 @@ PY
 wait_ready() {
   local panel_port="$1"
   local case_name="$2"
-  local attempt
-  for attempt in $(seq 1 160); do
+  for _ in $(seq 1 160); do
     if curl --silent --show-error --fail --max-time 1 \
       "http://127.0.0.1:${panel_port}/test/status" \
       | python3 -c '
@@ -447,9 +452,7 @@ main() {
     )
   fi
   log "external client: $("${MIHOMO_BIN}" -v | head -1)"
-  if git -C "${MIHOMO_SOURCE}" rev-parse --verify HEAD >/dev/null 2>&1; then
-    log "Mihomo source commit: $(git -C "${MIHOMO_SOURCE}" rev-parse HEAD)"
-  fi
+  log_mihomo_source_commit
 
   IFS=',' read -r -a case_list <<<"${CASES}"
   local case_name
@@ -460,4 +463,6 @@ main() {
   log "all requested real-process interoperability cases passed"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
