@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +23,7 @@ pub struct NodeLkgSnapshot {
     #[serde(default)]
     pub user_revision: Option<u64>,
     pub server_config: ServerConfig,
-    pub users: Vec<UserInfo>,
+    pub users: Arc<Vec<UserInfo>>,
     plugin: Option<PluginLkgSnapshot>,
 }
 
@@ -39,7 +40,7 @@ impl NodeLkgSnapshot {
         server_etag: Option<String>,
         user_etag: Option<String>,
         server_config: ServerConfig,
-        users: Vec<UserInfo>,
+        users: impl Into<Arc<Vec<UserInfo>>>,
         plugin_candidate: Option<&PluginConfigCandidate>,
     ) -> std::io::Result<Self> {
         let plugin = match plugin_candidate {
@@ -59,7 +60,7 @@ impl NodeLkgSnapshot {
             user_etag,
             user_revision: None,
             server_config,
-            users,
+            users: users.into(),
             plugin,
         })
     }
@@ -239,9 +240,10 @@ pub async fn persist(
         // Named MessagePack: markedly smaller and faster to encode than JSON on
         // a payload that scales with the user count, without the brittleness of
         // a positional encoding for a file a later build has to read back.
-        let bytes = rmp_serde::to_vec_named(&snapshot)
-            .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
-        persist_blocking(&path, &bytes)
+        // Encode directly into the atomic temporary file: materialising a
+        // second Vec<u8> here needlessly puts the whole snapshot beside the
+        // live user/runtime tables at the exact point where memory is tightest.
+        persist_blocking(&path, &snapshot)
     })
     .await
     .map_err(|error| std::io::Error::other(format!("LKG persist task failed: {error}")))?
@@ -272,7 +274,7 @@ fn load_blocking(
     Ok(snapshot)
 }
 
-fn persist_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn persist_blocking(path: &Path, snapshot: &NodeLkgSnapshot) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid_data("LKG snapshot path has no parent"))?;
@@ -296,7 +298,8 @@ fn persist_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let mut file = options.open(&temporary)?;
     let write_result = (|| {
-        file.write_all(bytes)?;
+        rmp_serde::encode::write_named(&mut file, snapshot)
+            .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)?;

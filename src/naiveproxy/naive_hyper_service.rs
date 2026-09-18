@@ -267,30 +267,23 @@ async fn naive_service(
 
     let has_padding = req.headers().get("padding").is_some();
 
-    // Borrow the table only for validation, copying out this user's identity;
-    // see `SharedUsers` for why the borrow must not outlive the handshake.
-    let users = config.users.load();
-    let validated_user = match req.headers().get("proxy-authorization") {
-        Some(auth) => match auth.to_str().ok().and_then(|s| users.validate(s)) {
-            Some(user) => user,
-            None => {
-                debug!("NaiveProxy: invalid credentials, returning 400");
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(empty_body())
-                    .unwrap());
-            }
-        },
-        None => {
-            debug!("NaiveProxy: missing auth header, returning 400");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(empty_body())
-                .unwrap());
-        }
+    // Scope the table borrow to validation. The response/tunnel below may
+    // await while the request remains alive, and must not pin an old table.
+    let credentials = {
+        let users = config.users.load();
+        req.headers()
+            .get("proxy-authorization")
+            .and_then(|auth| auth.to_str().ok())
+            .and_then(|auth| users.validate(auth))
+            .map(|user| (user.name.to_string(), user.authenticated_user.cloned()))
     };
-    let username = validated_user.name.to_string();
-    let authenticated_user = validated_user.authenticated_user.cloned();
+    let Some((username, authenticated_user)) = credentials else {
+        debug!("NaiveProxy: missing or invalid credentials, returning 400");
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(empty_body())
+            .unwrap());
+    };
 
     let destination = match parse_connect_destination(&req) {
         Some(dest) => dest,

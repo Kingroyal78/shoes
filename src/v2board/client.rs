@@ -83,7 +83,7 @@ impl V2BoardClient {
         &self,
         app_config: &AppConfig,
         node: &V2BoardNodeConfig,
-        etag: Option<&str>,
+        previous_etag: Option<&str>,
         last_body_hash: Option<&[u8; 32]>,
         since: Option<u64>,
     ) -> std::io::Result<UserListFetch> {
@@ -93,35 +93,30 @@ impl V2BoardClient {
             .query(&Self::user_query(app_config, node, since))
             .header("X-Response-Format", "msgpack")
             .header(ACCEPT, "application/x-msgpack, application/json");
-        let request = add_etag(request, etag);
+        let request = add_etag(request, previous_etag);
         let response = request.send().await.map_err(http_error)?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(UserListFetch::NotModified);
         }
 
-        let response = self.ensure_success(response).await?;
+        let mut response = self.ensure_success(response).await?;
         let etag = response_etag(response.headers());
+        // Some panel/proxy combinations ignore If-None-Match and resend a
+        // 200 body. A matching ETag is already a stronger identity check than
+        // hashing that body again; drain it in bounded chunks so the HTTP
+        // connection remains reusable without allocating the full payload.
+        if previous_etag.is_some() && etag.as_deref() == previous_etag {
+            drain_response_body(&mut response, self.user_list_body_limit).await?;
+            return Ok(UserListFetch::Unchanged { etag });
+        }
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let bytes = response.bytes().await.map_err(http_error).and_then(|b| {
-            if b.len() > self.user_list_body_limit {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "user list response exceeds configured limit: {} > {}",
-                        b.len(),
-                        self.user_list_body_limit
-                    ),
-                ))
-            } else {
-                Ok(b)
-            }
-        })?;
+        let bytes = read_user_body_limited(&mut response, self.user_list_body_limit).await?;
 
         let body_hash = *blake3::hash(&bytes).as_bytes();
         if last_body_hash == Some(&body_hash) {
@@ -368,6 +363,67 @@ impl V2BoardClient {
         }
         query
     }
+}
+
+async fn drain_response_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> std::io::Result<()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("user list response exceeds configured limit: content length exceeds {limit}"),
+        ));
+    }
+    let mut received = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+        received = received.saturating_add(chunk.len());
+        if received > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("user list response exceeds configured limit: {received} > {limit}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn read_user_body_limited(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("user list response exceeds configured limit: content length exceeds {limit}"),
+        ));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(limit),
+    );
+    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "user list response exceeds configured limit: {} > {limit}",
+                    body.len().saturating_add(chunk.len())
+                ),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn add_etag(request: reqwest::RequestBuilder, etag: Option<&str>) -> reqwest::RequestBuilder {
@@ -820,6 +876,40 @@ mod tests {
         }
         let request = request.await.unwrap();
         assert!(request.contains("since=7"));
+    }
+
+    #[tokio::test]
+    async fn a_matching_etag_skips_buffering_and_decoding_the_resent_body() {
+        let first_body = r#"{"users":[{"id":1,"uuid":"aaaaaaaa-0000-0000-0000-000000000001"}]}"#;
+        let first_response = json_response(StatusCode::OK, "\"stable\"", first_body);
+        let (api_host, _) = serve_once(first_response).await;
+        let (mut app, mut node) = app_and_node(NodeType::Vless);
+        app.v2board.api_host = api_host.clone();
+        node.api_host = Some(api_host);
+        let client = V2BoardClient::new(&app).unwrap();
+        let etag = match client
+            .get_user_list(&app, &node, None, None, None)
+            .await
+            .unwrap()
+        {
+            UserListFetch::Updated { etag, .. } => etag,
+            _ => panic!("the first response must decode"),
+        };
+
+        // The body is deliberately invalid. Matching ETag must make this a
+        // bounded drain rather than a decode attempt.
+        let second_response = json_response(StatusCode::OK, "\"stable\"", "not-json");
+        let (api_host, _) = serve_once(second_response).await;
+        node.api_host = Some(api_host.clone());
+        app.v2board.api_host = api_host;
+        match client
+            .get_user_list(&app, &node, etag.as_deref(), None, None)
+            .await
+            .unwrap()
+        {
+            UserListFetch::Unchanged { etag: observed } => assert_eq!(observed, etag),
+            _ => panic!("matching ETag must skip body decoding"),
+        }
     }
 
     async fn serve_once(response: String) -> (String, tokio::task::JoinHandle<String>) {

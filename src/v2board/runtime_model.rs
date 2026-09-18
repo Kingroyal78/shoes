@@ -284,6 +284,21 @@ pub fn normalize_node(
     })
 }
 
+/// Normalize the node's protocol/transport/security configuration without
+/// materializing its user table.
+///
+/// User-list refreshes only need the immutable node settings plus a protocol
+/// table built from the incoming rows.  Keeping this small variant separate
+/// prevents a refresh from first allocating `Vec<RuntimeUser>` and then
+/// allocating the protocol-specific table from it.
+pub(crate) fn normalize_node_without_users(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+) -> std::io::Result<RuntimeNodeSpec> {
+    normalize_node(app_config, node, server, &[])
+}
+
 fn validate_local_protocol_overrides(
     node: &V2BoardNodeConfig,
     node_type: NodeType,
@@ -1144,44 +1159,61 @@ fn normalize_users(
     node_type: NodeType,
     users: &[UserInfo],
 ) -> std::io::Result<Vec<RuntimeUser>> {
+    let mut normalized = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, node_type, users, |user| {
+        normalized.push(user);
+        Ok(())
+    })?;
+    Ok(normalized)
+}
+
+/// Visit active users after applying exactly the same panel credential,
+/// expiration and dedicated-egress normalization used by full runtime builds.
+/// The callback receives one temporary [`RuntimeUser`] at a time, allowing
+/// users-only refreshes to build their protocol table without an intermediate
+/// user vector.
+pub(crate) fn for_each_runtime_user<F>(
+    node: &V2BoardNodeConfig,
+    node_type: NodeType,
+    users: &[UserInfo],
+    mut visit: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(RuntimeUser) -> std::io::Result<()>,
+{
     let now = Utc::now();
     let mut rejections = Vec::new();
-    let normalized: Vec<RuntimeUser> = users
-        .iter()
-        .filter(|user| panel_user_active(user, now))
-        .map(|user| {
-            let credential = user.credential().ok_or_else(|| {
-                invalid_error(format!(
-                    "node `{}` user {} has no uuid/password/username credential",
-                    node.tag, user.id
-                ))
-            })?;
-            let dedicated_ip =
-                user.dedicated_ip.as_ref().and_then(|wire| {
-                    match dedicated_binding(node_type, wire, now.timestamp()) {
-                        Ok(binding) => Some(binding),
-                        Err(rejection) => {
-                            rejections.push((user.id, rejection));
-                            None
-                        }
-                    }
-                });
-            Ok(RuntimeUser {
-                uid: user.id,
-                credential: credential.to_string(),
-                secret: user.secret().map(ToOwned::to_owned),
-                username: non_empty(user.username.as_deref()),
-                password: non_empty(user.password.as_deref()),
-                user_key: user.key(),
-                policy: UserPolicy {
-                    speed_limit_mbps: user.speed_limit,
-                    device_limit: user.device_limit,
-                },
-                label: user.label.clone(),
-                dedicated_ip,
-            })
-        })
-        .collect::<std::io::Result<Vec<RuntimeUser>>>()?;
+    for user in users.iter().filter(|user| panel_user_active(user, now)) {
+        let credential = user.credential().ok_or_else(|| {
+            invalid_error(format!(
+                "node `{}` user {} has no uuid/password/username credential",
+                node.tag, user.id
+            ))
+        })?;
+        let dedicated_ip = user.dedicated_ip.as_ref().and_then(|wire| {
+            match dedicated_binding(node_type, wire, now.timestamp()) {
+                Ok(binding) => Some(binding),
+                Err(rejection) => {
+                    rejections.push((user.id, rejection));
+                    None
+                }
+            }
+        });
+        visit(RuntimeUser {
+            uid: user.id,
+            credential: credential.to_string(),
+            secret: user.secret().map(ToOwned::to_owned),
+            username: non_empty(user.username.as_deref()),
+            password: non_empty(user.password.as_deref()),
+            user_key: user.key(),
+            policy: UserPolicy {
+                speed_limit_mbps: user.speed_limit,
+                device_limit: user.device_limit,
+            },
+            label: user.label.clone(),
+            dedicated_ip,
+        })?;
+    }
 
     // A refused binding is a buyer paying for an exclusive address and getting
     // the node's shared one, so it cannot end here as a `None` nobody sees.
@@ -1189,7 +1221,7 @@ fn normalize_users(
     // function runs on nearly every pull and one line per bad row per pull is
     // a flood that hides the very thing it is reporting.
     egress::report_rejections(&node.tag, &rejections);
-    Ok(normalized)
+    Ok(())
 }
 
 /// The binding a user's `dedicated_ip` row asks for, or why this node refuses

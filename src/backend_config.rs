@@ -578,6 +578,8 @@ pub struct RuntimeConfig {
     pub device_online_min_traffic: u64,
     #[serde(default = "default_max_legacy_shadowsocks_users")]
     pub max_legacy_shadowsocks_users: usize,
+    #[serde(default = "default_max_concurrent_v2board_syncs")]
+    pub max_concurrent_v2board_syncs: usize,
     #[serde(default)]
     pub tcp_fast_open: bool,
 }
@@ -591,6 +593,7 @@ impl Default for RuntimeConfig {
             node_report_min_traffic: 0,
             device_online_min_traffic: 0,
             max_legacy_shadowsocks_users: default_max_legacy_shadowsocks_users(),
+            max_concurrent_v2board_syncs: default_max_concurrent_v2board_syncs(),
             tcp_fast_open: false,
         }
     }
@@ -694,6 +697,9 @@ impl AppConfig {
         }
         if self.runtime.max_legacy_shadowsocks_users == 0 {
             return invalid("runtime.max_legacy_shadowsocks_users must be greater than 0");
+        }
+        if self.runtime.max_concurrent_v2board_syncs == 0 {
+            return invalid("runtime.max_concurrent_v2board_syncs must be greater than 0");
         }
         if self.runtime.tcp_fast_open {
             return invalid(
@@ -1181,6 +1187,10 @@ fn default_push_interval_secs() -> u64 {
 
 fn default_max_legacy_shadowsocks_users() -> usize {
     10_000
+}
+
+fn default_max_concurrent_v2board_syncs() -> usize {
+    1
 }
 
 fn default_log_level() -> String {

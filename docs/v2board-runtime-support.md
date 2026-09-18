@@ -4,6 +4,11 @@ This document tracks the server-side production surface that the current V2Board
 
 The acceptance boundary is inbound/server behavior plus the V2Board control plane, policy, routing, and accounting. Generic local-YAML client/outbound implementations, TUN, utility proxy listeners, and client-side H2MUX or AnyTLS behavior are not evaluated or advertised here.
 
+For memory-bounded control-plane updates, `runtime.max_concurrent_v2board_syncs`
+limits how many node syncs may build user tables/runtime generations at once.
+It defaults to `1`; increase it only when the process has enough headroom for
+multiple large panel user lists.
+
 ## Node Models
 
 The local config accepts the supported node types `shadowsocks`, `vmess`, `vless`, `trojan`, `anytls`, `tuic`, `hysteria`, `naiveproxy`, and `v2node`. It also accepts the aliases `ss`, `v2ray`, `hysteria2`, and `naive`, which are normalized to `shadowsocks`, `vmess`, `hysteria`, and `naiveproxy` before calling UniProxy.

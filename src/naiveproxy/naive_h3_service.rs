@@ -300,18 +300,19 @@ async fn handle_h3_connect(
 ) -> io::Result<()> {
     let has_padding = req.headers().get("padding").is_some();
 
-    // Borrow the table only for validation, copying out this user's identity;
-    // see `SharedUsers` for why the borrow must not outlive the handshake.
-    let users = config.users.load();
-    let validated_user = match req.headers().get("proxy-authorization") {
-        Some(auth) => match auth.to_str().ok().and_then(|s| users.validate(s)) {
-            Some(user) => user,
-            None => return send_h3_status(stream, StatusCode::BAD_REQUEST).await,
-        },
-        None => return send_h3_status(stream, StatusCode::BAD_REQUEST).await,
+    // Scope the table borrow to validation. Error responses and the tunnel
+    // below await after this point and must not pin a superseded table.
+    let credentials = {
+        let users = config.users.load();
+        req.headers()
+            .get("proxy-authorization")
+            .and_then(|auth| auth.to_str().ok())
+            .and_then(|auth| users.validate(auth))
+            .map(|user| (user.name.to_string(), user.authenticated_user.cloned()))
     };
-    let username = validated_user.name.to_string();
-    let authenticated_user = validated_user.authenticated_user.cloned();
+    let Some((username, authenticated_user)) = credentials else {
+        return send_h3_status(stream, StatusCode::BAD_REQUEST).await;
+    };
 
     let destination = match req
         .uri()

@@ -76,8 +76,9 @@ use crate::v2board::outbound::dispatcher::OutboundDispatcher;
 use crate::v2board::proxy_protocol::ProxyProtocolServerHandler;
 use crate::v2board::route_rule_set::{load_geoip_matchers, load_geosite_matchers};
 use crate::v2board::runtime_model::{
-    RuntimeNodeSpec, RuntimeProtocol, RuntimeSecurity, RuntimeTls, RuntimeTransport,
-    ShadowsocksObfs, TcpHeader, normalize_node,
+    RuntimeNodeSpec, RuntimeProtocol, RuntimeSecurity, RuntimeTls, RuntimeTransport, RuntimeUser,
+    ShadowsocksObfs, TcpHeader, for_each_runtime_user, normalize_node,
+    normalize_node_without_users,
 };
 use crate::v2board::tracker::TrafficTracker;
 use crate::v2board::user_tables::NodeUserTables;
@@ -2928,6 +2929,124 @@ fn shadowsocks_2022_server_users(
         .collect()
 }
 
+fn authenticated_user_from_runtime(
+    node_tag: &Arc<str>,
+    user: RuntimeUser,
+    tracker: &Arc<TrafficTracker>,
+) -> AuthenticatedUser {
+    AuthenticatedUser {
+        node_tag: node_tag.clone(),
+        uid: user.uid,
+        user_key: user.user_key,
+        speed_limit: user.policy.speed_limit_mbps,
+        device_limit: user.policy.device_limit,
+        recorder: Some(tracker.clone()),
+        dedicated_ip: user.dedicated_ip,
+    }
+}
+
+/// Build server users directly from panel rows.  This is deliberately used by
+/// the users-only refresh path: a temporary `RuntimeUser` is created for one
+/// row and consumed immediately, rather than retaining a second full user
+/// vector between the panel snapshot and the protocol table.
+fn raw_server_users(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    reject_duplicate_credentials: bool,
+    max_users: Option<usize>,
+) -> std::io::Result<Vec<ServerUser>> {
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    let mut seen = reject_duplicate_credentials.then(|| HashMap::with_capacity(users.len()));
+    let mut result = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, spec.node_type, users, |user| {
+        if let Some(max_users) = max_users
+            && result.len() >= max_users
+        {
+            let count = result.len() + 1;
+            return invalid(format!(
+                "node `{}` shadowsocks legacy AEAD has {} users; max_legacy_shadowsocks_users={} because legacy multi-user authentication is O(n)",
+                spec.tag, count, max_users
+            ));
+        }
+        if let Some(seen) = seen.as_mut()
+            && let Some(previous) = seen.insert(user.credential.clone(), user.uid)
+        {
+            return invalid(format!(
+                "node `{}` user {} credential duplicates user {} credential",
+                spec.tag, user.uid, previous
+            ));
+        }
+        let credential = user.credential.clone();
+        let authenticated_user = authenticated_user_from_runtime(&node_tag, user, &tracker);
+        result.push(ServerUser {
+            credential,
+            authenticated_user,
+        });
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+fn build_shadowsocks_users_from_raw(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    max_legacy_shadowsocks_users: usize,
+) -> std::io::Result<ShadowsocksUsers> {
+    let RuntimeProtocol::Shadowsocks {
+        cipher, server_key, ..
+    } = &spec.protocol
+    else {
+        return invalid(format!("node `{}` is not a shadowsocks node", spec.tag));
+    };
+    let key_len = shadowsocks_2022_key_len(cipher)?;
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    if let Some(key_len) = key_len {
+        let server_key = server_key.as_deref().ok_or_else(|| {
+            invalid_error(format!(
+                "node `{}` shadowsocks 2022 cipher `{cipher}` requires server_key",
+                spec.tag
+            ))
+        })?;
+        let _ = decode_shadowsocks_2022_psk(server_key, key_len, || {
+            format!("node `{}` shadowsocks server_key", spec.tag)
+        })?;
+        let mut seen = HashMap::with_capacity(users.len());
+        let mut table_users = Vec::with_capacity(users.len());
+        for_each_runtime_user(node, spec.node_type, users, |user| {
+            let password = shadowsocks_2022_user_password(&user, key_len, &spec.tag)?;
+            let psk = decode_shadowsocks_2022_psk(&password, key_len, || {
+                format!("node `{}` user {} shadowsocks 2022 psk", spec.tag, user.uid)
+            })?;
+            if let Some(previous) = seen.insert(psk.clone(), user.uid) {
+                return invalid(format!(
+                    "node `{}` shadowsocks user {} psk duplicates user {} psk",
+                    spec.tag, user.uid, previous
+                ));
+            }
+            let authenticated_user = authenticated_user_from_runtime(&node_tag, user, &tracker);
+            table_users.push((psk, authenticated_user));
+            Ok(())
+        })?;
+        let cipher = shadowsocks_2022_runtime_cipher(cipher)?;
+        return Ok(ShadowsocksUsers::aead2022(&cipher, table_users));
+    }
+
+    let table_users = raw_server_users(
+        spec,
+        node,
+        users,
+        tracker,
+        true,
+        Some(max_legacy_shadowsocks_users),
+    )?;
+    let cipher: ShadowsocksCipher = cipher.as_str().try_into()?;
+    Ok(ShadowsocksUsers::legacy(&cipher, table_users))
+}
+
 /// Build the Shadowsocks user table described by `spec`.
 ///
 /// Shared by listener construction and by the users-only sync path so both
@@ -2980,6 +3099,43 @@ pub fn refresh_node_users(
     tracker: Arc<TrafficTracker>,
     user_tables: &NodeUserTables,
 ) -> std::io::Result<bool> {
+    // Shadowsocks and VMess are the most common large-user-list nodes.  Their
+    // hot-refresh tables only need protocol credentials, so avoid first
+    // materializing `RuntimeNodeSpec.users` (a second full user vector).  The
+    // remaining protocols retain the established full normalization path until
+    // their protocol-specific builders can be converted with the same care.
+    let lightweight_protocol = match node.node_type {
+        NodeType::Shadowsocks | NodeType::Vmess => true,
+        NodeType::V2Node => server
+            .protocol
+            .as_deref()
+            .and_then(NodeType::parse)
+            .is_some_and(|kind| matches!(kind, NodeType::Shadowsocks | NodeType::Vmess)),
+        _ => false,
+    };
+    if lightweight_protocol {
+        let lightweight_spec = normalize_node_without_users(app_config, node, server)?;
+        match lightweight_spec.node_type {
+            NodeType::Shadowsocks => {
+                let table = build_shadowsocks_users_from_raw(
+                    &lightweight_spec,
+                    node,
+                    users,
+                    tracker,
+                    app_config.runtime.max_legacy_shadowsocks_users,
+                )?;
+                user_tables.publish_shadowsocks(table);
+            }
+            NodeType::Vmess => {
+                let server_users =
+                    raw_server_users(&lightweight_spec, node, users, tracker, false, None)?;
+                user_tables.publish_vmess(VmessUsers::new(server_users));
+            }
+            _ => unreachable!(),
+        }
+        return Ok(true);
+    }
+
     let spec = normalize_node(app_config, node, server, users)?;
     match node.node_type {
         NodeType::Shadowsocks => {
@@ -3323,7 +3479,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::backend_config::RouteRuleSetsConfig;
+    use crate::backend_config::{RouteRuleSetsConfig, V2BoardNodeConfig};
     use crate::resolver::NativeResolver;
     use crate::v2board::runtime_model::{
         RuntimeBaseConfig, RuntimeBind, RuntimeReality, RuntimeRoute, RuntimeTls, RuntimeUser,
@@ -3729,6 +3885,46 @@ mod tests {
         let after = tables.shadowsocks().expect("still published");
         assert!(Arc::ptr_eq(&published, &after));
         assert_eq!(published.load().len(), 1);
+    }
+
+    #[test]
+    fn raw_shadowsocks_refresh_skips_the_runtime_user_vector() {
+        let node = V2BoardNodeConfig {
+            tag: "ss-refresh".to_string(),
+            node_id: 1,
+            node_type: NodeType::Shadowsocks,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let spec = shadowsocks_spec("aes-128-gcm", None, Vec::new());
+        let users = vec![
+            serde_json::from_value::<UserInfo>(json!({
+                "id": 1,
+                "uuid": "user-one"
+            }))
+            .unwrap(),
+            serde_json::from_value::<UserInfo>(json!({
+                "id": 2,
+                "uuid": "user-two",
+                "enabled": false
+            }))
+            .unwrap(),
+            serde_json::from_value::<UserInfo>(json!({
+                "id": 3,
+                "uuid": "user-three"
+            }))
+            .unwrap(),
+        ];
+
+        let table = build_shadowsocks_users_from_raw(&spec, &node, &users, test_tracker(), 10)
+            .expect("raw users build");
+        assert_eq!(table.len(), 2, "disabled panel users stay out of the table");
     }
 
     fn runtime_user(uid: u64, credential: &str, secret: Option<String>) -> RuntimeUser {

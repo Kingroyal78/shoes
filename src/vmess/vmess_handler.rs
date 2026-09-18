@@ -218,32 +218,38 @@ impl TcpServerHandler for VmessTcpServerHandler {
         aead_bytes.copy_from_slice(&cert_hash);
 
         let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        // Borrowed for the probe loop only; see `SharedUsers`.
-        let users = self.users.load();
-        let matched_user = users.users.iter().find_map(|user| {
-            let mut candidate = aead_bytes;
-            if user
-                .aead_decrypting_key
-                .decrypt(&mut candidate, DecryptionContext::None)
-                .is_err()
-            {
-                return None;
-            }
-            let checksum = super::crc32::crc32c(&candidate[0..12]);
-            let expected_checksum = u32::from_be_bytes(candidate[12..16].try_into().unwrap());
-            if checksum != expected_checksum {
-                return None;
-            }
-            let time_secs = u64::from_be_bytes(candidate[0..8].try_into().unwrap());
-            let time_delta = time_secs.abs_diff(current_time_secs);
-            if time_delta > 120 {
-                return Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
-                )));
-            }
-            Some(Ok((user.instruction_key, user.authenticated_user.clone())))
-        });
+        // Borrowed for the probe loop only; see `SharedUsers`. Copy out the
+        // matched credentials before any subsequent network await so a slow
+        // handshake cannot pin an old user table.
+        let matched_user = {
+            let users = self.users.load();
+            users.users.iter().find_map(|user| {
+                let mut candidate = aead_bytes;
+                if user
+                    .aead_decrypting_key
+                    .decrypt(&mut candidate, DecryptionContext::None)
+                    .is_err()
+                {
+                    return None;
+                }
+                let checksum = super::crc32::crc32c(&candidate[0..12]);
+                let expected_checksum = u32::from_be_bytes(candidate[12..16].try_into().unwrap());
+                if checksum != expected_checksum {
+                    return None;
+                }
+                let time_secs = u64::from_be_bytes(candidate[0..8].try_into().unwrap());
+                let time_delta = time_secs.abs_diff(current_time_secs);
+                if time_delta > 120 {
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"
+                        ),
+                    )));
+                }
+                Some(Ok((user.instruction_key, user.authenticated_user.clone())))
+            })
+        };
 
         let (instruction_key, authenticated_user) = match matched_user {
             Some(Ok(v)) => v,

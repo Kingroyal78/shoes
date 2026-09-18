@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::{Interval, interval};
 
 use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
@@ -34,6 +34,7 @@ pub async fn sync_once(config_path: &str) -> std::io::Result<()> {
             app.client.clone(),
             app.tracker.clone(),
             app.resolver.clone(),
+            app.sync_gate.clone(),
         );
         if let Err(error) = controller.restore_lkg().await {
             log::warn!(
@@ -61,6 +62,7 @@ struct V2BoardApp {
     client: V2BoardClient,
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
+    sync_gate: Arc<Semaphore>,
 }
 
 impl V2BoardApp {
@@ -70,11 +72,13 @@ impl V2BoardApp {
         let client = V2BoardClient::new(&config)?;
         let tracker = Arc::new(TrafficTracker::new(config.runtime.data_dir.clone()).await?);
         let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
+        let sync_gate = Arc::new(Semaphore::new(config.runtime.max_concurrent_v2board_syncs));
         Ok(Self {
             config,
             client,
             tracker,
             resolver,
+            sync_gate,
         })
     }
 
@@ -90,6 +94,7 @@ impl V2BoardApp {
                 self.client.clone(),
                 self.tracker.clone(),
                 self.resolver.clone(),
+                self.sync_gate.clone(),
             );
             let mut ready = match controller.restore_lkg().await {
                 Ok(restored) => restored,
@@ -179,7 +184,7 @@ struct NodeController {
     /// recognised without paying to decode it again.
     user_body_hash: Option<[u8; 32]>,
     server_config: Option<ServerConfig>,
-    users: Option<Vec<UserInfo>>,
+    users: Option<Arc<Vec<UserInfo>>>,
     plugin_candidate: Option<PluginConfigCandidate>,
     plugin_applied: Option<PluginConfigApplied>,
     force_plugin_refresh: bool,
@@ -187,6 +192,7 @@ struct NodeController {
     /// so a failed persist is retried even though nothing changed afterwards.
     lkg_persist_pending: bool,
     runtime: NodeRuntime,
+    sync_gate: Arc<Semaphore>,
     /// User tables shared with the live listeners. They outlive runtime
     /// generations so a user-list change is published in place instead of
     /// rebuilding listeners that open connections would then pin.
@@ -200,6 +206,7 @@ impl NodeController {
         client: V2BoardClient,
         tracker: Arc<TrafficTracker>,
         resolver: Arc<dyn Resolver>,
+        sync_gate: Arc<Semaphore>,
     ) -> Self {
         Self {
             config,
@@ -218,6 +225,7 @@ impl NodeController {
             force_plugin_refresh: false,
             lkg_persist_pending: false,
             runtime: NodeRuntime::default(),
+            sync_gate,
             user_tables: NodeUserTables::new(),
         }
     }
@@ -314,7 +322,7 @@ impl NodeController {
         let mut next_user_etag = self.user_etag.clone();
         let mut next_user_revision = self.user_revision;
         let mut next_user_body_hash = self.user_body_hash;
-        let mut next_users = self.users.clone();
+        let mut next_users: Option<Arc<Vec<UserInfo>>> = None;
         let mut next_plugin_candidate = self.plugin_candidate.clone();
 
         // A successful pull used to produce no output at all, which left the
@@ -328,6 +336,13 @@ impl NodeController {
         let mut plugin_outcome = "n/a";
         let mut users_outcome = "not modified";
         let mut alive_fetched = false;
+
+        let _sync_permit = self
+            .sync_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::other("V2Board sync gate was closed"))?;
 
         match self
             .client
@@ -391,40 +406,64 @@ impl NodeController {
                 // panel that does answer conditional requests can graduate to
                 // 304 and skip sending the body at all.
                 next_user_etag = etag;
+                next_users = self.users.clone();
             }
             UserListFetch::Updated {
                 etag,
                 value,
                 body_hash,
             } => {
-                let merged_users = if value.full {
-                    value.users.clone()
-                } else {
-                    let mut by_id = next_users
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|user| (user.id, user))
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    for user in &value.users {
-                        by_id.insert(user.id, user.clone());
-                    }
-                    for id in &value.removed {
-                        by_id.remove(id);
-                    }
-                    by_id.into_values().collect()
-                };
-                users_changed = self.users.as_ref() != Some(&merged_users);
-                users_outcome = if users_changed {
-                    "changed"
-                } else {
-                    "resent unchanged"
-                };
                 next_user_etag = etag;
-                next_users = Some(merged_users);
                 next_user_revision = value.revision;
                 next_user_body_hash = Some(body_hash);
-                changed |= users_changed;
+                // An empty delta means the panel confirmed the revision we
+                // already hold: rebuilding the whole set for it would cost a
+                // full clone plus a full map per pull, which is exactly the
+                // allocation amplification this feature exists to remove.
+                if !value.full && value.users.is_empty() && value.removed.is_empty() {
+                    if self.users.is_none() {
+                        // The panel's empty delta is only meaningful relative
+                        // to a local base. Do not advance its validators while
+                        // we have no base to apply; the next pull must be a
+                        // full response instead of getting stuck on 304s.
+                        self.invalidate_user_cache();
+                        return Err(std::io::Error::other(
+                            "received an empty user delta without a cached snapshot",
+                        ));
+                    }
+                    users_outcome = "not modified";
+                    next_users = self.users.clone();
+                } else {
+                    let base = self
+                        .users
+                        .take()
+                        .and_then(|users| Arc::try_unwrap(users).map_err(|_| ()).ok());
+                    let Some(base) =
+                        base.or_else(|| if value.full { Some(Vec::new()) } else { None })
+                    else {
+                        self.invalidate_user_cache();
+                        return Err(std::io::Error::other(
+                            "user snapshot is shared; forcing a full user refetch",
+                        ));
+                    };
+                    let (merged_users, delta_changed) = if value.full {
+                        let mut users = value.users;
+                        users.sort_unstable_by_key(|user| user.id);
+                        (users, true)
+                    } else {
+                        merge_user_delta(base, value.users, value.removed)
+                    };
+                    // A full response is already a new candidate. For a delta,
+                    // merge_user_delta reports whether any row really changed.
+                    users_changed = delta_changed;
+                    users_outcome = if users_changed {
+                        "changed"
+                    } else {
+                        "resent unchanged"
+                    };
+                    next_users = Some(Arc::new(merged_users));
+                    changed |= users_changed;
+                }
             }
         }
 
@@ -433,7 +472,15 @@ impl NodeController {
             .is_some_and(|users| users.iter().any(|user| user.device_limit.unwrap_or(0) > 0))
         {
             alive_fetched = true;
-            let alive = self.client.get_alive_list(&self.config, &self.node).await?;
+            let alive = match self.client.get_alive_list(&self.config, &self.node).await {
+                Ok(alive) => alive,
+                Err(error) => {
+                    if next_users.is_some() && self.users.is_none() {
+                        self.invalidate_user_cache();
+                    }
+                    return Err(error);
+                }
+            };
             self.tracker
                 .replace_panel_alive(&self.node.tag, alive.alive);
         }
@@ -449,9 +496,18 @@ impl NodeController {
             }
         );
 
-        if next_server_config.is_none() || next_users.is_none() {
+        if next_server_config.is_none() {
             return Err(std::io::Error::other(format!(
-                "node `{}` has no cached server config/users after sync",
+                "node `{}` has no cached server config after sync",
+                self.node.tag
+            )));
+        }
+        if next_users.is_none() {
+            next_users = self.users.clone();
+        }
+        if next_users.is_none() {
+            return Err(std::io::Error::other(format!(
+                "node `{}` has no cached users after sync",
                 self.node.tag
             )));
         }
@@ -459,7 +515,7 @@ impl NodeController {
         let applied_generation = changed || self.runtime.is_empty();
         if applied_generation {
             let server = next_server_config.as_ref().unwrap();
-            let users = next_users.as_ref().unwrap();
+            let users: &[UserInfo] = next_users.as_deref().unwrap();
             // A sync that only changed the user list can be published into the
             // running listeners. Replacing the generation instead would leave
             // the superseded listener — and its whole user table — resident
@@ -469,13 +525,27 @@ impl NodeController {
                 && !self.runtime.is_empty()
                 && self.user_tables.is_published();
             let refreshed = if users_only {
-                self.refresh_users(server, users)?
+                match self.refresh_users(server, users) {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        if self.users.is_none() {
+                            self.invalidate_user_cache();
+                        }
+                        return Err(error);
+                    }
+                }
             } else {
                 false
             };
-            if !refreshed {
-                self.apply_runtime(server, users, next_plugin_candidate.as_ref())
-                    .await?;
+            if !refreshed
+                && let Err(error) = self
+                    .apply_runtime(server, users, next_plugin_candidate.as_ref())
+                    .await
+            {
+                if self.users.is_none() {
+                    self.invalidate_user_cache();
+                }
+                return Err(error);
             }
             // At info, unlike the pull summary: this is the node changing what
             // it serves, and info is what production runs at.
@@ -496,16 +566,9 @@ impl NodeController {
 
         // The conditional request validators and cached values describe the
         // applied generation, not merely the most recently observed payload.
-        // Commit them only after the whole runtime replacement succeeds so a
-        // failed candidate is fetched and retried on the next pull.
-        let previous_server_etag = self.server_etag.clone();
-        let previous_server_config = self.server_config.clone();
-        let previous_user_etag = self.user_etag.clone();
-        let previous_user_revision = self.user_revision;
-        let previous_user_body_hash = self.user_body_hash;
-        let previous_users = self.users.clone();
-        let previous_plugin_candidate = self.plugin_candidate.clone();
-
+        // Commit them only after the whole runtime replacement succeeds. A
+        // failed user candidate has already invalidated the in-memory cache and
+        // will be recovered with a full pull on the next interval.
         self.server_etag = next_server_etag;
         self.server_config = next_server_config;
         self.user_etag = next_user_etag;
@@ -530,31 +593,27 @@ impl NodeController {
                 Ok(()) => self.lkg_persist_pending = false,
                 Err(e) => {
                     // LKG persist failed (e.g. disk full/permissions). The
-                    // retry used to come from rolling the validators back so
-                    // the next pull re-fetched and re-persisted; now that an
-                    // unchanged payload no longer triggers a persist, the
-                    // intent is recorded directly, so the on-disk recovery
-                    // point still cannot freeze behind 304s. The rollback
-                    // stays -- it also re-derives the payloads the snapshot is
-                    // built from.
+                    // applied state stays live. The pending bit makes a later
+                    // 304 pull retry persistence without rebuilding the whole
+                    // runtime or retaining a second user table for rollback.
                     log::error!(
                         "node `{}` LKG persist failed; will retry on next sync: {e}",
                         self.node.tag
                     );
                     self.lkg_persist_pending = true;
-                    self.server_etag = previous_server_etag;
-                    self.server_config = previous_server_config;
-                    self.user_etag = previous_user_etag;
-                    self.user_revision = previous_user_revision;
-                    self.user_body_hash = previous_user_body_hash;
-                    self.users = previous_users;
-                    self.plugin_candidate = previous_plugin_candidate;
                     return Err(e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn invalidate_user_cache(&mut self) {
+        self.user_etag = None;
+        self.user_revision = None;
+        self.user_body_hash = None;
+        self.users = None;
     }
 
     /// Publish a new user list into the live listeners.
@@ -659,7 +718,7 @@ impl NodeController {
         self.user_etag = snapshot.user_etag;
         self.user_revision = snapshot.user_revision;
         self.server_config = Some(snapshot.server_config);
-        self.users = Some(snapshot.users);
+        self.users = Some(snapshot.users.clone());
         self.plugin_candidate = plugin_candidate;
         log::info!(
             "node `{}` restored its last-known-good runtime before contacting V2Board",
@@ -844,6 +903,134 @@ fn plugin_features(candidate: &PluginConfigCandidate) -> Vec<AppliedFeature> {
     features
 }
 
+/// Apply a panel delta to the stable id-sorted user vector without building a
+/// full map or cloning unchanged users. The input vector is owned by the
+/// controller and is therefore safe to mutate in place.
+fn merge_user_delta(
+    mut users: Vec<UserInfo>,
+    mut updates: Vec<UserInfo>,
+    mut removed: Vec<u64>,
+) -> (Vec<UserInfo>, bool) {
+    // Full responses are sorted before publication, but snapshots created by
+    // older builds may preserve panel order. Repair that once, without a map
+    // allocation, before relying on binary search.
+    if users.windows(2).any(|pair| pair[0].id > pair[1].id) {
+        users.sort_unstable_by_key(|user| user.id);
+    }
+    // A handful of changes are cheaper to apply in place.  Once the delta
+    // grows past this bound, repeated insert/remove calls become O(n*k): each
+    // call shifts the tail of the user vector.  The batch path below removes
+    // all affected rows in one pass and appends updates before one final sort,
+    // keeping the memory profile bounded by the existing vector capacity.
+    const IN_PLACE_CHANGE_LIMIT: usize = 32;
+    let change_count = updates.len().saturating_add(removed.len());
+    if change_count <= IN_PLACE_CHANGE_LIMIT {
+        users.reserve(updates.len());
+        let mut changed = false;
+        for user in updates {
+            match users.binary_search_by_key(&user.id, |existing| existing.id) {
+                Ok(index) => {
+                    if users[index] != user {
+                        users[index] = user;
+                        changed = true;
+                    }
+                }
+                Err(index) => {
+                    users.insert(index, user);
+                    changed = true;
+                }
+            }
+        }
+        for id in removed {
+            if let Ok(index) = users.binary_search_by_key(&id, |existing| existing.id) {
+                users.remove(index);
+                changed = true;
+            }
+        }
+        return (users, changed);
+    }
+
+    // Keep the panel's sequential semantics for duplicate update IDs: the
+    // last row in the payload wins. `sort_by` is stable, so equal IDs retain
+    // their original order. `dedup_by` receives (current, previous); copying
+    // the current row into the previous slot keeps the last value while the
+    // duplicate is removed. This clone only occurs for duplicate IDs.
+    updates.sort_by_key(|user| user.id);
+    updates.dedup_by(|current, previous| {
+        let duplicate = current.id == previous.id;
+        if duplicate {
+            *previous = current.clone();
+        }
+        duplicate
+    });
+    removed.sort_unstable();
+    removed.dedup();
+
+    // Determine whether the resulting table differs before removing rows.
+    // This preserves the no-op result for an identical update, while a
+    // remove always wins over an update for the same ID (as in the small
+    // sequential path above).
+    let mut changed = false;
+    let mut additions = 0usize;
+    for user in &updates {
+        let removed_by_delta = removed.binary_search(&user.id).is_ok();
+        if let Ok(index) = users.binary_search_by_key(&user.id, |existing| existing.id) {
+            if removed_by_delta || users[index] != *user {
+                changed = true;
+            }
+        } else if !removed_by_delta {
+            changed = true;
+            additions += 1;
+        }
+    }
+    for id in &removed {
+        if users
+            .binary_search_by_key(id, |existing| existing.id)
+            .is_ok()
+        {
+            changed = true;
+        }
+    }
+
+    // Both vectors are sorted. Walk each once and discard rows superseded by
+    // either an update or a removal. This is O(n+k), with no second full user
+    // table allocated.
+    let mut update_index = 0usize;
+    let mut removed_index = 0usize;
+    users.retain(|existing| {
+        while update_index < updates.len() && updates[update_index].id < existing.id {
+            update_index += 1;
+        }
+        while removed_index < removed.len() && removed[removed_index] < existing.id {
+            removed_index += 1;
+        }
+        let updated = update_index < updates.len() && updates[update_index].id == existing.id;
+        let deleted = removed_index < removed.len() && removed[removed_index] == existing.id;
+        !(updated || deleted)
+    });
+
+    // Append new/updated rows except IDs that are removed in the same delta;
+    // removal is intentionally authoritative. The retained prefix is already
+    // sorted, so only deltas that add rows require a final in-place sort.
+    let mut removed_index = 0usize;
+    let mut appended = false;
+    users.reserve(additions);
+    for user in updates {
+        while removed_index < removed.len() && removed[removed_index] < user.id {
+            removed_index += 1;
+        }
+        if removed_index < removed.len() && removed[removed_index] == user.id {
+            continue;
+        }
+        users.push(user);
+        appended = true;
+    }
+    if appended {
+        users.sort_unstable_by_key(|user| user.id);
+    }
+    (users, changed)
+}
+
 fn plugin_io_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
@@ -887,6 +1074,108 @@ mod tests {
                 ))
             })
         }
+    }
+
+    fn test_user(id: u64, secret: &str) -> UserInfo {
+        UserInfo {
+            id,
+            uuid: None,
+            secret: Some(secret.to_string()),
+            password: None,
+            username: None,
+            speed_limit: None,
+            device_limit: None,
+            label: None,
+            enabled: None,
+            expires_at: None,
+            expires_on: None,
+            max_connections: None,
+            max_ips: None,
+            quota_bytes: None,
+            dedicated_ip: None,
+        }
+    }
+
+    #[test]
+    fn merge_user_delta_updates_sorted_vector_without_rebuilding_unchanged_rows() {
+        let original = test_user(2, "old");
+        let (users, changed) = merge_user_delta(
+            vec![test_user(4, "four"), test_user(1, "one"), original.clone()],
+            vec![test_user(2, "new"), test_user(3, "three")],
+            vec![1],
+        );
+
+        assert!(changed);
+        assert_eq!(
+            users.iter().map(|user| user.id).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert_eq!(users[0].secret.as_deref(), Some("new"));
+        assert_eq!(users[2].secret.as_deref(), Some("four"));
+        assert_ne!(users[0], original);
+    }
+
+    #[test]
+    fn merge_user_delta_reports_no_change_for_identical_delta() {
+        let users = vec![test_user(1, "one"), test_user(2, "two")];
+        let (merged, changed) =
+            merge_user_delta(users.clone(), vec![test_user(1, "one")], vec![999]);
+
+        assert!(!changed);
+        assert_eq!(merged, users);
+    }
+
+    #[test]
+    fn merge_user_delta_batches_large_unsorted_delta_and_keeps_last_duplicate() {
+        let original = (0..128)
+            .map(|id| test_user(id, &format!("old-{id}")))
+            .collect::<Vec<_>>();
+        let mut updates = (0..65)
+            .rev()
+            .map(|id| test_user(id, &format!("new-{id}")))
+            .collect::<Vec<_>>();
+        // Stable sorting plus deduplication must preserve the last occurrence
+        // from the payload, even when the update order is otherwise arbitrary.
+        updates.push(test_user(42, "last-42"));
+        updates.push(test_user(100, "new-100"));
+        updates.push(test_user(100, "last-100"));
+        updates.push(test_user(200, "added-then-removed"));
+
+        let (merged, changed) = merge_user_delta(original, updates, vec![200, 30, 10, 20, 20, 999]);
+
+        assert!(changed);
+        assert!(!merged.iter().any(|user| user.id == 200));
+        assert!(!merged.iter().any(|user| [10, 20, 30].contains(&user.id)));
+        assert_eq!(
+            merged
+                .iter()
+                .find(|user| user.id == 42)
+                .and_then(|user| user.secret.as_deref()),
+            Some("last-42")
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|user| user.id == 100)
+                .and_then(|user| user.secret.as_deref()),
+            Some("last-100")
+        );
+        assert!(merged.windows(2).all(|pair| pair[0].id < pair[1].id));
+    }
+
+    #[test]
+    fn merge_user_delta_large_identical_updates_are_a_no_op() {
+        let users = (0..96)
+            .map(|id| test_user(id, &format!("user-{id}")))
+            .collect::<Vec<_>>();
+        let updates = (0..64)
+            .map(|id| test_user(id, &format!("user-{id}")))
+            .collect::<Vec<_>>();
+
+        let (merged, changed) = merge_user_delta(users.clone(), updates, vec![999, 1000]);
+
+        assert!(!changed);
+        assert_eq!(merged, users);
     }
 
     #[tokio::test]
@@ -940,7 +1229,14 @@ mod tests {
 
         let client = V2BoardClient::new(&config).unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(NoopResolver);
-        let mut controller = NodeController::new(config, node, client, tracker, resolver);
+        let mut controller = NodeController::new(
+            config,
+            node,
+            client,
+            tracker,
+            resolver,
+            Arc::new(Semaphore::new(1)),
+        );
 
         let err = controller.push().await.unwrap_err();
         assert!(err.to_string().contains("HTTP 500"));

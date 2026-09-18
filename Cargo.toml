@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -132,7 +132,7 @@ rustc-hash = "*"
 rustls-pemfile = { version = "*", optional = true }
 rustls = "*"
 salsa20 = "0.10.2"
-serde = { version = "*", features = ["derive", "std"] }
+serde = { version = "*", features = ["derive", "std", "rc"] }
 serde_json = "*"
 serde_yaml = "*"
 sha1 = "0.11.0"

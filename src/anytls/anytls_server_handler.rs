@@ -250,9 +250,14 @@ impl AnyTlsServerHandler {
         // password or the remaining 24 bytes of the SHA256 hash.
         let prefix_data = reader.peek_slice(&mut server_stream, 8).await?;
 
-        // Borrowed across the two peeks of one handshake only; see `SharedUsers`.
-        let users = self.users.load();
-        if !users.matches_prefix(prefix_data) {
+        // Keep the replaceable table borrow scoped to this lookup. Holding it
+        // across the second network read would pin a superseded table for every
+        // slow or abandoned handshake.
+        let prefix_matches = {
+            let users = self.users.load();
+            users.matches_prefix(prefix_data)
+        };
+        if !prefix_matches {
             log::debug!("AnyTLS quick fallback: 8-byte prefix doesn't match any user");
             if let Some(ref fallback) = self.fallback {
                 return self.fallback_to_dest(server_stream, reader, fallback).await;
@@ -266,25 +271,24 @@ impl AnyTlsServerHandler {
         // Prefix matches - now read the full 32-byte hash
         let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
 
-        let user = match users.get(auth_data) {
-            Some(user) => {
-                log::debug!("AnyTLS user authenticated: {}", user.name);
-                // Auth succeeded - consume the header bytes
-                reader.consume(32);
-                user.clone()
-            }
-            None => {
-                log::debug!("AnyTLS authentication failed: unknown password");
-                // If fallback is configured, forward the connection there
-                if let Some(ref fallback) = self.fallback {
-                    return self.fallback_to_dest(server_stream, reader, fallback).await;
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "authentication failed",
-                ));
-            }
+        let user = {
+            let users = self.users.load();
+            users.get(auth_data).cloned()
         };
+        let Some(user) = user else {
+            log::debug!("AnyTLS authentication failed: unknown password");
+            // If fallback is configured, forward the connection there
+            if let Some(ref fallback) = self.fallback {
+                return self.fallback_to_dest(server_stream, reader, fallback).await;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "authentication failed",
+            ));
+        };
+        log::debug!("AnyTLS user authenticated: {}", user.name);
+        // Auth succeeded - consume the header bytes
+        reader.consume(32);
 
         let padding_len = reader.read_u16_be(&mut server_stream).await?;
 

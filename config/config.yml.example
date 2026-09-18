@@ -51,6 +51,7 @@ runtime:
   node_report_min_traffic: 0
   device_online_min_traffic: 0
   max_legacy_shadowsocks_users: 10000
+  max_concurrent_v2board_syncs: 1
   tcp_fast_open: false
 
 # Optional global TLS files for panel nodes that enable TLS but do not provide

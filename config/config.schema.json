@@ -69,6 +69,7 @@
         "node_report_min_traffic": { "type": "integer", "minimum": 0, "default": 0, "description": "Fallback minimum bytes before user traffic is pushed." },
         "device_online_min_traffic": { "type": "integer", "minimum": 0, "default": 0, "description": "Fallback minimum bytes before alive IPs are pushed." },
         "max_legacy_shadowsocks_users": { "type": "integer", "minimum": 1, "default": 10000, "description": "Startup guard for O(n) legacy Shadowsocks multi-user authentication." },
+        "max_concurrent_v2board_syncs": { "type": "integer", "minimum": 1, "default": 1, "description": "Maximum concurrent V2Board node syncs; lower values cap peak user-list/runtime memory." },
         "tcp_fast_open": { "type": "boolean", "default": false, "description": "Parsed but not wired in the V2Board runtime yet." }
       }
     },
