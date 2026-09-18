@@ -252,7 +252,9 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    # Do not publish a GitHub release until both the Linux artifacts and the
+    # multi-architecture Docker image are available.
+    needs: [build, docker-manifest]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
