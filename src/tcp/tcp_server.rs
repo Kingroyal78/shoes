@@ -1198,8 +1198,10 @@ fn record_traffic_for(user: &AuthenticatedUser, upload: &AtomicU64, download: &A
 }
 
 #[cfg(test)]
-fn active_traffic_len() -> usize {
-    ACTIVE_TRAFFIC.len()
+fn active_traffic_contains_uid(uid: u64) -> bool {
+    ACTIVE_TRAFFIC
+        .iter()
+        .any(|entry| entry.value().user.uid == uid)
 }
 
 fn flush_pending_traffic(authenticated_user: &Option<AuthenticatedUser>) {
@@ -2945,11 +2947,9 @@ mod tests {
         let upload = Arc::new(AtomicU64::new(0));
         let download = Arc::new(AtomicU64::new(0));
 
-        let before = active_traffic_len();
         let task = TrafficFlushTask::start(&user, upload.clone(), download.clone());
-        assert_eq!(
-            active_traffic_len(),
-            before + 1,
+        assert!(
+            active_traffic_contains_uid(9001),
             "an authenticated connection must be visible to the sweeper"
         );
 
@@ -2959,7 +2959,10 @@ mod tests {
         upload.store(11, Ordering::Relaxed);
         download.store(22, Ordering::Relaxed);
         drop(task);
-        assert_eq!(active_traffic_len(), before);
+        assert!(
+            !active_traffic_contains_uid(9001),
+            "closing the connection must deregister its sweeper entry"
+        );
         assert_eq!(*recorder.traffic.lock(), (11, 22));
 
         // A connection with no recorder is not registered at all.
@@ -2968,7 +2971,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
-        assert_eq!(active_traffic_len(), before);
+        assert!(!active_traffic_contains_uid(9001));
         drop(anonymous);
     }
 
