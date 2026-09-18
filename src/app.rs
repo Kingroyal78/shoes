@@ -35,6 +35,12 @@ pub async fn sync_once(config_path: &str) -> std::io::Result<()> {
             app.tracker.clone(),
             app.resolver.clone(),
         );
+        if let Err(error) = controller.restore_lkg().await {
+            log::warn!(
+                "node `{}` ignored an invalid last-known-good snapshot before sync-once: {error}",
+                controller.node.tag
+            );
+        }
         controller.sync().await?;
         ok += 1;
     }
@@ -168,6 +174,7 @@ struct NodeController {
     resolver: Arc<dyn Resolver>,
     server_etag: Option<String>,
     user_etag: Option<String>,
+    user_revision: Option<u64>,
     /// Digest of the user-list body last decoded, so an identical one can be
     /// recognised without paying to decode it again.
     user_body_hash: Option<[u8; 32]>,
@@ -202,6 +209,7 @@ impl NodeController {
             resolver,
             server_etag: None,
             user_etag: None,
+            user_revision: None,
             user_body_hash: None,
             server_config: None,
             users: None,
@@ -304,6 +312,7 @@ impl NodeController {
         let mut next_server_etag = self.server_etag.clone();
         let mut next_server_config = self.server_config.clone();
         let mut next_user_etag = self.user_etag.clone();
+        let mut next_user_revision = self.user_revision;
         let mut next_user_body_hash = self.user_body_hash;
         let mut next_users = self.users.clone();
         let mut next_plugin_candidate = self.plugin_candidate.clone();
@@ -370,6 +379,7 @@ impl NodeController {
                 &self.node,
                 self.user_etag.as_deref(),
                 self.user_body_hash.as_ref(),
+                self.user_revision.or(Some(0)),
             )
             .await?
         {
@@ -387,14 +397,32 @@ impl NodeController {
                 value,
                 body_hash,
             } => {
-                users_changed = self.users.as_ref() != Some(&value.users);
+                let merged_users = if value.full {
+                    value.users.clone()
+                } else {
+                    let mut by_id = next_users
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|user| (user.id, user))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    for user in &value.users {
+                        by_id.insert(user.id, user.clone());
+                    }
+                    for id in &value.removed {
+                        by_id.remove(id);
+                    }
+                    by_id.into_values().collect()
+                };
+                users_changed = self.users.as_ref() != Some(&merged_users);
                 users_outcome = if users_changed {
                     "changed"
                 } else {
                     "resent unchanged"
                 };
                 next_user_etag = etag;
-                next_users = Some(value.users);
+                next_users = Some(merged_users);
+                next_user_revision = value.revision;
                 next_user_body_hash = Some(body_hash);
                 changed |= users_changed;
             }
@@ -473,6 +501,7 @@ impl NodeController {
         let previous_server_etag = self.server_etag.clone();
         let previous_server_config = self.server_config.clone();
         let previous_user_etag = self.user_etag.clone();
+        let previous_user_revision = self.user_revision;
         let previous_user_body_hash = self.user_body_hash;
         let previous_users = self.users.clone();
         let previous_plugin_candidate = self.plugin_candidate.clone();
@@ -480,6 +509,7 @@ impl NodeController {
         self.server_etag = next_server_etag;
         self.server_config = next_server_config;
         self.user_etag = next_user_etag;
+        self.user_revision = next_user_revision;
         self.user_body_hash = next_user_body_hash;
         self.users = next_users;
         self.plugin_candidate = next_plugin_candidate;
@@ -515,6 +545,7 @@ impl NodeController {
                     self.server_etag = previous_server_etag;
                     self.server_config = previous_server_config;
                     self.user_etag = previous_user_etag;
+                    self.user_revision = previous_user_revision;
                     self.user_body_hash = previous_user_body_hash;
                     self.users = previous_users;
                     self.plugin_candidate = previous_plugin_candidate;
@@ -626,6 +657,7 @@ impl NodeController {
         .await?;
         self.server_etag = snapshot.server_etag;
         self.user_etag = snapshot.user_etag;
+        self.user_revision = snapshot.user_revision;
         self.server_config = Some(snapshot.server_config);
         self.users = Some(snapshot.users);
         self.plugin_candidate = plugin_candidate;
@@ -650,7 +682,8 @@ impl NodeController {
             server_config,
             users,
             self.plugin_candidate.as_ref(),
-        )?;
+        )?
+        .with_user_revision(self.user_revision);
         lkg::persist(&self.config.runtime.data_dir, &self.node, snapshot).await
     }
 

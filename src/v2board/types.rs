@@ -98,8 +98,20 @@ impl Default for BaseConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 enum UserListWire {
-    Users { users: Vec<UserInfo> },
-    Data { data: UserListData },
+    Envelope {
+        #[serde(default)]
+        snapshot_revision: Option<u64>,
+        #[serde(default)]
+        generated_at: Option<u64>,
+        #[serde(default)]
+        full: Option<bool>,
+        users: Vec<UserInfo>,
+        #[serde(default)]
+        removed: Vec<u64>,
+    },
+    Data {
+        data: UserListData,
+    },
     Direct(Vec<UserInfo>),
 }
 
@@ -113,6 +125,10 @@ enum UserListData {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserList {
     pub users: Vec<UserInfo>,
+    pub revision: Option<u64>,
+    pub generated_at: Option<u64>,
+    pub full: bool,
+    pub removed: Vec<u64>,
 }
 
 impl<'de> Deserialize<'de> for UserList {
@@ -121,15 +137,30 @@ impl<'de> Deserialize<'de> for UserList {
         D: serde::Deserializer<'de>,
     {
         let wire = UserListWire::deserialize(deserializer)?;
-        let users = match wire {
-            UserListWire::Users { users } => users,
+        let (users, revision, generated_at, full, removed) = match wire {
+            UserListWire::Envelope {
+                snapshot_revision,
+                generated_at,
+                full,
+                users,
+                removed,
+            } => {
+                let is_full = full.unwrap_or(snapshot_revision.is_none());
+                (users, snapshot_revision, generated_at, is_full, removed)
+            }
             UserListWire::Data { data } => match data {
-                UserListData::Users { users } => users,
-                UserListData::Direct(users) => users,
+                UserListData::Users { users } => (users, None, None, true, Vec::new()),
+                UserListData::Direct(users) => (users, None, None, true, Vec::new()),
             },
-            UserListWire::Direct(users) => users,
+            UserListWire::Direct(users) => (users, None, None, true, Vec::new()),
         };
-        Ok(Self { users })
+        Ok(Self {
+            users,
+            revision,
+            generated_at,
+            full,
+            removed,
+        })
     }
 }
 
@@ -335,6 +366,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(data_array.users[0].id, 9);
+
+        let delta: UserList = serde_json::from_value(json!({
+            "snapshot_revision": 42,
+            "generated_at": 1700000000,
+            "full": false,
+            "users": [{"id": 10, "uuid": "00000000-0000-0000-0000-000000000010"}],
+            "removed": [11, 12]
+        }))
+        .unwrap();
+        assert_eq!(delta.revision, Some(42));
+        assert_eq!(delta.generated_at, Some(1700000000));
+        assert!(!delta.full);
+        assert_eq!(delta.removed, vec![11, 12]);
+
+        let legacy: UserList = serde_json::from_value(json!({
+            "users": [{"id": 13}]
+        }))
+        .unwrap();
+        assert_eq!(legacy.revision, None);
+        assert!(legacy.full);
     }
 
     #[test]

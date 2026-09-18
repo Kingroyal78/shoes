@@ -85,11 +85,12 @@ impl V2BoardClient {
         node: &V2BoardNodeConfig,
         etag: Option<&str>,
         last_body_hash: Option<&[u8; 32]>,
+        since: Option<u64>,
     ) -> std::io::Result<UserListFetch> {
         let request = self
             .http
             .get(Self::endpoint(app_config, node, "user"))
-            .query(&Self::query(app_config, node))
+            .query(&Self::user_query(app_config, node, since))
             .header("X-Response-Format", "msgpack")
             .header(ACCEPT, "application/x-msgpack, application/json");
         let request = add_etag(request, etag);
@@ -354,6 +355,18 @@ impl V2BoardClient {
             ("node_id", node.node_id.to_string()),
             ("node_type", node.node_type.as_uniproxy().to_string()),
         ]
+    }
+
+    fn user_query(
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        since: Option<u64>,
+    ) -> Vec<(&'static str, String)> {
+        let mut query = Self::query(app_config, node);
+        if let Some(revision) = since {
+            query.push(("since", revision.to_string()));
+        }
+        query
     }
 }
 
@@ -774,7 +787,10 @@ mod tests {
         node.api_host = Some(api_host);
         let client = V2BoardClient::new(&app).unwrap();
 
-        let first = client.get_user_list(&app, &node, None, None).await.unwrap();
+        let first = client
+            .get_user_list(&app, &node, None, None, None)
+            .await
+            .unwrap();
         let (hash, decoded) = match first {
             UserListFetch::Updated {
                 value, body_hash, ..
@@ -785,14 +801,14 @@ mod tests {
 
         // The panel re-sends exactly the same list, as one that ignores
         // conditional requests does on every interval.
-        let (api_host, _request) = serve_once(response).await;
+        let (api_host, request) = serve_once(response).await;
         let mut node = node.clone();
         node.api_host = Some(api_host.clone());
         app.v2board.api_host = api_host;
         let client = V2BoardClient::new(&app).unwrap();
 
         match client
-            .get_user_list(&app, &node, None, Some(&hash))
+            .get_user_list(&app, &node, None, Some(&hash), Some(7))
             .await
             .unwrap()
         {
@@ -802,6 +818,8 @@ mod tests {
             }
             UserListFetch::NotModified => panic!("the server sent a body, not a 304"),
         }
+        let request = request.await.unwrap();
+        assert!(request.contains("since=7"));
     }
 
     async fn serve_once(response: String) -> (String, tokio::task::JoinHandle<String>) {

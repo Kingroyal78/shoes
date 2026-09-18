@@ -10,7 +10,7 @@ use crate::backend_config::{NodeType, V2BoardNodeConfig};
 use super::plugin_api::{OpaqueEtag, PluginConfigCandidate};
 use super::types::{ServerConfig, UserInfo};
 
-const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLkgSnapshot {
@@ -19,6 +19,8 @@ pub struct NodeLkgSnapshot {
     node_type: String,
     pub server_etag: Option<String>,
     pub user_etag: Option<String>,
+    #[serde(default)]
+    pub user_revision: Option<u64>,
     pub server_config: ServerConfig,
     pub users: Vec<UserInfo>,
     plugin: Option<PluginLkgSnapshot>,
@@ -55,14 +57,20 @@ impl NodeLkgSnapshot {
             node_type: node.node_type.as_uniproxy().to_string(),
             server_etag,
             user_etag,
+            user_revision: None,
             server_config,
             users,
             plugin,
         })
     }
 
+    pub fn with_user_revision(mut self, revision: Option<u64>) -> Self {
+        self.user_revision = revision;
+        self
+    }
+
     pub fn validate_for(&self, node: &V2BoardNodeConfig) -> std::io::Result<()> {
-        if self.schema_version != SNAPSHOT_SCHEMA_VERSION {
+        if self.schema_version != 1 && self.schema_version != SNAPSHOT_SCHEMA_VERSION {
             return Err(invalid_data("unsupported last-known-good snapshot schema"));
         }
         if self.node_id != node.node_id || self.node_type != node.node_type.as_uniproxy() {
