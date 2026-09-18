@@ -24,6 +24,10 @@ use tokio_util::sync::CancellationToken;
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 const MAX_REASSEMBLED_UDP_PACKET_SIZE: usize = u16::MAX as usize;
 const MAX_FRAGMENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// Bound per-connection UDP sessions.  Session ids are client-controlled, so
+/// relying only on the 60-second idle timeout lets a peer create thousands of
+/// outbound sockets and retain their queues before cleanup runs.
+const MAX_UDP_SESSIONS: usize = 1024;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
@@ -1195,6 +1199,14 @@ async fn run_udp_local_to_remote_loop(
                 continue;
             }
         };
+
+        if !sessions.contains_key(&session_id) && sessions.len() >= MAX_UDP_SESSIONS {
+            debug!(
+                "Hysteria2 UDP session limit reached ({MAX_UDP_SESSIONS}); dropping session {session_id}"
+            );
+            remove_hysteria2_fragments_for_session(&mut fragments, session_id);
+            continue;
+        }
 
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {

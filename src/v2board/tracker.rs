@@ -64,12 +64,6 @@ struct TrackerState {
     panel_alive: HashMap<String, HashMap<u64, u64>>,
 }
 
-/// The on-disk shape, which predates sharding and stays independent of it.
-#[derive(Serialize)]
-struct TrafficSnapshot<'a> {
-    traffic: &'a HashMap<&'a str, HashMap<u64, TrafficCounter>>,
-}
-
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 struct TrafficCounter {
     upload: u64,
@@ -293,6 +287,17 @@ impl TrafficTracker {
                     state.alive_traffic.remove(node_tag);
                 }
             }
+            // The panel's device-limit snapshot is also keyed by user.  It
+            // used to survive user deletion because only local live/alive
+            // traffic was reconciled, so a churned user set could leave one
+            // entry per historical account resident forever (and continue to
+            // affect admission until the next panel alive response).
+            if let Some(node) = state.panel_alive.get_mut(node_tag) {
+                node.retain(|uid, _| active_uids.contains(uid));
+                if node.is_empty() {
+                    state.panel_alive.remove(node_tag);
+                }
+            }
             if removed_traffic {
                 state.traffic.remove(node_tag);
             }
@@ -308,26 +313,57 @@ impl TrafficTracker {
     }
 
     fn snapshot_bytes(&self) -> std::io::Result<Vec<u8>> {
-        // Merged back into one map so the file keeps its shape regardless of
-        // how many shards the process runs with.
-        let mut traffic: HashMap<&str, HashMap<u64, TrafficCounter>> = HashMap::new();
+        // Keep the file's historical `{traffic: {node: {uid: counter}}}`
+        // shape, but serialize one node at a time.  The old implementation
+        // first merged every shard into a second full HashMap and only then
+        // encoded it, so a push briefly held the live shard maps, the merged
+        // maps, and the JSON buffer together.
         let guards = self
             .shards
             .iter()
             .map(|shard| shard.lock())
             .collect::<Vec<_>>();
-        for state in &guards {
-            for (node_tag, users) in &state.traffic {
-                traffic
-                    .entry(node_tag.as_str())
-                    .or_default()
-                    .extend(users.iter().map(|(uid, counter)| (*uid, *counter)));
+        let mut node_tags = guards
+            .iter()
+            .flat_map(|state| state.traffic.keys().cloned())
+            .collect::<Vec<_>>();
+        node_tags.sort_unstable();
+        node_tags.dedup();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(br#"{"traffic":{"#);
+        for (node_index, node_tag) in node_tags.iter().enumerate() {
+            if node_index > 0 {
+                bytes.push(b',');
             }
+            serde_json::to_writer(&mut bytes, node_tag)
+                .map_err(|e| std::io::Error::other(format!("encode traffic node: {e}")))?;
+            bytes.push(b':');
+            bytes.push(b'{');
+            let mut user_index = 0usize;
+            for state in &guards {
+                let Some(users) = state.traffic.get(node_tag) else {
+                    continue;
+                };
+                for (uid, counter) in users {
+                    if user_index > 0 {
+                        bytes.push(b',');
+                    }
+                    user_index += 1;
+                    // JSON object keys are strings even though the logical
+                    // user id is numeric.
+                    serde_json::to_writer(&mut bytes, &uid.to_string())
+                        .map_err(|e| std::io::Error::other(format!("encode traffic user: {e}")))?;
+                    bytes.push(b':');
+                    serde_json::to_writer(&mut bytes, counter).map_err(|e| {
+                        std::io::Error::other(format!("encode traffic counter: {e}"))
+                    })?;
+                }
+            }
+            bytes.push(b'}');
         }
-        // Not `to_vec_pretty`: nothing reads this by eye, and the indentation
-        // costs about a third again in bytes and encoding time.
-        serde_json::to_vec(&TrafficSnapshot { traffic: &traffic })
-            .map_err(|e| std::io::Error::other(format!("encode traffic snapshot: {e}")))
+        bytes.extend_from_slice(b"}}");
+        Ok(bytes)
     }
 }
 
@@ -763,6 +799,7 @@ mod tests {
         tracker.add_traffic("node-b", 10, 1, 1);
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         assert!(tracker.add_alive_ip_and_check_limit("node-a", 11, ip, None));
+        tracker.replace_panel_alive("node-a", HashMap::from([(10, 3), (11, 4)]));
 
         let active: std::collections::HashSet<u64> = [10u64].into_iter().collect();
         tracker.reconcile_users("node-a", &active);
@@ -775,6 +812,13 @@ mod tests {
         );
         assert!(!tracker.snapshot_traffic("node-a", 0).contains_key("11"));
         assert!(tracker.snapshot_alive("node-a", 7, 0).is_empty());
+        let panel_alive: HashMap<u64, u64> = tracker
+            .shards
+            .iter()
+            .filter_map(|shard| shard.lock().panel_alive.get("node-a").cloned())
+            .flat_map(|users| users.into_iter())
+            .collect();
+        assert_eq!(panel_alive, HashMap::from([(10, 3)]));
         assert_eq!(
             tracker.snapshot_traffic("node-b", 0).get("10"),
             Some(&[1, 1])

@@ -378,10 +378,27 @@ impl NodeController {
             {
                 PluginConfigObserved::NotModified { .. } => plugin_outcome = "not modified",
                 PluginConfigObserved::Candidate(candidate) => {
-                    plugin_outcome = "changed";
+                    // A panel or proxy may ignore If-None-Match and resend a
+                    // 200 body on every pull.  The ETag is useful for the
+                    // next request, but it must not by itself force a new
+                    // runtime generation: rebuilding the Shadowsocks edge
+                    // retains the old listener/user table until its last
+                    // connection closes and creates a large RSS sawtooth.
+                    let runtime_changed = self
+                        .plugin_candidate
+                        .as_ref()
+                        .map(|previous| !previous.runtime_equivalent(&candidate))
+                        .unwrap_or(true);
+                    plugin_outcome = if runtime_changed {
+                        "changed"
+                    } else {
+                        "resent unchanged"
+                    };
                     next_plugin_candidate = Some(candidate);
-                    changed = true;
-                    non_user_changed = true;
+                    if runtime_changed {
+                        changed = true;
+                        non_user_changed = true;
+                    }
                 }
             }
             self.force_plugin_refresh = false;
@@ -433,6 +450,31 @@ impl NodeController {
                     }
                     users_outcome = "not modified";
                     next_users = self.users.clone();
+                } else if value.full {
+                    // Some panels regenerate the full response (or its
+                    // serialization order) without changing any user.  Sort
+                    // once, compare against the stable snapshot, and keep the
+                    // existing Arc on an exact semantic no-op.  Otherwise the
+                    // old code rebuilt every protocol table despite serving
+                    // the same credentials.
+                    let (users, full_changed) = prepare_full_user_list(
+                        self.users.as_deref().map(Vec::as_slice),
+                        value.users,
+                    );
+                    if !full_changed {
+                        users_outcome = "resent unchanged";
+                        next_users = self.users.clone();
+                    } else {
+                        // The previous snapshot is no longer needed for a
+                        // full replacement.  Drop our ownership before
+                        // constructing the new Arc so the peak does not hold
+                        // two complete panel snapshots unnecessarily.
+                        drop(self.users.take());
+                        users_changed = true;
+                        users_outcome = "changed";
+                        next_users = Some(Arc::new(users));
+                        changed = true;
+                    }
                 } else {
                     let base = self
                         .users
@@ -446,13 +488,8 @@ impl NodeController {
                             "user snapshot is shared; forcing a full user refetch",
                         ));
                     };
-                    let (merged_users, delta_changed) = if value.full {
-                        let mut users = value.users;
-                        users.sort_unstable_by_key(|user| user.id);
-                        (users, true)
-                    } else {
-                        merge_user_delta(base, value.users, value.removed)
-                    };
+                    let (merged_users, delta_changed) =
+                        merge_user_delta(base, value.users, value.removed);
                     // A full response is already a new candidate. For a delta,
                     // merge_user_delta reports whether any row really changed.
                     users_changed = delta_changed;
@@ -1031,6 +1068,19 @@ fn merge_user_delta(
     (users, changed)
 }
 
+/// Normalize a full panel response into the stable id order used by delta
+/// merging and report whether it differs from the current snapshot.  Keeping
+/// this comparison separate makes a semantically unchanged full response a
+/// true no-op even when the panel's wire ordering or ETag changes.
+fn prepare_full_user_list(
+    current: Option<&[UserInfo]>,
+    mut users: Vec<UserInfo>,
+) -> (Vec<UserInfo>, bool) {
+    users.sort_unstable_by_key(|user| user.id);
+    let changed = current != Some(users.as_slice());
+    (users, changed)
+}
+
 fn plugin_io_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
@@ -1176,6 +1226,28 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(merged, users);
+    }
+
+    #[test]
+    fn full_user_list_reuses_semantically_identical_snapshot() {
+        let current = vec![test_user(1, "one"), test_user(2, "two")];
+        let (candidate, changed) = prepare_full_user_list(
+            Some(current.as_slice()),
+            vec![test_user(2, "two"), test_user(1, "one")],
+        );
+
+        assert!(!changed);
+        assert_eq!(candidate, current);
+    }
+
+    #[test]
+    fn full_user_list_reports_changed_rows_after_sorting() {
+        let current = vec![test_user(1, "one")];
+        let (candidate, changed) =
+            prepare_full_user_list(Some(current.as_slice()), vec![test_user(1, "new")]);
+
+        assert!(changed);
+        assert_eq!(candidate[0].secret.as_deref(), Some("new"));
     }
 
     #[tokio::test]

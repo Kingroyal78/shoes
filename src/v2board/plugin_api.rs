@@ -1082,6 +1082,17 @@ impl PluginConfigCandidate {
         self.wire_manifest.as_ref()
     }
 
+    /// Whether applying this candidate would change the running plugin
+    /// runtime.  The panel's ETag is a transport validator, not the runtime
+    /// identity: a proxy may legally resend a 200 with a new validator even
+    /// when the decoded manifest is unchanged.  Comparing the validated
+    /// manifest avoids rebuilding the whole Shadowsocks generation for that
+    /// case while still allowing the controller to retain the newest ETag and
+    /// wire representation for conditional requests/LKG persistence.
+    pub fn runtime_equivalent(&self, other: &Self) -> bool {
+        self.manifest == other.manifest
+    }
+
     pub fn revision(&self) -> &ConfigRevision {
         &self.manifest.config_revision
     }
@@ -1808,6 +1819,45 @@ mod tests {
                 "shadowsocks-uot-v2"
             ])
         );
+    }
+
+    #[test]
+    fn runtime_equivalence_ignores_transport_etag_changes() {
+        let first = PluginConfigCandidate::from_wire(
+            OpaqueEtag::from_static("\"first\""),
+            base_manifest(Value::Null),
+            12,
+        )
+        .unwrap();
+        let second = PluginConfigCandidate::from_wire(
+            OpaqueEtag::from_static("\"second\""),
+            base_manifest(Value::Null),
+            12,
+        )
+        .unwrap();
+
+        assert!(first.runtime_equivalent(&second));
+    }
+
+    #[test]
+    fn runtime_equivalence_detects_manifest_changes() {
+        let first = PluginConfigCandidate::from_wire(
+            OpaqueEtag::from_static("\"same\""),
+            base_manifest(Value::Null),
+            12,
+        )
+        .unwrap();
+        let changed = PluginConfigCandidate::from_wire(
+            OpaqueEtag::from_static("\"changed\""),
+            base_manifest(plugin(
+                "obfs",
+                json!({"mode": "http", "host": "cover.example"}),
+            )),
+            12,
+        )
+        .unwrap();
+
+        assert!(!first.runtime_equivalent(&changed));
     }
 
     #[test]

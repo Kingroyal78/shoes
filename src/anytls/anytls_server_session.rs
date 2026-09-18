@@ -38,6 +38,13 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
 const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Bound the number of logical streams one AnyTLS connection may keep alive.
+/// Each stream owns a bounded channel and a handler task; without a cap a
+/// peer can open monotonically new stream IDs faster than the remote side
+/// drains them and turn those per-stream buffers/maps into an unbounded heap
+/// cost. This matches the 1024-stream bound used by the H2MUX runtime.
+const MAX_CONCURRENT_STREAMS: usize = 1024;
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -424,6 +431,18 @@ impl AnyTlsSession {
                 // This prevents race conditions with duplicate SYNs
                 let stream_opt = {
                     let mut streams = self.streams.write().await;
+                    if streams.len() >= MAX_CONCURRENT_STREAMS {
+                        log::warn!(
+                            "AnyTLS stream limit reached ({MAX_CONCURRENT_STREAMS}); refusing stream {stream_id}"
+                        );
+                        drop(streams);
+                        self.send_synack(
+                            stream_id,
+                            Some("maximum concurrent AnyTLS streams reached"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     use std::collections::hash_map::Entry;
                     match streams.entry(stream_id) {
                         Entry::Occupied(_) => {
@@ -433,6 +452,7 @@ impl AnyTlsSession {
                         Entry::Vacant(entry) => {
                             // Create new stream with bounded channel for backpressure
                             let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+                            let cleanup_sender = data_tx.clone();
                             let stream = AnyTlsStream::new(
                                 stream_id,
                                 data_rx,
@@ -440,17 +460,23 @@ impl AnyTlsSession {
                                 Arc::clone(&self.is_closed),
                             );
                             entry.insert(data_tx);
-                            Some(stream)
+                            Some((stream, cleanup_sender))
                         }
                     }
                 };
 
                 // Handle the new stream internally with timeout and task tracking
-                if let Some(stream) = stream_opt {
+                if let Some((stream, cleanup_sender)) = stream_opt {
                     let session = Arc::clone(self);
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
+                    // Install the handle before the task can run.  If the
+                    // task completed immediately (for example because the
+                    // destination header was malformed), the old ordering
+                    // let its cleanup observe no map entry and then inserted
+                    // the already-finished JoinHandle forever.
+                    let mut tasks = self.stream_tasks.lock().await;
                     let handle = tokio::spawn(async move {
                         let resolver = session.resolver.clone();
                         let peer_addr = session.peer_addr;
@@ -487,10 +513,24 @@ impl AnyTlsSession {
                         // Remove self from stream_tasks on completion
                         let mut tasks = session_for_cleanup.stream_tasks.lock().await;
                         tasks.remove(&stream_id_for_cleanup);
+                        drop(tasks);
+
+                        // A handler can finish before it manages to enqueue
+                        // its FIN (for example on a malformed destination or
+                        // a timeout while the outgoing channel is full).  Do
+                        // not leave its sender in `streams` forever.  The
+                        // channel identity check prevents an old task from
+                        // deleting a newer stream that reused the same ID.
+                        let mut streams = session_for_cleanup.streams.write().await;
+                        if streams
+                            .get(&stream_id_for_cleanup)
+                            .is_some_and(|current| current.same_channel(&cleanup_sender))
+                        {
+                            streams.remove(&stream_id_for_cleanup);
+                        }
                     });
 
                     // Track the task for cancellation on session close
-                    let mut tasks = self.stream_tasks.lock().await;
                     tasks.insert(stream_id, handle);
                 }
             }

@@ -15,7 +15,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error, warn};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +60,11 @@ const MAX_REASSEMBLED_UDP_PACKET_SIZE: usize = u16::MAX as usize;
 /// Bound bytes retained by incomplete packets independently of the LRU key
 /// count. This is per QUIC connection.
 const MAX_FRAGMENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// Bound outbound UDP sessions per authenticated TUIC connection. Association
+/// ids are client-controlled, and the idle cleanup runs only every ten
+/// seconds, so relying on the `u16` key space would let a peer retain tens of
+/// thousands of sockets, channels, and tasks at once.
+const MAX_UDP_SESSIONS: usize = 1024;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
@@ -92,6 +97,7 @@ struct TuicUniStreamContext {
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     udp_session_map: UdpSessionMap,
+    udp_session_slots: Arc<Semaphore>,
     udp_fragments: UdpFragmentCache,
     cancel_token: CancellationToken,
     connection_scope: Arc<AuthenticatedConnectionScope>,
@@ -323,6 +329,7 @@ async fn process_connection(
     // 2. multiple threads can modify different sessions concurrently
     // 3. the outer write lock is only needed for adding/removing sessions
     let udp_session_map = Arc::new(DashMap::new());
+    let udp_session_slots = Arc::new(Semaphore::new(MAX_UDP_SESSIONS));
 
     // Clone what we need for each loop before creating async blocks
     let heartbeat_connection = connection.clone();
@@ -339,6 +346,7 @@ async fn process_connection(
         resolver: resolver.clone(),
         outbound_dispatcher: outbound_dispatcher.clone(),
         udp_session_map: udp_session_map.clone(),
+        udp_session_slots: udp_session_slots.clone(),
         udp_fragments: Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap(),
         ))),
@@ -376,6 +384,7 @@ async fn process_connection(
         datagram_resolver,
         datagram_dispatcher,
         udp_session_map,
+        udp_session_slots,
         datagram_cancel_token,
         datagram_connection_scope,
     );
@@ -914,6 +923,10 @@ struct UdpSession {
     last_activity: std::time::Instant,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
+    // Keeps the per-connection session budget occupied until this map entry
+    // is dropped. A raced, non-inserted session therefore returns its slot
+    // as soon as the temporary value is dropped.
+    _slot: OwnedSemaphorePermit,
 }
 
 struct FragmentedPacket {
@@ -960,6 +973,7 @@ impl UdpSession {
         parent_cancel_token: &CancellationToken,
         connection_scope: Arc<AuthenticatedConnectionScope>,
         is_uni_stream: bool,
+        slot: OwnedSemaphorePermit,
     ) -> Self {
         let session_cancel_token = parent_cancel_token.child_token();
         let (tx, rx) = mpsc::channel(64);
@@ -972,6 +986,7 @@ impl UdpSession {
             last_socket_addr: initial_socket_addr,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            _slot: slot,
         };
 
         tokio::spawn(async move {
@@ -998,6 +1013,15 @@ impl UdpSession {
     fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
         self.last_location = location;
         self.last_socket_addr = socket_addr;
+    }
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        // DashMap removal normally cancels explicitly, but a concurrent
+        // assoc-id race can create a session that never gets inserted. Make
+        // every dropped value stop its task so that path cannot leak a socket.
+        self.cancel_token.cancel();
     }
 }
 
@@ -1406,6 +1430,7 @@ async fn process_pending_uni_task(
         &context.resolver,
         context.outbound_dispatcher.as_ref(),
         &context.udp_session_map,
+        &context.udp_session_slots,
         assoc_id,
         remote_location,
         payload.as_ref(),
@@ -1456,6 +1481,7 @@ async fn process_udp_packet(
     resolver: &Arc<dyn Resolver>,
     outbound_dispatcher: Option<&Arc<OutboundDispatcher>>,
     udp_session_map: &UdpSessionMap,
+    udp_session_slots: &Arc<Semaphore>,
     fragments: &mut UdpFragmentMap,
     assoc_id: u16,
     packet_id: u16,
@@ -1490,6 +1516,7 @@ async fn process_udp_packet(
         resolver,
         outbound_dispatcher,
         udp_session_map,
+        udp_session_slots,
         assoc_id,
         remote_location,
         payload.as_ref(),
@@ -1561,6 +1588,7 @@ async fn forward_udp_packet(
     resolver: &Arc<dyn Resolver>,
     outbound_dispatcher: Option<&Arc<OutboundDispatcher>>,
     udp_session_map: &UdpSessionMap,
+    udp_session_slots: &Arc<Semaphore>,
     assoc_id: u16,
     remote_location: NetLocation,
     payload: &[u8],
@@ -1576,6 +1604,15 @@ async fn forward_udp_packet(
                 s.last_location.clone(),
             ),
             None => {
+                let slot = match udp_session_slots.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        debug!(
+                            "TUIC UDP session limit reached ({MAX_UDP_SESSIONS}); dropping association {assoc_id}"
+                        );
+                        return Ok(());
+                    }
+                };
                 if let Some(dispatcher) = outbound_dispatcher {
                     let sniffed_protocol = if dispatcher.requires_protocol_sniff() {
                         sniff_udp_protocol(payload)
@@ -1619,6 +1656,7 @@ async fn forward_udp_packet(
                         cancel_token,
                         connection_scope.clone(),
                         is_uni_stream,
+                        slot,
                     );
 
                     match udp_session_map.entry(assoc_id) {
@@ -1708,6 +1746,7 @@ async fn forward_udp_packet(
                         cancel_token,
                         connection_scope.clone(),
                         is_uni_stream,
+                        slot,
                     );
 
                     match udp_session_map.entry(assoc_id) {
@@ -1899,12 +1938,14 @@ fn remove_udp_fragments_for_assoc(fragments: &mut UdpFragmentMap, assoc_id: u16)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_datagram_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
     udp_session_map: UdpSessionMap,
+    udp_session_slots: Arc<Semaphore>,
     cancel_token: CancellationToken,
     connection_scope: Arc<AuthenticatedConnectionScope>,
 ) -> std::io::Result<()> {
@@ -2033,6 +2074,7 @@ async fn run_datagram_loop(
             &resolver,
             outbound_dispatcher.as_ref(),
             &udp_session_map,
+            &udp_session_slots,
             &mut fragments,
             assoc_id,
             packet_id,

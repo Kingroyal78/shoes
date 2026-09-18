@@ -13,6 +13,12 @@ use super::salt_checker::SaltChecker;
 /// single lock makes connection setup a queue. Salts are uniformly random, so
 /// their hash spreads across shards evenly by construction.
 const SHARD_COUNT: usize = 16;
+/// A replay window measured in minutes still needs a memory ceiling when a
+/// public listener sees a sustained stream of fresh handshakes.  Keeping this
+/// many entries per shard bounds the checker to roughly 131k salts total; the
+/// oldest entries are evicted only under pressure, so normal traffic retains
+/// the full time-based replay window.
+const MAX_ENTRIES_PER_SHARD: usize = 8192;
 
 /// Remembers recently seen salts for a bounded window.
 ///
@@ -77,6 +83,11 @@ impl SaltChecker for TimedSaltChecker {
         if !shard.seen.insert(digest) {
             return false;
         }
+        while shard.seen.len() > MAX_ENTRIES_PER_SHARD {
+            if let Some((_, oldest)) = shard.order.pop_front() {
+                shard.seen.remove(&oldest);
+            }
+        }
         shard.order.push_back((now, digest));
         true
     }
@@ -118,5 +129,20 @@ mod tests {
             occupied, SHARD_COUNT,
             "a single busy shard would put connection setup back behind one lock"
         );
+    }
+
+    #[test]
+    fn salt_cache_has_a_per_shard_memory_ceiling() {
+        let checker = TimedSaltChecker::new(60);
+        for i in 0..(MAX_ENTRIES_PER_SHARD * SHARD_COUNT * 2) {
+            assert!(checker.insert_and_check(&i.to_le_bytes()));
+        }
+
+        let total = checker
+            .shards
+            .iter()
+            .map(|shard| shard.lock().seen.len())
+            .sum::<usize>();
+        assert!(total <= MAX_ENTRIES_PER_SHARD * SHARD_COUNT);
     }
 }

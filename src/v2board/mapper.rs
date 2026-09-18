@@ -3137,7 +3137,11 @@ pub fn refresh_node_users(
     }
 
     let spec = normalize_node(app_config, node, server, users)?;
-    match node.node_type {
+    // Use the resolved runtime protocol, not the panel's wrapper type.  A
+    // V2Node is only a transport envelope; rebuilding its generation for
+    // every user change pins the previous table behind live connections even
+    // though the concrete protocol has a hot-swappable user slot.
+    match spec.node_type {
         NodeType::Shadowsocks => {
             let table = build_shadowsocks_users(
                 &spec,
@@ -3169,7 +3173,7 @@ pub fn refresh_node_users(
         NodeType::Naiveproxy => {
             naiveproxy_user_lookup(&spec, tracker, user_tables)?;
         }
-        NodeType::V2Node => return Ok(false),
+        NodeType::V2Node => unreachable!("normalize_node resolves V2Node before refresh"),
     }
     Ok(true)
 }
