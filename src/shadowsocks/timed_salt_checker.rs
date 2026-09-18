@@ -14,10 +14,10 @@ use super::salt_checker::SaltChecker;
 /// their hash spreads across shards evenly by construction.
 const SHARD_COUNT: usize = 16;
 /// A replay window measured in minutes still needs a memory ceiling when a
-/// public listener sees a sustained stream of fresh handshakes.  Keeping this
-/// many entries per shard bounds the checker to roughly 131k salts total; the
-/// oldest entries are evicted only under pressure, so normal traffic retains
-/// the full time-based replay window.
+/// public listener sees a sustained stream of fresh handshakes. Keeping this
+/// many entries per shard bounds the checker to roughly 131k salts total. A
+/// full shard rejects new salts rather than evicting an unexpired one, because
+/// eviction would reopen the replay window under an unauthenticated flood.
 const MAX_ENTRIES_PER_SHARD: usize = 8192;
 
 /// Remembers recently seen salts for a bounded window.
@@ -80,14 +80,13 @@ impl SaltChecker for TimedSaltChecker {
             shard.order.pop_front();
         }
 
-        if !shard.seen.insert(digest) {
+        if shard.seen.contains(&digest) {
             return false;
         }
-        while shard.seen.len() > MAX_ENTRIES_PER_SHARD {
-            if let Some((_, oldest)) = shard.order.pop_front() {
-                shard.seen.remove(&oldest);
-            }
+        if shard.seen.len() >= MAX_ENTRIES_PER_SHARD {
+            return false;
         }
+        shard.seen.insert(digest);
         shard.order.push_back((now, digest));
         true
     }
@@ -134,8 +133,12 @@ mod tests {
     #[test]
     fn salt_cache_has_a_per_shard_memory_ceiling() {
         let checker = TimedSaltChecker::new(60);
+        let mut accepted = Vec::new();
         for i in 0..(MAX_ENTRIES_PER_SHARD * SHARD_COUNT * 2) {
-            assert!(checker.insert_and_check(&i.to_le_bytes()));
+            let salt = i.to_le_bytes();
+            if checker.insert_and_check(&salt) {
+                accepted.push(salt);
+            }
         }
 
         let total = checker
@@ -144,5 +147,12 @@ mod tests {
             .map(|shard| shard.lock().seen.len())
             .sum::<usize>();
         assert!(total <= MAX_ENTRIES_PER_SHARD * SHARD_COUNT);
+        assert!(accepted.len() <= MAX_ENTRIES_PER_SHARD * SHARD_COUNT);
+
+        // Capacity pressure must never evict a salt that is still inside the
+        // replay window.
+        for salt in accepted.iter().take(128) {
+            assert!(!checker.insert_and_check(salt));
+        }
     }
 }

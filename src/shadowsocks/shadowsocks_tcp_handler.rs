@@ -470,12 +470,6 @@ impl ShadowsocksTcpHandler {
             .to_vec();
         let request_salt = &probe[..salt_len];
 
-        if let Some(salt_checker) = &self.salt_checker
-            && !salt_checker.insert_and_check(request_salt)
-        {
-            return Err(std::io::Error::other("got duplicate salt"));
-        }
-
         let encrypted_identity_header = &probe[salt_len..salt_len + encrypted_identity_len];
         let Some(identity_psk) = &self.aead2022_identity_psk else {
             return Err(std::io::Error::new(
@@ -512,7 +506,16 @@ impl ShadowsocksTcpHandler {
             server_stream,
             Some(initial_data.into_boxed_slice()),
         ));
-        Ok((stream, key, Some(authenticated_user), None))
+        // Let `ShadowsocksStream` record the salt only after it has decrypted
+        // and timestamp-validated the fixed AEAD-2022 header. Invalid
+        // identities and stale handshakes must not be able to consume replay
+        // cache capacity before authentication.
+        Ok((
+            stream,
+            key,
+            Some(authenticated_user),
+            self.salt_checker.clone(),
+        ))
     }
 }
 
