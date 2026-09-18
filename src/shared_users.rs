@@ -58,6 +58,27 @@ impl<T> SharedUsers<T> {
         let previous = std::mem::replace(&mut *self.current.write(), users);
         drop(previous);
     }
+
+    /// Apply a small update to the currently visible table.
+    ///
+    /// When no listener is holding a lookup borrow, the table can be changed
+    /// in place and its allocation stays stable.  A concurrent lookup keeps
+    /// the old `Arc` alive; in that case clone the table before applying the
+    /// update so authentication never observes a partial mutation.
+    pub fn update_with(&self, update: impl FnOnce(&mut T))
+    where
+        T: Clone,
+    {
+        let mut current = self.current.write();
+        if let Some(current) = Arc::get_mut(&mut current) {
+            update(current);
+            return;
+        }
+
+        let mut next = (**current).clone();
+        update(&mut next);
+        *current = Arc::new(next);
+    }
 }
 
 /// A lazily created handle to one protocol's user table.
@@ -159,5 +180,28 @@ mod tests {
         users.store(42);
 
         assert_eq!(*listener_copy.load(), 42);
+    }
+
+    #[test]
+    fn update_with_mutates_in_place_when_no_lookup_borrow_is_live() {
+        let users = SharedUsers::new(vec![1_u32, 2]);
+        let before = users.load();
+        drop(before);
+
+        users.update_with(|current| current.push(3));
+
+        let after = users.load();
+        assert_eq!(after.as_slice(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn update_with_clones_while_a_lookup_borrow_is_live() {
+        let users = SharedUsers::new(vec![1_u32, 2]);
+        let before = users.load();
+
+        users.update_with(|current| current.push(3));
+
+        assert_eq!(before.as_slice(), [1, 2]);
+        assert_eq!(users.load().as_slice(), [1, 2, 3]);
     }
 }

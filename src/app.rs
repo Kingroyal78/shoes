@@ -9,7 +9,9 @@ use crate::resolver::{CachingNativeResolver, Resolver};
 use crate::thread_util::set_num_threads;
 use crate::v2board::client::{FetchResult, UserListFetch, V2BoardClient};
 use crate::v2board::lkg::{self, NodeLkgSnapshot};
-use crate::v2board::mapper::{map_node, map_shadowsocks_plugin_nodes, refresh_node_users};
+use crate::v2board::mapper::{
+    map_node, map_shadowsocks_plugin_nodes, refresh_node_user_delta, refresh_node_users,
+};
 use crate::v2board::plugin_api::{
     AppliedFeature, OpaqueEtag, PluginApiError, PluginConfigApplied, PluginConfigCandidate,
     PluginConfigObserved, PluginStatusReport,
@@ -199,6 +201,12 @@ struct NodeController {
     user_tables: NodeUserTables,
 }
 
+#[derive(Debug)]
+struct UserDelta {
+    updated: Vec<UserInfo>,
+    removed: Vec<u64>,
+}
+
 impl NodeController {
     fn new(
         config: Arc<AppConfig>,
@@ -324,6 +332,7 @@ impl NodeController {
         let mut next_user_body_hash = self.user_body_hash;
         let mut next_users: Option<Arc<Vec<UserInfo>>> = None;
         let mut next_plugin_candidate = self.plugin_candidate.clone();
+        let mut user_delta: Option<UserDelta> = None;
 
         // A successful pull used to produce no output at all, which left the
         // routine case -- nothing moved -- indistinguishable from a panel that
@@ -488,16 +497,24 @@ impl NodeController {
                             "user snapshot is shared; forcing a full user refetch",
                         ));
                     };
+                    let delta_updated = value.users.clone();
+                    let delta_removed = value.removed.clone();
                     let (merged_users, delta_changed) =
                         merge_user_delta(base, value.users, value.removed);
                     // A full response is already a new candidate. For a delta,
                     // merge_user_delta reports whether any row really changed.
                     users_changed = delta_changed;
                     users_outcome = if users_changed {
-                        "changed"
+                        "delta changed"
                     } else {
-                        "resent unchanged"
+                        "delta unchanged"
                     };
+                    if delta_changed {
+                        user_delta = Some(UserDelta {
+                            updated: delta_updated,
+                            removed: delta_removed,
+                        });
+                    }
                     next_users = Some(Arc::new(merged_users));
                     changed |= users_changed;
                 }
@@ -562,7 +579,7 @@ impl NodeController {
                 && !self.runtime.is_empty()
                 && self.user_tables.is_published();
             let refreshed = if users_only {
-                match self.refresh_users(server, users) {
+                match self.refresh_users_delta(server, users, user_delta.as_ref()) {
                     Ok(refreshed) => refreshed,
                     Err(error) => {
                         if self.users.is_none() {
@@ -662,10 +679,7 @@ impl NodeController {
         server: &ServerConfig,
         users: &[UserInfo],
     ) -> std::io::Result<bool> {
-        let active_uids: std::collections::HashSet<u64> =
-            users.iter().map(|user| user.id).collect();
-        crate::tcp::tcp_server::reconcile_speed_limiters(&self.node.tag, &active_uids);
-        self.tracker.reconcile_users(&self.node.tag, &active_uids);
+        self.reconcile_active_users(users);
 
         refresh_node_users(
             &self.config,
@@ -675,6 +689,48 @@ impl NodeController {
             self.tracker.clone(),
             &self.user_tables,
         )
+    }
+
+    /// Apply a panel delta directly to a protocol table when that table has a
+    /// safe indexed update path. Protocols without one fall back to the
+    /// established full-table refresh.
+    fn refresh_users_delta(
+        &mut self,
+        server: &ServerConfig,
+        users: &[UserInfo],
+        delta: Option<&UserDelta>,
+    ) -> std::io::Result<bool> {
+        self.reconcile_active_users(users);
+
+        if let Some(delta) = delta
+            && refresh_node_user_delta(
+                &self.config,
+                &self.node,
+                server,
+                &delta.updated,
+                &delta.removed,
+                self.tracker.clone(),
+                &self.user_tables,
+            )?
+        {
+            return Ok(true);
+        }
+
+        refresh_node_users(
+            &self.config,
+            &self.node,
+            server,
+            users,
+            self.tracker.clone(),
+            &self.user_tables,
+        )
+    }
+
+    fn reconcile_active_users(&self, users: &[UserInfo]) {
+        let active_uids: std::collections::HashSet<u64> =
+            users.iter().map(|user| user.id).collect();
+        crate::tcp::tcp_server::reconcile_speed_limiters(&self.node.tag, &active_uids);
+        self.tracker.reconcile_users(&self.node.tag, &active_uids);
     }
 
     async fn apply_runtime(

@@ -7,7 +7,7 @@ use aws_lc_rs::cipher::{AES_128, AES_256, DecryptingKey, DecryptionContext, Unbo
 use aws_lc_rs::cipher::{EncryptingKey, EncryptionContext};
 use log::debug;
 use rand::{Rng, RngExt};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::AsyncWriteExt;
 
 use super::salt_checker::SaltChecker;
@@ -81,10 +81,12 @@ struct ShadowsocksUserKey {
 /// Built by the control plane and published through
 /// [`SharedUsers`](crate::shared_users::SharedUsers), so a user-list change
 /// never rebuilds the listener.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ShadowsocksUsers {
     keys: Vec<ShadowsocksUserKey>,
     by_user_hash: FxHashMap<[u8; AEAD2022_USER_HASH_LEN], usize>,
+    by_uid: FxHashMap<u64, usize>,
+    aead2022: bool,
 }
 
 impl ShadowsocksUsers {
@@ -103,6 +105,7 @@ impl ShadowsocksUsers {
                     authenticated_user: user.authenticated_user,
                 })
                 .collect(),
+            false,
         )
     }
 
@@ -121,20 +124,35 @@ impl ShadowsocksUsers {
                     authenticated_user,
                 })
                 .collect(),
+            true,
         )
     }
 
-    fn new(keys: Vec<ShadowsocksUserKey>) -> Self {
+    fn new(keys: Vec<ShadowsocksUserKey>, aead2022: bool) -> Self {
         let by_user_hash = keys
             .iter()
             .enumerate()
             .filter_map(|(index, user)| user.aead2022_user_hash.map(|hash| (hash, index)))
             .collect();
-        Self { keys, by_user_hash }
+        let by_uid = keys
+            .iter()
+            .enumerate()
+            .map(|(index, user)| (user.authenticated_user.uid, index))
+            .collect();
+        Self {
+            keys,
+            by_user_hash,
+            by_uid,
+            aead2022,
+        }
     }
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    pub(crate) fn contains_uid(&self, uid: u64) -> bool {
+        self.by_uid.contains_key(&uid)
     }
 
     fn is_empty(&self) -> bool {
@@ -148,6 +166,118 @@ impl ShadowsocksUsers {
         self.by_user_hash
             .get(user_hash)
             .map(|&index| &self.keys[index])
+    }
+
+    /// Validate a small AEAD2022 user delta without changing the live table.
+    ///
+    /// Validation is separate from application because [`SharedUsers`] can
+    /// mutate an otherwise uniquely-owned table in place. Keeping all error
+    /// checks here means the subsequent in-place operation is infallible and
+    /// cannot leave a partially applied table behind.
+    pub fn validate_aead2022_delta(
+        &self,
+        additions: &Self,
+        removed: &[u64],
+    ) -> std::io::Result<()> {
+        if !self.aead2022 || !additions.aead2022 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Shadowsocks user delta requires AEAD2022 tables",
+            ));
+        }
+
+        let removed: FxHashSet<u64> = removed.iter().copied().collect();
+        let mut incoming_uids = FxHashSet::default();
+        for user in &additions.keys {
+            let uid = user.authenticated_user.uid;
+            if !incoming_uids.insert(uid) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("duplicate Shadowsocks AEAD2022 user id {uid} in delta"),
+                ));
+            }
+        }
+        let mut incoming_hashes = FxHashSet::default();
+        for user in &additions.keys {
+            let uid = user.authenticated_user.uid;
+            let Some(hash) = user.aead2022_user_hash else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Shadowsocks AEAD2022 user {uid} has no identity hash"),
+                ));
+            };
+            if !incoming_hashes.insert(hash) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("duplicate Shadowsocks AEAD2022 identity hash for user {uid}"),
+                ));
+            }
+            if let Some(&index) = self.by_user_hash.get(&hash) {
+                let existing_uid = self.keys[index].authenticated_user.uid;
+                if existing_uid != uid
+                    && !removed.contains(&existing_uid)
+                    && !incoming_uids.contains(&existing_uid)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Shadowsocks AEAD2022 identity hash for user {uid} conflicts with user {existing_uid}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a validated AEAD2022 delta in place.
+    pub fn apply_aead2022_delta(
+        &mut self,
+        additions: Self,
+        removed: &[u64],
+    ) -> std::io::Result<()> {
+        self.validate_aead2022_delta(&additions, removed)?;
+        self.apply_aead2022_delta_validated(additions, removed);
+        Ok(())
+    }
+
+    pub(crate) fn apply_aead2022_delta_validated(&mut self, additions: Self, removed: &[u64]) {
+        // Remove every UID that is about to be replaced before inserting the
+        // new rows. This handles key swaps (A takes B's old PSK while B gets a
+        // new one) without temporarily overwriting another user's hash index.
+        for user in &additions.keys {
+            self.remove_uid(user.authenticated_user.uid);
+        }
+        for uid in removed {
+            self.remove_uid(*uid);
+        }
+        for user in additions.keys {
+            let uid = user.authenticated_user.uid;
+            let hash = user
+                .aead2022_user_hash
+                .expect("validated AEAD2022 delta user has an identity hash");
+            let index = self.keys.len();
+            self.keys.push(user);
+            self.by_uid.insert(uid, index);
+            self.by_user_hash.insert(hash, index);
+        }
+    }
+
+    fn remove_uid(&mut self, uid: u64) {
+        let Some(index) = self.by_uid.remove(&uid) else {
+            return;
+        };
+        let removed = self.keys.swap_remove(index);
+        if let Some(hash) = removed.aead2022_user_hash {
+            self.by_user_hash.remove(&hash);
+        }
+        if index < self.keys.len() {
+            let moved = &self.keys[index];
+            self.by_uid.insert(moved.authenticated_user.uid, index);
+            if let Some(hash) = moved.aead2022_user_hash {
+                self.by_user_hash.insert(hash, index);
+            }
+        }
     }
 }
 
@@ -984,6 +1114,123 @@ mod tests {
     #[test]
     fn aead2022_identity_header_decodes_user_hash_aes256() {
         assert_identity_header_round_trip(32);
+    }
+
+    #[test]
+    fn aead2022_user_delta_updates_indexes_in_place() {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let mut table = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![
+                (vec![1; 16], test_authenticated_user(1, "one")),
+                (vec![2; 16], test_authenticated_user(2, "two")),
+            ],
+        );
+        let additions = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![
+                (vec![3; 16], test_authenticated_user(3, "three")),
+                (vec![4; 16], test_authenticated_user(2, "two-updated")),
+            ],
+        );
+
+        table.apply_aead2022_delta(additions, &[1]).unwrap();
+
+        assert_eq!(table.len(), 2);
+        assert!(!table.by_uid.contains_key(&1));
+        assert_eq!(table.by_uid.len(), 2);
+        let updated_hash = shadowsocks_2022_user_hash(&[4; 16]);
+        assert_eq!(
+            table
+                .find_by_user_hash(&updated_hash)
+                .unwrap()
+                .authenticated_user
+                .user_key,
+            "two-updated"
+        );
+        assert!(
+            table
+                .find_by_user_hash(&shadowsocks_2022_user_hash(&[2; 16]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn aead2022_user_delta_rejects_duplicate_hash_without_mutating() {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let mut table = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![(vec![1; 16], test_authenticated_user(1, "one"))],
+        );
+        let additions = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![
+                (vec![9; 16], test_authenticated_user(2, "two")),
+                (vec![9; 16], test_authenticated_user(3, "three")),
+            ],
+        );
+
+        assert!(table.apply_aead2022_delta(additions, &[]).is_err());
+        assert_eq!(table.len(), 1);
+        assert!(table.by_uid.contains_key(&1));
+        assert!(!table.by_uid.contains_key(&2));
+    }
+
+    #[test]
+    fn aead2022_user_delta_allows_hash_swap_between_updated_users() {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let mut table = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![
+                (vec![1; 16], test_authenticated_user(1, "one")),
+                (vec![2; 16], test_authenticated_user(2, "two")),
+            ],
+        );
+        let additions = ShadowsocksUsers::aead2022(
+            &cipher,
+            vec![
+                (vec![2; 16], test_authenticated_user(1, "one-swapped")),
+                (vec![3; 16], test_authenticated_user(2, "two-new")),
+            ],
+        );
+
+        table.apply_aead2022_delta(additions, &[]).unwrap();
+
+        let hash_two = shadowsocks_2022_user_hash(&[2; 16]);
+        let hash_three = shadowsocks_2022_user_hash(&[3; 16]);
+        assert_eq!(
+            table
+                .find_by_user_hash(&hash_two)
+                .unwrap()
+                .authenticated_user
+                .uid,
+            1
+        );
+        assert_eq!(
+            table
+                .find_by_user_hash(&hash_three)
+                .unwrap()
+                .authenticated_user
+                .uid,
+            2
+        );
+        assert!(
+            table
+                .find_by_user_hash(&shadowsocks_2022_user_hash(&[1; 16]))
+                .is_none()
+        );
+    }
+
+    fn test_authenticated_user(uid: u64, user_key: &str) -> AuthenticatedUser {
+        AuthenticatedUser {
+            node_tag: Arc::from("test-node"),
+            uid,
+            user_key: user_key.to_string(),
+            speed_limit: None,
+            device_limit: None,
+            recorder: None,
+            dedicated_ip: None,
+        }
     }
 
     fn assert_identity_header_round_trip(key_len: usize) {

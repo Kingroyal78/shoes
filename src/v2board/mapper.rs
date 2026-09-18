@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
@@ -3178,6 +3178,110 @@ pub fn refresh_node_users(
     Ok(true)
 }
 
+/// Apply a small panel user delta directly to a live Shadowsocks AEAD2022
+/// table. Returns `false` when the resolved protocol has no indexed delta
+/// path, allowing the caller to use the normal full-table refresh.
+pub fn refresh_node_user_delta(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+    updated: &[UserInfo],
+    removed: &[u64],
+    tracker: Arc<TrafficTracker>,
+    user_tables: &NodeUserTables,
+) -> std::io::Result<bool> {
+    let lightweight_protocol = match node.node_type {
+        NodeType::Shadowsocks | NodeType::Vmess => true,
+        NodeType::V2Node => server
+            .protocol
+            .as_deref()
+            .and_then(NodeType::parse)
+            .is_some_and(|kind| matches!(kind, NodeType::Shadowsocks | NodeType::Vmess)),
+        _ => false,
+    };
+    if !lightweight_protocol {
+        return Ok(false);
+    }
+
+    let spec = normalize_node_without_users(app_config, node, server)?;
+    if spec.node_type != NodeType::Shadowsocks {
+        return Ok(false);
+    }
+    let RuntimeProtocol::Shadowsocks { cipher, .. } = &spec.protocol else {
+        return Ok(false);
+    };
+    // Legacy Shadowsocks has no identity index, so replacing its table is the
+    // only correct and bounded option. The production large-user path is
+    // AEAD2022, where each delta row maps directly to one UID/hash entry.
+    if shadowsocks_2022_key_len(cipher)?.is_none() {
+        return Ok(false);
+    }
+    let Some(shared) = user_tables.shadowsocks() else {
+        return Ok(false);
+    };
+
+    let effective_updated = effective_delta_updates(updated, removed);
+
+    let additions = build_shadowsocks_users_from_raw(
+        &spec,
+        node,
+        &effective_updated,
+        tracker,
+        app_config.runtime.max_legacy_shadowsocks_users,
+    )?;
+    // `for_each_runtime_user` omits disabled/expired rows. If such a row was
+    // previously active, its delta must remove the old credential even when
+    // the panel did not include the UID in `removed`.
+    let effective_removed = effective_delta_removed(&effective_updated, removed, &additions);
+    let current = shared.load();
+    match current.validate_aead2022_delta(&additions, &effective_removed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    drop(current);
+
+    shared.update_with(|table| {
+        table.apply_aead2022_delta_validated(additions, &effective_removed);
+    });
+    Ok(true)
+}
+
+/// Match `merge_user_delta` semantics: duplicate update IDs use the last row,
+/// while a removal wins over an update for the same UID.
+fn effective_delta_updates(updated: &[UserInfo], removed: &[u64]) -> Vec<UserInfo> {
+    let removed_set: FxHashSet<u64> = removed.iter().copied().collect();
+    let mut seen = FxHashSet::default();
+    let mut effective_updated = Vec::with_capacity(updated.len());
+    for user in updated.iter().rev() {
+        if removed_set.contains(&user.id) || !seen.insert(user.id) {
+            continue;
+        }
+        effective_updated.push(user.clone());
+    }
+    effective_updated.reverse();
+    effective_updated
+}
+
+/// Rows filtered by `for_each_runtime_user` (disabled/expired users, for
+/// example) still need to remove any old live credential on a delta refresh.
+fn effective_delta_removed(
+    updated: &[UserInfo],
+    removed: &[u64],
+    additions: &ShadowsocksUsers,
+) -> Vec<u64> {
+    let mut effective_removed = removed.to_vec();
+    effective_removed.extend(
+        updated
+            .iter()
+            .filter(|user| !additions.contains_uid(user.id))
+            .map(|user| user.id),
+    );
+    effective_removed.sort_unstable();
+    effective_removed.dedup();
+    effective_removed
+}
+
 fn server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
@@ -3929,6 +4033,51 @@ mod tests {
         let table = build_shadowsocks_users_from_raw(&spec, &node, &users, test_tracker(), 10)
             .expect("raw users build");
         assert_eq!(table.len(), 2, "disabled panel users stay out of the table");
+    }
+
+    #[test]
+    fn delta_removes_updated_users_filtered_from_the_runtime_table() {
+        let node = V2BoardNodeConfig {
+            tag: "ss-delta".to_string(),
+            node_id: 1,
+            node_type: NodeType::Shadowsocks,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let spec = shadowsocks_spec(
+            "2022-blake3-aes-128-gcm",
+            Some(BASE64.encode([7u8; 16])),
+            Vec::new(),
+        );
+        let updated = vec![
+            serde_json::from_value::<UserInfo>(serde_json::json!({
+                "id": 1,
+                "uuid": "0123456789abcdef"
+            }))
+            .unwrap(),
+            serde_json::from_value::<UserInfo>(serde_json::json!({
+                "id": 2,
+                "uuid": "fedcba9876543210",
+                "enabled": false
+            }))
+            .unwrap(),
+        ];
+        let effective_updated = effective_delta_updates(&updated, &[]);
+        let additions =
+            build_shadowsocks_users_from_raw(&spec, &node, &effective_updated, test_tracker(), 10)
+                .unwrap();
+
+        assert_eq!(additions.len(), 1);
+        assert_eq!(
+            effective_delta_removed(&effective_updated, &[], &additions),
+            [2]
+        );
     }
 
     fn runtime_user(uid: u64, credential: &str, secret: Option<String>) -> RuntimeUser {

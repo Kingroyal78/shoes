@@ -110,7 +110,6 @@ impl NodeUserTables {
     }
 
     /// The Shadowsocks handle a listener was built with, if any.
-    #[cfg(test)]
     pub fn shadowsocks(&self) -> Option<Arc<SharedUsers<ShadowsocksUsers>>> {
         self.inner.shadowsocks.get()
     }
