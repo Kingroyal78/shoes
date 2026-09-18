@@ -3,15 +3,35 @@ use crate::util::allocate_vec;
 
 #[derive(Debug, Clone)]
 pub struct Blake3Key {
-    key_bytes: Box<[u8]>,
+    key_bytes: Blake3KeyBytes,
     session_key_len: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Blake3KeyBytes {
+    Aes128([u8; 16]),
+    Aes256([u8; 32]),
+    Other(Box<[u8]>),
 }
 
 impl Blake3Key {
     pub fn new(key_bytes: Box<[u8]>, session_key_len: usize) -> Self {
+        let key_bytes = match key_bytes.len() {
+            16 => Blake3KeyBytes::Aes128(key_bytes.as_ref().try_into().unwrap()),
+            32 => Blake3KeyBytes::Aes256(key_bytes.as_ref().try_into().unwrap()),
+            _ => Blake3KeyBytes::Other(key_bytes),
+        };
         Self {
             key_bytes,
             session_key_len,
+        }
+    }
+
+    fn key_bytes(&self) -> &[u8] {
+        match &self.key_bytes {
+            Blake3KeyBytes::Aes128(key) => key,
+            Blake3KeyBytes::Aes256(key) => key,
+            Blake3KeyBytes::Other(key) => key,
         }
     }
 }
@@ -37,12 +57,9 @@ pub fn create_shadowsocks_2022_subkey(
         ));
     }
 
-    let mut key_material = allocate_vec(psk.len() + salt.len());
-    key_material[0..psk.len()].copy_from_slice(psk);
-    key_material[psk.len()..].copy_from_slice(salt);
-
     let mut hasher = blake3::Hasher::new_derive_key(context);
-    hasher.update(&key_material);
+    hasher.update(psk);
+    hasher.update(salt);
     let mut output_reader = hasher.finalize_xof();
 
     let mut subkey = allocate_vec(output_len);
@@ -76,7 +93,7 @@ pub fn shadowsocks_2022_user_hash(user_psk: &[u8]) -> [u8; AEAD2022_USER_HASH_LE
 impl ShadowsocksKey for Blake3Key {
     fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
         create_shadowsocks_2022_subkey(
-            &self.key_bytes,
+            self.key_bytes(),
             salt,
             self.session_key_len,
             SESSION_CONTEXT_STR,

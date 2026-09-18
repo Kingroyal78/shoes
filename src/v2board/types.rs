@@ -193,22 +193,24 @@ pub struct UserInfo {
     pub device_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_flexible_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_flexible_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_on: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_connections: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_ips: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_bytes: Option<u64>,
     /// The dedicated egress IP this user bought. Absent for everyone who did
     /// not buy one -- the panel omits the key rather than sending a null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dedicated_ip: Option<DedicatedIp>,
+    pub dedicated_ip: Option<Box<DedicatedIp>>,
 }
 
 /// The panel's `dedicated_ip` object.
@@ -284,12 +286,30 @@ impl UserInfo {
     }
 
     pub fn enabled_flag(&self) -> Option<bool> {
-        flexible_bool(self.enabled.as_ref())
+        self.enabled
     }
 
     pub fn expires_at_unix(&self) -> Option<i64> {
-        flexible_i64(self.expires_at.as_ref())
+        self.expires_at
     }
+}
+
+fn deserialize_flexible_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(flexible_bool(
+        Option::<Value>::deserialize(deserializer)?.as_ref(),
+    ))
+}
+
+fn deserialize_flexible_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(flexible_i64(
+        Option::<Value>::deserialize(deserializer)?.as_ref(),
+    ))
 }
 
 fn flexible_bool(value: Option<&Value>) -> Option<bool> {
@@ -340,6 +360,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn user_rows_stay_compact_on_sixty_four_bit_targets() {
+        if cfg!(target_pointer_width = "64") {
+            assert!(
+                std::mem::size_of::<UserInfo>() <= 224,
+                "UserInfo grew to {} bytes; this is multiplied by every panel user",
+                std::mem::size_of::<UserInfo>()
+            );
+        }
+    }
+
+    #[test]
+    fn flexible_status_fields_are_normalized_while_unknown_limits_are_ignored() {
+        let user: UserInfo = serde_json::from_value(json!({
+            "id": 7,
+            "enabled": "yes",
+            "expires_at": "1700000000",
+            "max_connections": 99,
+            "max_ips": 12,
+            "quota_bytes": 123456
+        }))
+        .unwrap();
+        assert_eq!(user.enabled, Some(true));
+        assert_eq!(user.expires_at, Some(1_700_000_000));
+
+        let encoded = serde_json::to_value(user).unwrap();
+        assert_eq!(encoded["enabled"], true);
+        assert_eq!(encoded["expires_at"], 1_700_000_000_i64);
+        assert!(encoded.get("max_connections").is_none());
+    }
 
     #[test]
     fn user_list_accepts_v2board_response_shapes_and_uid_alias() {

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Interval, MissedTickBehavior, interval};
 
@@ -187,6 +188,7 @@ struct NodeController {
     user_body_hash: Option<[u8; 32]>,
     server_config: Option<ServerConfig>,
     users: Option<Arc<Vec<UserInfo>>>,
+    device_limited_user_count: usize,
     plugin_candidate: Option<PluginConfigCandidate>,
     plugin_applied: Option<PluginConfigApplied>,
     force_plugin_refresh: bool,
@@ -228,6 +230,7 @@ impl NodeController {
             user_body_hash: None,
             server_config: None,
             users: None,
+            device_limited_user_count: 0,
             plugin_candidate: None,
             plugin_applied: None,
             force_plugin_refresh: false,
@@ -331,6 +334,7 @@ impl NodeController {
         let mut next_user_revision = self.user_revision;
         let mut next_user_body_hash = self.user_body_hash;
         let mut next_users: Option<Arc<Vec<UserInfo>>> = None;
+        let mut next_device_limited_user_count = self.device_limited_user_count;
         let mut next_plugin_candidate = self.plugin_candidate.clone();
         let mut user_delta: Option<UserDelta> = None;
 
@@ -482,9 +486,19 @@ impl NodeController {
                         users_changed = true;
                         users_outcome = "changed";
                         next_users = Some(Arc::new(users));
+                        next_device_limited_user_count = next_users
+                            .as_deref()
+                            .map(|users| count_device_limited_users(users))
+                            .unwrap_or(0);
                         changed = true;
                     }
                 } else {
+                    next_device_limited_user_count = device_limit_count_after_delta(
+                        self.device_limited_user_count,
+                        self.users.as_deref().map(Vec::as_slice).unwrap_or_default(),
+                        &value.users,
+                        &value.removed,
+                    );
                     let base = self
                         .users
                         .take()
@@ -521,10 +535,7 @@ impl NodeController {
             }
         }
 
-        if next_users
-            .as_ref()
-            .is_some_and(|users| users.iter().any(|user| user.device_limit.unwrap_or(0) > 0))
-        {
+        if next_device_limited_user_count > 0 {
             alive_fetched = true;
             let alive = match self.client.get_alive_list(&self.config, &self.node).await {
                 Ok(alive) => alive,
@@ -629,6 +640,7 @@ impl NodeController {
         self.user_revision = next_user_revision;
         self.user_body_hash = next_user_body_hash;
         self.users = next_users;
+        self.device_limited_user_count = next_device_limited_user_count;
         self.plugin_candidate = next_plugin_candidate;
 
         // Persist only when the snapshot's *contents* moved, not merely because
@@ -643,7 +655,35 @@ impl NodeController {
         // once. The snapshot's contents stay correct, because everything that
         // changes them sets `applied_generation`.
         if applied_generation || self.lkg_persist_pending {
-            match self.persist_lkg().await {
+            let persist_result = if !self.lkg_persist_pending && !non_user_changed {
+                if let (Some(delta), Some(revision)) = (user_delta.as_ref(), self.user_revision) {
+                    match lkg::append_user_delta(
+                        &self.config.runtime.data_dir,
+                        &self.node,
+                        self.user_etag.clone(),
+                        revision,
+                        delta.updated.clone(),
+                        delta.removed.clone(),
+                    )
+                    .await
+                    {
+                        Ok(false) => Ok(()),
+                        Ok(true) => self.persist_lkg().await,
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            // An unusually large delta is better represented by
+                            // a compact base. Preserve availability instead of
+                            // retrying an unappendable journal record forever.
+                            self.persist_lkg().await
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.persist_lkg().await
+                }
+            } else {
+                self.persist_lkg().await
+            };
+            match persist_result {
                 Ok(()) => self.lkg_persist_pending = false,
                 Err(e) => {
                     // LKG persist failed (e.g. disk full/permissions). The
@@ -700,10 +740,8 @@ impl NodeController {
         users: &[UserInfo],
         delta: Option<&UserDelta>,
     ) -> std::io::Result<bool> {
-        self.reconcile_active_users(users);
-
         if let Some(delta) = delta
-            && refresh_node_user_delta(
+            && let Some(removed) = refresh_node_user_delta(
                 &self.config,
                 &self.node,
                 server,
@@ -713,9 +751,12 @@ impl NodeController {
                 &self.user_tables,
             )?
         {
+            crate::tcp::tcp_server::remove_speed_limiters(&self.node.tag, &removed);
+            self.tracker.remove_users(&self.node.tag, &removed);
             return Ok(true);
         }
 
+        self.reconcile_active_users(users);
         refresh_node_users(
             &self.config,
             &self.node,
@@ -797,9 +838,16 @@ impl NodeController {
     }
 
     async fn restore_lkg(&mut self) -> std::io::Result<bool> {
-        let Some(snapshot) = lkg::load(&self.config.runtime.data_dir, &self.node).await? else {
+        let Some(mut snapshot) = lkg::load(&self.config.runtime.data_dir, &self.node).await? else {
             return Ok(false);
         };
+        if snapshot
+            .users
+            .windows(2)
+            .any(|pair| pair[0].id > pair[1].id)
+        {
+            Arc::make_mut(&mut snapshot.users).sort_unstable_by_key(|user| user.id);
+        }
         let plugin_candidate = snapshot.plugin_candidate(&self.node)?;
         self.apply_runtime(
             &snapshot.server_config,
@@ -812,6 +860,7 @@ impl NodeController {
         self.user_revision = snapshot.user_revision;
         self.server_config = Some(snapshot.server_config);
         self.users = Some(snapshot.users.clone());
+        self.device_limited_user_count = count_device_limited_users(&snapshot.users);
         self.plugin_candidate = plugin_candidate;
         log::info!(
             "node `{}` restored its last-known-good runtime before contacting V2Board",
@@ -1124,6 +1173,49 @@ fn merge_user_delta(
     (users, changed)
 }
 
+fn count_device_limited_users(users: &[UserInfo]) -> usize {
+    users
+        .iter()
+        .filter(|user| user.device_limit.unwrap_or(0) > 0)
+        .count()
+}
+
+/// Update the cached count from only the UIDs touched by a delta. The panel's
+/// remove list wins over updates, matching `merge_user_delta` semantics.
+fn device_limit_count_after_delta(
+    current_count: usize,
+    users: &[UserInfo],
+    updates: &[UserInfo],
+    removed: &[u64],
+) -> usize {
+    let removed: FxHashSet<u64> = removed.iter().copied().collect();
+    let mut latest = FxHashMap::default();
+    for user in updates {
+        latest.insert(user.id, user);
+    }
+    let mut affected = removed.clone();
+    affected.extend(latest.keys().copied());
+
+    let mut count = current_count;
+    for uid in affected {
+        let previous = users
+            .binary_search_by_key(&uid, |user| user.id)
+            .ok()
+            .and_then(|index| users.get(index))
+            .is_some_and(|user| user.device_limit.unwrap_or(0) > 0);
+        let next = !removed.contains(&uid)
+            && latest
+                .get(&uid)
+                .is_some_and(|user| user.device_limit.unwrap_or(0) > 0);
+        match (previous, next) {
+            (true, false) => count = count.saturating_sub(1),
+            (false, true) => count = count.saturating_add(1),
+            _ => {}
+        }
+    }
+    count
+}
+
 /// Normalize a full panel response into the stable id order used by delta
 /// merging and report whether it differs from the current snapshot.  Keeping
 /// this comparison separate makes a semantically unchanged full response a
@@ -1200,9 +1292,6 @@ mod tests {
             enabled: None,
             expires_at: None,
             expires_on: None,
-            max_connections: None,
-            max_ips: None,
-            quota_bytes: None,
             dedicated_ip: None,
         }
     }
@@ -1287,6 +1376,26 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(merged, users);
+    }
+
+    #[test]
+    fn device_limit_count_is_updated_from_delta_without_a_full_scan() {
+        let mut users = vec![
+            test_user(1, "one"),
+            test_user(2, "two"),
+            test_user(3, "three"),
+        ];
+        users[0].device_limit = Some(2);
+        users[2].device_limit = Some(1);
+        let mut update_two = test_user(2, "two");
+        update_two.device_limit = Some(3);
+        let mut update_three = test_user(3, "three");
+        update_three.device_limit = None;
+
+        assert_eq!(
+            device_limit_count_after_delta(2, &users, &[update_two, update_three], &[1]),
+            1
+        );
     }
 
     #[test]

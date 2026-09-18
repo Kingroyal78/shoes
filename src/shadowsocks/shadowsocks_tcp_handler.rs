@@ -46,7 +46,7 @@ use super::shadowsocks_stream_type::ShadowsocksStreamType;
 #[derive(Debug)]
 pub struct ShadowsocksTcpHandler {
     cipher: ShadowsocksCipher,
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
     aead2022: bool,
     salt_checker: Option<Arc<dyn SaltChecker>>,
     udp_enabled: bool,
@@ -66,7 +66,7 @@ pub struct ShadowsocksTcpHandler {
 
 #[derive(Clone, Debug)]
 struct ShadowsocksUserKey {
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
     aead2022_user_hash: Option<[u8; AEAD2022_USER_HASH_LEN]>,
     authenticated_user: AuthenticatedUser,
 }
@@ -97,10 +97,10 @@ impl ShadowsocksUsers {
             users
                 .into_iter()
                 .map(|user| ShadowsocksUserKey {
-                    key: Arc::new(Box::new(DefaultKey::new(
+                    key: Arc::new(DefaultKey::new(
                         &user.credential,
                         cipher.algorithm().key_len(),
-                    ))),
+                    )),
                     aead2022_user_hash: None,
                     authenticated_user: user.authenticated_user,
                 })
@@ -117,10 +117,10 @@ impl ShadowsocksUsers {
                 .into_iter()
                 .map(|(user_psk, authenticated_user)| ShadowsocksUserKey {
                     aead2022_user_hash: Some(shadowsocks_2022_user_hash(&user_psk)),
-                    key: Arc::new(Box::new(Blake3Key::new(
+                    key: Arc::new(Blake3Key::new(
                         user_psk.into_boxed_slice(),
                         cipher.algorithm().key_len(),
-                    ))),
+                    )),
                     authenticated_user,
                 })
                 .collect(),
@@ -290,10 +290,8 @@ impl ShadowsocksTcpHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
-            password,
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(DefaultKey::new(password, cipher.algorithm().key_len()));
         Self {
             cipher,
             key,
@@ -373,10 +371,10 @@ impl ShadowsocksTcpHandler {
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         let identity_psk = server_psk.clone().into_boxed_slice();
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
+        let key: Arc<dyn ShadowsocksKey> = Arc::new(Blake3Key::new(
             server_psk.into_boxed_slice(),
             cipher.algorithm().key_len(),
-        )));
+        ));
         Self {
             cipher,
             key,
@@ -409,10 +407,8 @@ impl ShadowsocksTcpHandler {
 
     /// Create a new handler for client use (no proxy_selector needed)
     pub fn new_client(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
-            password,
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(DefaultKey::new(password, cipher.algorithm().key_len()));
         Self {
             cipher,
             key,
@@ -439,10 +435,10 @@ impl ShadowsocksTcpHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
+        let key: Arc<dyn ShadowsocksKey> = Arc::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
             cipher.algorithm().key_len(),
-        )));
+        ));
         Self {
             cipher,
             key,
@@ -467,10 +463,10 @@ impl ShadowsocksTcpHandler {
         key_bytes: &[u8],
         udp_enabled: bool,
     ) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
+        let key: Arc<dyn ShadowsocksKey> = Arc::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
             cipher.algorithm().key_len(),
-        )));
+        ));
         Self {
             cipher,
             key,
@@ -495,7 +491,7 @@ impl ShadowsocksTcpHandler {
         stream_type: ShadowsocksStreamType,
     ) -> std::io::Result<(
         Box<dyn AsyncStream>,
-        Arc<Box<dyn ShadowsocksKey>>,
+        Arc<dyn ShadowsocksKey>,
         Option<AuthenticatedUser>,
         Option<Arc<dyn SaltChecker>>,
     )> {
@@ -507,7 +503,7 @@ impl ShadowsocksTcpHandler {
                 self.salt_checker.clone(),
             ));
         };
-        if users.load().is_empty() {
+        if users.with_current(ShadowsocksUsers::is_empty) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "multi-user Shadowsocks handler has no users",
@@ -538,7 +534,7 @@ impl ShadowsocksTcpHandler {
         stream_type: ShadowsocksStreamType,
     ) -> std::io::Result<(
         Box<dyn AsyncStream>,
-        Arc<Box<dyn ShadowsocksKey>>,
+        Arc<dyn ShadowsocksKey>,
         Option<AuthenticatedUser>,
     )> {
         let salt_len = self.cipher.salt_len();
@@ -554,23 +550,22 @@ impl ShadowsocksTcpHandler {
 
         // Borrow the table only for the lookup. Holding it for the lifetime of
         // the connection would pin a superseded table until the connection ends.
-        let users = users.load();
-        for user in &users.keys {
-            if try_decrypt_aead_length(
-                self.cipher.algorithm(),
-                user.key.as_ref().as_ref(),
-                salt,
-                encrypted_length,
-                stream_type.max_payload_len(),
-            )
-            .is_ok()
-            {
-                let key = user.key.clone();
-                let authenticated_user = user.authenticated_user.clone();
-                drop(users);
-                let stream = prepend_probe(server_stream, reader, probe);
-                return Ok((stream, key, Some(authenticated_user)));
-            }
+        let matched = users.with_current(|users| {
+            users.keys.iter().find_map(|user| {
+                try_decrypt_aead_length(
+                    self.cipher.algorithm(),
+                    user.key.as_ref(),
+                    salt,
+                    encrypted_length,
+                    stream_type.max_payload_len(),
+                )
+                .ok()
+                .map(|_| (user.key.clone(), user.authenticated_user.clone()))
+            })
+        });
+        if let Some((key, authenticated_user)) = matched {
+            let stream = prepend_probe(server_stream, reader, probe);
+            return Ok((stream, key, Some(authenticated_user)));
         }
 
         Err(std::io::Error::new(
@@ -585,7 +580,7 @@ impl ShadowsocksTcpHandler {
         users: &SharedUsers<ShadowsocksUsers>,
     ) -> std::io::Result<(
         Box<dyn AsyncStream>,
-        Arc<Box<dyn ShadowsocksKey>>,
+        Arc<dyn ShadowsocksKey>,
         Option<AuthenticatedUser>,
         Option<Arc<dyn SaltChecker>>,
     )> {
@@ -615,15 +610,15 @@ impl ShadowsocksTcpHandler {
 
         // Borrow the table only for the lookup, then copy out this user's own
         // credentials; see `SharedUsers` for why the borrow must not outlive it.
-        let (key, authenticated_user) = {
-            let users = users.load();
-            let Some(user) = users.find_by_user_hash(&user_hash) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "no matching Shadowsocks 2022 user",
-                ));
-            };
-            (user.key.clone(), user.authenticated_user.clone())
+        let Some((key, authenticated_user)) = users.with_current(|users| {
+            users
+                .find_by_user_hash(&user_hash)
+                .map(|user| (user.key.clone(), user.authenticated_user.clone()))
+        }) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no matching Shadowsocks 2022 user",
+            ));
         };
 
         let mut initial_data = Vec::with_capacity(probe.len() - encrypted_identity_len);
@@ -1141,7 +1136,7 @@ mod tests {
         assert_eq!(table.by_uid.len(), 2);
         let updated_hash = shadowsocks_2022_user_hash(&[4; 16]);
         assert_eq!(
-            table
+            &*table
                 .find_by_user_hash(&updated_hash)
                 .unwrap()
                 .authenticated_user
@@ -1225,7 +1220,7 @@ mod tests {
         AuthenticatedUser {
             node_tag: Arc::from("test-node"),
             uid,
-            user_key: user_key.to_string(),
+            user_key: user_key.into(),
             speed_limit: None,
             device_limit: None,
             recorder: None,

@@ -1784,9 +1784,6 @@ mod tests {
             enabled: None,
             expires_at: None,
             expires_on: None,
-            max_connections: None,
-            max_ips: None,
-            quota_bytes: None,
             dedicated_ip: None,
         }]
     }
@@ -1815,7 +1812,7 @@ mod tests {
         let (app, node) = app_config(NodeType::Vmess);
         let server = server("tcp");
         let mut users = users();
-        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", 3600));
+        users[0].dedicated_ip = Some(Box::new(dedicated_wire("198.51.100.7", "egress", 3600)));
 
         let spec = normalize_node(&app, &node, &server, &users).unwrap();
 
@@ -1841,7 +1838,7 @@ mod tests {
     fn an_unusable_dedicated_ip_does_not_fail_the_sync() {
         let (app, node) = app_config(NodeType::Vmess);
         let mut users = users();
-        users[0].dedicated_ip = Some(crate::v2board::types::DedicatedIp {
+        users[0].dedicated_ip = Some(Box::new(crate::v2board::types::DedicatedIp {
             assignment_id: Some(7),
             ip: Some("definitely-not-an-ip".to_string()),
             mode: Some("egress".to_string()),
@@ -1850,7 +1847,7 @@ mod tests {
             username: None,
             password: None,
             expires_at: None,
-        });
+        }));
 
         let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();
 
@@ -1868,7 +1865,7 @@ mod tests {
     fn an_expired_assignment_stops_binding() {
         let (app, node) = app_config(NodeType::Vmess);
         let mut users = users();
-        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", -60));
+        users[0].dedicated_ip = Some(Box::new(dedicated_wire("198.51.100.7", "egress", -60)));
 
         let spec = normalize_node(&app, &node, &server("tcp"), &users).unwrap();
 
@@ -1891,7 +1888,7 @@ mod tests {
             // the v2 one for this to be a test about the binding.
             server.version = Some(2);
             let mut users = users();
-            users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "egress", 3600));
+            users[0].dedicated_ip = Some(Box::new(dedicated_wire("198.51.100.7", "egress", 3600)));
 
             let spec = normalize_node(&app, &node, &server, &users).unwrap();
 
@@ -1917,11 +1914,19 @@ mod tests {
         app.v2board.nodes[0].tag = node.tag.clone();
 
         let mut users = users();
-        users[0].dedicated_ip = Some(dedicated_wire("198.51.100.7", "ingress_egress", 3600));
+        users[0].dedicated_ip = Some(Box::new(dedicated_wire(
+            "198.51.100.7",
+            "ingress_egress",
+            3600,
+        )));
         let mut second = users[0].clone();
         second.id = 11;
         second.uuid = Some("00000000-0000-0000-0000-000000000002".to_string());
-        second.dedicated_ip = Some(dedicated_wire("198.51.100.8", "ingress_egress", 3600));
+        second.dedicated_ip = Some(Box::new(dedicated_wire(
+            "198.51.100.8",
+            "ingress_egress",
+            3600,
+        )));
         users.push(second);
 
         // Two users on one bad reason, and the node pulled twice: four lines
@@ -2111,12 +2116,9 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             label: Some("disabled".to_string()),
-            enabled: Some(json!(false)),
+            enabled: Some(false),
             expires_at: None,
             expires_on: None,
-            max_connections: None,
-            max_ips: None,
-            quota_bytes: None,
             dedicated_ip: None,
         });
         users.push(UserInfo {
@@ -2128,12 +2130,9 @@ mod tests {
             speed_limit: None,
             device_limit: None,
             label: Some("expired".to_string()),
-            enabled: Some(json!(true)),
-            expires_at: Some(json!(1)),
+            enabled: Some(true),
+            expires_at: Some(1),
             expires_on: None,
-            max_connections: None,
-            max_ips: None,
-            quota_bytes: None,
             dedicated_ip: None,
         });
 

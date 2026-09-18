@@ -663,7 +663,7 @@ mod tests {
         AuthenticatedUser {
             node_tag: "vless-vision".into(),
             uid,
-            user_key: format!("user-{uid}"),
+            user_key: format!("user-{uid}").into(),
             speed_limit: None,
             device_limit: None,
             recorder: None,

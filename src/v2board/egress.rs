@@ -387,6 +387,7 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// newly sold IP.
 static EGRESS_CHAINS: LazyLock<RwLock<HashMap<DedicatedEgress, Arc<ClientChainGroup>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+const EGRESS_CHAIN_CACHE_LIMIT: usize = 4096;
 
 /// The chain this egress dials through, built on first use.
 pub fn chain_group_for(
@@ -403,6 +404,13 @@ pub fn chain_group_for(
 
     let mut chains = EGRESS_CHAINS.write().unwrap_or_else(|e| e.into_inner());
     // Another connection may have built it between the two locks.
+    if !chains.contains_key(egress) && chains.len() >= EGRESS_CHAIN_CACHE_LIMIT {
+        // A chain held only by the cache is safe to rebuild on its next dial.
+        // Preserve chains cloned by in-flight connections; if more than the
+        // limit are genuinely concurrent, correctness wins and the map may
+        // temporarily exceed the soft ceiling until a later miss reaps them.
+        chains.retain(|_, chain| Arc::strong_count(chain) > 1);
+    }
     chains
         .entry(egress.clone())
         .or_insert_with(|| Arc::new(build_chain(egress, resolver)))

@@ -41,7 +41,7 @@ use crate::util::{allocate_vec, write_all};
 #[derive(Debug)]
 struct ShadowsocksData {
     cipher: ShadowsocksCipher,
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
 }
 
 /// The user set of a Trojan listener, indexed by the password hash the client
@@ -659,10 +659,10 @@ impl TrojanTcpHandler {
                 cipher,
                 password: shadowsocks_password,
             } => {
-                let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
+                let key: Arc<dyn ShadowsocksKey> = Arc::new(DefaultKey::new(
                     shadowsocks_password,
                     cipher.algorithm().key_len(),
-                )));
+                ));
                 ShadowsocksData {
                     cipher: *cipher,
                     key,

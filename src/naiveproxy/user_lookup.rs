@@ -196,7 +196,7 @@ mod tests {
         let authenticated_user = AuthenticatedUser {
             node_tag: "node-a".into(),
             uid: 42,
-            user_key: "user-42".to_string(),
+            user_key: "user-42".into(),
             speed_limit: Some(10),
             device_limit: Some(2),
             recorder: None,

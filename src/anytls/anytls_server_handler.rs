@@ -53,7 +53,7 @@ impl AnyTlsUsers {
             by_password_hash.insert(
                 password_hash,
                 AnyTlsAuthenticatedUser {
-                    name: user.authenticated_user.user_key.clone(),
+                    name: user.authenticated_user.user_key.to_string(),
                     authenticated_user: Some(user.authenticated_user),
                 },
             );

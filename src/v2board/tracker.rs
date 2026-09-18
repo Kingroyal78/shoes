@@ -85,6 +85,20 @@ fn node_map<'a, V: Default>(map: &'a mut HashMap<String, V>, node_tag: &str) -> 
         .expect("inserted above when it was missing")
 }
 
+fn remove_user_from_node_map<V>(
+    map: &mut HashMap<String, HashMap<u64, V>>,
+    node_tag: &str,
+    uid: u64,
+) {
+    let remove_node = map.get_mut(node_tag).is_some_and(|users| {
+        users.remove(&uid);
+        users.is_empty()
+    });
+    if remove_node {
+        map.remove(node_tag);
+    }
+}
+
 impl TrafficTracker {
     pub async fn new(data_dir: PathBuf) -> std::io::Result<Self> {
         tokio::fs::create_dir_all(&data_dir).await?;
@@ -304,6 +318,19 @@ impl TrafficTracker {
             if removed_alive {
                 state.alive.remove(node_tag);
             }
+        }
+    }
+
+    /// Drop state for the handful of users named by a delta. The full
+    /// `reconcile_users` pass remains the repair path for full snapshots; doing
+    /// it for every delta makes sync cost proportional to the entire panel.
+    pub fn remove_users(&self, node_tag: &str, removed_uids: &[u64]) {
+        for uid in removed_uids {
+            let mut state = self.shards[*uid as usize & (SHARD_COUNT - 1)].lock();
+            remove_user_from_node_map(&mut state.traffic, node_tag, *uid);
+            remove_user_from_node_map(&mut state.alive, node_tag, *uid);
+            remove_user_from_node_map(&mut state.alive_traffic, node_tag, *uid);
+            remove_user_from_node_map(&mut state.panel_alive, node_tag, *uid);
         }
     }
 
@@ -823,6 +850,26 @@ mod tests {
             tracker.snapshot_traffic("node-b", 0).get("10"),
             Some(&[1, 1])
         );
+    }
+
+    #[test]
+    fn remove_users_only_touches_named_users_and_node() {
+        let tracker = tracker();
+        tracker.add_traffic("node-a", 10, 1, 2);
+        tracker.add_traffic("node-a", 11, 3, 4);
+        tracker.add_traffic("node-b", 10, 5, 6);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        assert!(tracker.add_alive_ip_and_check_limit("node-a", 10, ip, None));
+        tracker.replace_panel_alive("node-a", HashMap::from([(10, 1), (11, 2)]));
+
+        tracker.remove_users("node-a", &[10]);
+
+        let node_a = tracker.snapshot_traffic("node-a", 0);
+        let node_b = tracker.snapshot_traffic("node-b", 0);
+        assert!(!node_a.contains_key("10"));
+        assert_eq!(node_a.get("11"), Some(&[3, 4]));
+        assert_eq!(node_b.get("10"), Some(&[5, 6]));
+        assert!(tracker.snapshot_alive("node-a", 7, 0).is_empty());
     }
 
     #[test]

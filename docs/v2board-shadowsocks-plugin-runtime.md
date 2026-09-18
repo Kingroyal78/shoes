@@ -60,10 +60,12 @@ uses the same bind address, shoes stops the old generation, starts and probes
 the candidate, and restores the exact previous graph if the candidate fails.
 
 The applied server config, users, ETags, and exact plugin manifest are
-atomically persisted under `runtime.data_dir` as MessagePack in
-`v2board-lkg-<node-type>-<node-id>.mpk`. Legacy `.json` snapshots are migrated
+atomically persisted under `runtime.data_dir` as a MessagePack base in
+`v2board-lkg-<node-type>-<node-id>.mpk`. User-only deltas are durably appended
+to a length- and CRC-framed `.journal`, replayed by revision on restart, and
+periodically compacted into a new base. Legacy `.json` snapshots are migrated
 and removed only after the replacement passes read-back verification. On Unix
-the file mode is `0600`.
+the files use mode `0600`.
 Because this snapshot contains user and plugin credentials, the data directory
 must be private to the shoes service account. A validated last-known-good
 snapshot is restored before the first panel request after restart.

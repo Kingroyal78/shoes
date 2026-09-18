@@ -2918,7 +2918,7 @@ fn shadowsocks_2022_server_users(
                 AuthenticatedUser {
                     node_tag: node_tag.clone(),
                     uid: user.uid,
-                    user_key: user.user_key.clone(),
+                    user_key: Arc::from(user.user_key.as_str()),
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
@@ -2937,7 +2937,7 @@ fn authenticated_user_from_runtime(
     AuthenticatedUser {
         node_tag: node_tag.clone(),
         uid: user.uid,
-        user_key: user.user_key,
+        user_key: Arc::from(user.user_key),
         speed_limit: user.policy.speed_limit_mbps,
         device_limit: user.policy.device_limit,
         recorder: Some(tracker.clone()),
@@ -3179,7 +3179,7 @@ pub fn refresh_node_users(
 }
 
 /// Apply a small panel user delta directly to a live Shadowsocks AEAD2022
-/// table. Returns `false` when the resolved protocol has no indexed delta
+/// table. Returns `None` when the resolved protocol has no indexed delta
 /// path, allowing the caller to use the normal full-table refresh.
 pub fn refresh_node_user_delta(
     app_config: &AppConfig,
@@ -3189,7 +3189,7 @@ pub fn refresh_node_user_delta(
     removed: &[u64],
     tracker: Arc<TrafficTracker>,
     user_tables: &NodeUserTables,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<Vec<u64>>> {
     let lightweight_protocol = match node.node_type {
         NodeType::Shadowsocks | NodeType::Vmess => true,
         NodeType::V2Node => server
@@ -3200,24 +3200,24 @@ pub fn refresh_node_user_delta(
         _ => false,
     };
     if !lightweight_protocol {
-        return Ok(false);
+        return Ok(None);
     }
 
     let spec = normalize_node_without_users(app_config, node, server)?;
     if spec.node_type != NodeType::Shadowsocks {
-        return Ok(false);
+        return Ok(None);
     }
     let RuntimeProtocol::Shadowsocks { cipher, .. } = &spec.protocol else {
-        return Ok(false);
+        return Ok(None);
     };
     // Legacy Shadowsocks has no identity index, so replacing its table is the
     // only correct and bounded option. The production large-user path is
     // AEAD2022, where each delta row maps directly to one UID/hash entry.
     if shadowsocks_2022_key_len(cipher)?.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(shared) = user_tables.shadowsocks() else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let effective_updated = effective_delta_updates(updated, removed);
@@ -3233,18 +3233,18 @@ pub fn refresh_node_user_delta(
     // previously active, its delta must remove the old credential even when
     // the panel did not include the UID in `removed`.
     let effective_removed = effective_delta_removed(&effective_updated, removed, &additions);
-    let current = shared.load();
-    match current.validate_aead2022_delta(&additions, &effective_removed) {
+    match shared
+        .with_current(|current| current.validate_aead2022_delta(&additions, &effective_removed))
+    {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(None),
         Err(error) => return Err(error),
     }
-    drop(current);
 
     shared.update_with(|table| {
         table.apply_aead2022_delta_validated(additions, &effective_removed);
     });
-    Ok(true)
+    Ok(Some(effective_removed))
 }
 
 /// Match `merge_user_delta` semantics: duplicate update IDs use the last row,
@@ -3297,7 +3297,7 @@ fn server_users(
                 authenticated_user: AuthenticatedUser {
                     node_tag: node_tag.clone(),
                     uid: user.uid,
-                    user_key: user.user_key.clone(),
+                    user_key: Arc::from(user.user_key.as_str()),
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
@@ -3355,7 +3355,7 @@ fn naiveproxy_user_lookup(
                 Some(AuthenticatedUser {
                     node_tag: node_tag.clone(),
                     uid: user.uid,
-                    user_key: user.user_key.clone(),
+                    user_key: Arc::from(user.user_key.as_str()),
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
@@ -3404,7 +3404,7 @@ fn tuic_server_users(
                 Some(AuthenticatedUser {
                     node_tag: node_tag.clone(),
                     uid: user.uid,
-                    user_key: user.user_key.clone(),
+                    user_key: Arc::from(user.user_key.as_str()),
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),
@@ -3448,7 +3448,7 @@ fn hysteria2_server_users(
                 Some(AuthenticatedUser {
                     node_tag: node_tag.clone(),
                     uid: user.uid,
-                    user_key: user.user_key.clone(),
+                    user_key: Arc::from(user.user_key.as_str()),
                     speed_limit: user.policy.speed_limit_mbps,
                     device_limit: user.policy.device_limit,
                     recorder: Some(tracker.clone()),

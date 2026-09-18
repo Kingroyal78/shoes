@@ -48,6 +48,17 @@ impl<T> SharedUsers<T> {
         self.current.read().clone()
     }
 
+    /// Inspect the current table without cloning its owning `Arc`.
+    ///
+    /// Delta-capable protocols should prefer this for short lookups. A cloned
+    /// `Arc` racing with [`update_with`](Self::update_with) forces a full
+    /// copy-on-write clone of the table; a read guard instead makes the writer
+    /// wait for the lookup and then mutate the uniquely-owned table in place.
+    pub fn with_current<R>(&self, inspect: impl FnOnce(&T) -> R) -> R {
+        let current = self.current.read();
+        inspect(current.as_ref())
+    }
+
     /// Publish a new table. Connections already authenticated keep running
     /// against the credentials they were admitted with; the next lookup sees
     /// the new table.
@@ -192,6 +203,17 @@ mod tests {
 
         let after = users.load();
         assert_eq!(after.as_slice(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn guarded_lookup_does_not_add_an_arc_owner() {
+        let users = SharedUsers::new(vec![1_u32, 2]);
+        users.with_current(|current| {
+            assert_eq!(current.as_slice(), [1, 2]);
+            assert_eq!(Arc::strong_count(&users.current.read()), 1);
+        });
+        users.update_with(|current| current.push(3));
+        assert_eq!(users.load().as_slice(), [1, 2, 3]);
     }
 
     #[test]

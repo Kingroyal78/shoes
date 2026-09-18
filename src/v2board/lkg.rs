@@ -12,6 +12,22 @@ use super::plugin_api::{OpaqueEtag, PluginConfigCandidate};
 use super::types::{ServerConfig, UserInfo};
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 2;
+const JOURNAL_SCHEMA_VERSION: u8 = 1;
+const JOURNAL_COMPACT_BYTES: u64 = 8 * 1024 * 1024;
+const JOURNAL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserDeltaJournalRecord {
+    schema_version: u8,
+    node_id: u64,
+    node_type: String,
+    user_etag: Option<String>,
+    user_revision: u64,
+    updated: Vec<UserInfo>,
+    removed: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLkgSnapshot {
@@ -122,7 +138,9 @@ pub async fn load(
             // is later removed by hand, so retire it after validation rather
             // than merely after observing that the MPK path exists.
             retire_legacy_snapshot(legacy_path).await;
-            return Ok(Some(snapshot));
+            return replay_user_delta_journal(data_dir, node, snapshot)
+                .await
+                .map(Some);
         }
         Ok(None) => {}
         Err(current_error) if current_error.kind() == std::io::ErrorKind::InvalidData => {
@@ -249,6 +267,181 @@ pub async fn persist(
     .map_err(|error| std::io::Error::other(format!("LKG persist task failed: {error}")))?
 }
 
+/// Durably append a user-only delta. Returns `true` when the journal has grown
+/// large enough that the caller should compact it into a fresh base snapshot.
+pub async fn append_user_delta(
+    data_dir: &Path,
+    node: &V2BoardNodeConfig,
+    user_etag: Option<String>,
+    user_revision: u64,
+    updated: Vec<UserInfo>,
+    removed: Vec<u64>,
+) -> std::io::Result<bool> {
+    tokio::fs::create_dir_all(data_dir).await?;
+    let path = journal_path(data_dir, node);
+    let record = UserDeltaJournalRecord {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        node_id: node.node_id,
+        node_type: node.node_type.as_uniproxy().to_string(),
+        user_etag,
+        user_revision,
+        updated,
+        removed,
+    };
+    tokio::task::spawn_blocking(move || append_user_delta_blocking(&path, &record))
+        .await
+        .map_err(|error| std::io::Error::other(format!("LKG journal task failed: {error}")))?
+}
+
+async fn replay_user_delta_journal(
+    data_dir: &Path,
+    node: &V2BoardNodeConfig,
+    snapshot: NodeLkgSnapshot,
+) -> std::io::Result<NodeLkgSnapshot> {
+    let path = journal_path(data_dir, node);
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || replay_user_delta_journal_blocking(&path, &node, snapshot))
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("LKG journal replay task failed: {error}"))
+        })?
+}
+
+fn append_user_delta_blocking(
+    path: &Path,
+    record: &UserDeltaJournalRecord,
+) -> std::io::Result<bool> {
+    let payload = rmp_serde::to_vec_named(record)
+        .map_err(|error| invalid_data(format!("failed to encode LKG journal record: {error}")))?;
+    if payload.len() > JOURNAL_MAX_RECORD_BYTES || payload.len() > u32::MAX as usize {
+        return Err(invalid_data("LKG journal record is too large"));
+    }
+    let checksum = crc32fast::hash(&payload);
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let journal_existed = path.exists();
+    let mut file = options.open(path)?;
+    file.write_all(&(payload.len() as u32).to_le_bytes())?;
+    file.write_all(&payload)?;
+    file.write_all(&checksum.to_le_bytes())?;
+    file.sync_all()?;
+    if !journal_existed {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_data("LKG journal path has no parent"))?;
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(file.metadata()?.len() >= JOURNAL_COMPACT_BYTES)
+}
+
+fn replay_user_delta_journal_blocking(
+    path: &Path,
+    node: &V2BoardNodeConfig,
+    mut snapshot: NodeLkgSnapshot,
+) -> std::io::Result<NodeLkgSnapshot> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(snapshot),
+        Err(error) => return Err(error),
+    };
+    let mut offset = 0usize;
+    let mut users_sorted = snapshot
+        .users
+        .windows(2)
+        .all(|pair| pair[0].id <= pair[1].id);
+    while offset < bytes.len() {
+        let Some(length_bytes) = bytes.get(offset..offset.saturating_add(4)) else {
+            log::warn!("ignoring torn LKG journal length at byte {offset}");
+            break;
+        };
+        let length = u32::from_le_bytes(length_bytes.try_into().unwrap()) as usize;
+        if length > JOURNAL_MAX_RECORD_BYTES {
+            log::warn!("ignoring invalid LKG journal record length {length} at byte {offset}");
+            break;
+        }
+        let payload_start = offset + 4;
+        let payload_end = payload_start.saturating_add(length);
+        let checksum_end = payload_end.saturating_add(4);
+        let Some(payload) = bytes.get(payload_start..payload_end) else {
+            log::warn!("ignoring torn LKG journal payload at byte {offset}");
+            break;
+        };
+        let Some(checksum_bytes) = bytes.get(payload_end..checksum_end) else {
+            log::warn!("ignoring torn LKG journal checksum at byte {offset}");
+            break;
+        };
+        let expected = u32::from_le_bytes(checksum_bytes.try_into().unwrap());
+        if crc32fast::hash(payload) != expected {
+            log::warn!("ignoring corrupt LKG journal tail at byte {offset}");
+            break;
+        }
+        let record: UserDeltaJournalRecord = rmp_serde::from_slice(payload).map_err(|error| {
+            invalid_data(format!("failed to decode LKG journal record: {error}"))
+        })?;
+        validate_journal_record(&record, node)?;
+        offset = checksum_end;
+
+        if snapshot
+            .user_revision
+            .is_some_and(|revision| record.user_revision <= revision)
+        {
+            continue;
+        }
+        let users = Arc::make_mut(&mut snapshot.users);
+        if !users_sorted {
+            users.sort_unstable_by_key(|user| user.id);
+            users_sorted = true;
+        }
+        apply_user_delta(users, record.updated, record.removed);
+        snapshot.user_etag = record.user_etag;
+        snapshot.user_revision = Some(record.user_revision);
+    }
+    if offset < bytes.len() {
+        // Future records must not be appended behind an unreadable crash tail:
+        // replay would stop at the same tail forever and hide every newer
+        // durable update. Keep the valid prefix and make subsequent appends
+        // contiguous with it.
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(offset as u64)?;
+        file.sync_all()?;
+    }
+    Ok(snapshot)
+}
+
+fn validate_journal_record(
+    record: &UserDeltaJournalRecord,
+    node: &V2BoardNodeConfig,
+) -> std::io::Result<()> {
+    if record.schema_version != JOURNAL_SCHEMA_VERSION {
+        return Err(invalid_data("unsupported LKG journal schema"));
+    }
+    if record.node_id != node.node_id || record.node_type != node.node_type.as_uniproxy() {
+        return Err(invalid_data(
+            "LKG journal belongs to a different V2Board node",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_user_delta(users: &mut Vec<UserInfo>, updated: Vec<UserInfo>, removed: Vec<u64>) {
+    for user in updated {
+        match users.binary_search_by_key(&user.id, |existing| existing.id) {
+            Ok(index) => users[index] = user,
+            Err(index) => users.insert(index, user),
+        }
+    }
+    for uid in removed {
+        if let Ok(index) = users.binary_search_by_key(&uid, |existing| existing.id) {
+            users.remove(index);
+        }
+    }
+}
+
 fn load_blocking(
     path: &Path,
     node: &V2BoardNodeConfig,
@@ -315,6 +508,12 @@ fn persist_blocking(path: &Path, snapshot: &NodeLkgSnapshot) -> std::io::Result<
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
+        let journal = path.with_extension("journal");
+        match std::fs::remove_file(journal) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         File::open(parent)?.sync_all()
     })();
     if write_result.is_err() {
@@ -329,6 +528,10 @@ fn snapshot_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
         node.node_type.as_uniproxy(),
         node.node_id
     ))
+}
+
+fn journal_path(data_dir: &Path, node: &V2BoardNodeConfig) -> PathBuf {
+    snapshot_path(data_dir, node).with_extension("journal")
 }
 
 /// Where snapshots were written before the encoding changed.
@@ -772,5 +975,137 @@ mod tests {
         };
         assert_eq!(options.password.expose_secret(), "restls-secret");
         assert_eq!(restored_candidate.etag().as_str(), "\"plugin-etag\"");
+    }
+
+    #[tokio::test]
+    async fn user_delta_journal_replays_without_rewriting_the_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "delta".to_string(),
+            node_id: 31,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let user = |id, uuid: &str| {
+            serde_json::from_value::<UserInfo>(json!({"id": id, "uuid": uuid})).unwrap()
+        };
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            None,
+            Some("users-1".to_string()),
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 8443})).unwrap(),
+            vec![user(1, "old-1"), user(2, "old-2")],
+            None,
+        )
+        .unwrap()
+        .with_user_revision(Some(1));
+        persist(directory.path(), &node, snapshot).await.unwrap();
+        let base_len = std::fs::metadata(snapshot_path(directory.path(), &node))
+            .unwrap()
+            .len();
+
+        assert!(
+            !append_user_delta(
+                directory.path(),
+                &node,
+                Some("users-2".to_string()),
+                2,
+                vec![user(2, "new-2"), user(3, "new-3")],
+                vec![1],
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(snapshot_path(directory.path(), &node))
+                .unwrap()
+                .len(),
+            base_len
+        );
+
+        let restored = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(restored.user_revision, Some(2));
+        assert_eq!(restored.user_etag.as_deref(), Some("users-2"));
+        assert_eq!(
+            restored
+                .users
+                .iter()
+                .map(|user| (user.id, user.uuid.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(2, "new-2"), (3, "new-3")]
+        );
+
+        persist(directory.path(), &node, restored).await.unwrap();
+        assert!(
+            !journal_path(directory.path(), &node).exists(),
+            "publishing a compact base must retire the replayed journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_delta_journal_ignores_a_torn_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = V2BoardNodeConfig {
+            tag: "torn-delta".to_string(),
+            node_id: 32,
+            node_type: NodeType::Vless,
+            listen: None,
+            api_host: None,
+            api_key: None,
+            pull_interval_secs: None,
+            push_interval_secs: None,
+            tls: None,
+            trojan_fallback: None,
+            hysteria2_masquerade: None,
+        };
+        let snapshot = NodeLkgSnapshot::new(
+            &node,
+            None,
+            None,
+            serde_json::from_value::<ServerConfig>(json!({"server_port": 8443})).unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .with_user_revision(Some(1));
+        persist(directory.path(), &node, snapshot).await.unwrap();
+        append_user_delta(
+            directory.path(),
+            &node,
+            None,
+            2,
+            vec![serde_json::from_value(json!({"id": 7, "uuid": "user-7"})).unwrap()],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let valid_len = std::fs::metadata(journal_path(directory.path(), &node))
+            .unwrap()
+            .len();
+        OpenOptions::new()
+            .append(true)
+            .open(journal_path(directory.path(), &node))
+            .unwrap()
+            .write_all(&[9, 0])
+            .unwrap();
+
+        let restored = load(directory.path(), &node).await.unwrap().unwrap();
+        assert_eq!(restored.user_revision, Some(2));
+        assert_eq!(restored.users.len(), 1);
+        assert_eq!(restored.users[0].id, 7);
+        assert_eq!(
+            std::fs::metadata(journal_path(directory.path(), &node))
+                .unwrap()
+                .len(),
+            valid_len,
+            "replay must truncate the torn tail before future appends"
+        );
     }
 }

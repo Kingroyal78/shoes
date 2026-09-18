@@ -32,7 +32,7 @@ pub struct AuthenticatedUser {
     /// table plus one more for each of the several clones a connection makes.
     pub node_tag: Arc<str>,
     pub uid: u64,
-    pub user_key: String,
+    pub user_key: Arc<str>,
     pub speed_limit: Option<u64>,
     pub device_limit: Option<u64>,
     pub recorder: Option<Arc<dyn TrafficRecorder>>,

@@ -65,7 +65,7 @@ impl ShadowsocksKey for SnellKey {
 #[derive(Debug)]
 pub struct SnellServerHandler {
     cipher: ShadowsocksCipher,
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -79,10 +79,8 @@ impl SnellServerHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
-            password,
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(SnellKey::new(password, cipher.algorithm().key_len()));
         Self {
             cipher,
             key,
@@ -245,16 +243,14 @@ impl TcpServerHandler for SnellServerHandler {
 #[derive(Debug)]
 pub struct SnellClientHandler {
     cipher: ShadowsocksCipher,
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
     udp_enabled: bool,
 }
 
 impl SnellClientHandler {
     pub fn new(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
-            password,
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(SnellKey::new(password, cipher.algorithm().key_len()));
         Self {
             cipher,
             key,
@@ -458,10 +454,8 @@ mod tests {
     async fn udp_setup_preserves_first_packet_coalesced_with_header() {
         let (client_io, server_io) = duplex(8192);
         let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
-            "secretpass",
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(SnellKey::new("secretpass", cipher.algorithm().key_len()));
         let mut client_stream = ShadowsocksStream::new(
             Box::new(TestStream(client_io)),
             ShadowsocksStreamType::Aead,

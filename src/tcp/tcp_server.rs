@@ -1292,6 +1292,18 @@ pub(crate) fn reconcile_speed_limiters(
         .retain(|key, _| &*key.node_tag != node_tag || active_uids.contains(&key.uid));
 }
 
+/// Remove state for a small panel delta without scanning the process-global
+/// limiter map or allocating a set containing every active user.
+pub(crate) fn remove_speed_limiters(node_tag: &str, removed_uids: &[u64]) {
+    let node_tag: Arc<str> = Arc::from(node_tag);
+    for uid in removed_uids {
+        USER_SPEED_LIMITERS.remove(&UserSpeedLimitKey {
+            node_tag: node_tag.clone(),
+            uid: *uid,
+        });
+    }
+}
+
 #[cfg(test)]
 fn speed_limiter_map_len() -> usize {
     USER_SPEED_LIMITERS.len()
@@ -2923,7 +2935,7 @@ mod tests {
         Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid,
-            user_key: format!("user-{uid}"),
+            user_key: format!("user-{uid}").into(),
             speed_limit,
             device_limit: None,
             recorder: None,
@@ -2983,7 +2995,7 @@ mod tests {
         Some(AuthenticatedUser {
             node_tag: node_tag.into(),
             uid,
-            user_key: format!("user-{uid}"),
+            user_key: format!("user-{uid}").into(),
             speed_limit,
             device_limit: None,
             recorder: None,
@@ -2998,7 +3010,7 @@ mod tests {
         Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid,
-            user_key: format!("user-{uid}"),
+            user_key: format!("user-{uid}").into(),
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder),
@@ -3149,7 +3161,7 @@ mod tests {
         Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid,
-            user_key: format!("user-{uid}"),
+            user_key: format!("user-{uid}").into(),
             speed_limit: None,
             device_limit: None,
             recorder: None,
@@ -3501,6 +3513,22 @@ mod tests {
         assert_eq!(speed_limiter_map_len_for(node_tag), 0);
     }
 
+    #[test]
+    fn delta_removes_only_named_speed_limiters() {
+        let node_tag = "delta-remove-limiter-node";
+        for uid in [7101, 7102] {
+            assert!(
+                speed_limiter_for(&authenticated_user_with_tag(node_tag, uid, Some(2))).is_some()
+            );
+        }
+
+        remove_speed_limiters(node_tag, &[7102]);
+
+        assert!(speed_limiter_map_contains(node_tag, 7101));
+        assert!(!speed_limiter_map_contains(node_tag, 7102));
+        remove_speed_limiters(node_tag, &[7101]);
+    }
+
     #[tokio::test]
     async fn speed_limited_stream_read_advances_caller_buffer() {
         let payload = b"GET /fast.bin HTTP/1.1\r\n\r\n".to_vec();
@@ -3570,7 +3598,7 @@ mod tests {
         let user = Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid: 1003,
-            user_key: "user-1003".to_string(),
+            user_key: "user-1003".into(),
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder.clone()),
@@ -3595,7 +3623,7 @@ mod tests {
         let user = Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid: 1004,
-            user_key: "user-1004".to_string(),
+            user_key: "user-1004".into(),
             speed_limit: None,
             device_limit: None,
             recorder: Some(recorder.clone()),
@@ -3709,7 +3737,7 @@ mod tests {
         let authenticated_user = Some(AuthenticatedUser {
             node_tag: "node-a".into(),
             uid: 1004,
-            user_key: "user-1004".to_string(),
+            user_key: "user-1004".into(),
             speed_limit: None,
             device_limit: Some(1),
             recorder: Some(recorder.clone()),

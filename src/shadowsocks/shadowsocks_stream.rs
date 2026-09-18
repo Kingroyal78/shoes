@@ -214,7 +214,7 @@ pub struct ShadowsocksStream {
     stream_type: ShadowsocksStreamType,
     algorithm: ShadowsocksAeadAlgorithm,
     salt_len: usize,
-    key: Arc<Box<dyn ShadowsocksKey>>,
+    key: Arc<dyn ShadowsocksKey>,
     salt_checker: Option<Arc<dyn SaltChecker>>,
     encrypt_iv: Box<[u8]>,
     decrypt_iv: Option<Box<[u8]>>,
@@ -295,7 +295,7 @@ impl ShadowsocksStream {
         stream_type: ShadowsocksStreamType,
         algorithm: ShadowsocksAeadAlgorithm,
         salt_len: usize,
-        key: Arc<Box<dyn ShadowsocksKey>>,
+        key: Arc<dyn ShadowsocksKey>,
         salt_checker: Option<Arc<dyn SaltChecker>>,
     ) -> Self {
         // The buffers grow on demand up to a full packet. Reserving the
@@ -1407,8 +1407,8 @@ mod tests {
 
     fn test_stream(stream_type: ShadowsocksStreamType) -> ShadowsocksStream {
         let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
-        let key: Arc<Box<dyn ShadowsocksKey>> =
-            Arc::new(Box::new(DefaultKey::new("test-password", cipher.key_len())));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(DefaultKey::new("test-password", cipher.key_len()));
         ShadowsocksStream::new(
             Box::new(SinkStream),
             stream_type,
@@ -1424,8 +1424,8 @@ mod tests {
         inner: Box<dyn AsyncStream>,
     ) -> ShadowsocksStream {
         let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
-        let key: Arc<Box<dyn ShadowsocksKey>> =
-            Arc::new(Box::new(DefaultKey::new("test-password", cipher.key_len())));
+        let key: Arc<dyn ShadowsocksKey> =
+            Arc::new(DefaultKey::new("test-password", cipher.key_len()));
         ShadowsocksStream::new(
             inner,
             stream_type,
