@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -298,8 +298,15 @@ fn persist_blocking(path: &Path, snapshot: &NodeLkgSnapshot) -> std::io::Result<
     }
     let mut file = options.open(&temporary)?;
     let write_result = (|| {
-        rmp_serde::encode::write_named(&mut file, snapshot)
-            .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
+        // MessagePack emits many tiny writes (one per scalar/field). Keep the
+        // atomic tmp+rename and fsync semantics, but coalesce those writes so
+        // a large user snapshot does not turn into millions of syscalls.
+        {
+            let mut writer = std::io::BufWriter::with_capacity(1 << 20, &mut file);
+            rmp_serde::encode::write_named(&mut writer, snapshot)
+                .map_err(|error| invalid_data(format!("failed to encode LKG snapshot: {error}")))?;
+            writer.flush()?;
+        }
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)?;

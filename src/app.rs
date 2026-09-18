@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
-use tokio::time::{Interval, interval};
+use tokio::time::{Interval, MissedTickBehavior, interval};
 
 use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
 use crate::resolver::{CachingNativeResolver, Resolver};
@@ -1086,7 +1086,12 @@ fn plugin_io_error(error: impl std::fmt::Display) -> std::io::Error {
 }
 
 fn controller_interval(secs: u64) -> Interval {
-    interval(Duration::from_secs(secs.max(1)))
+    let mut timer = interval(Duration::from_secs(secs.max(1)));
+    // A delayed sync must not run a burst of catch-up iterations.  Each sync
+    // can fetch and apply a full panel snapshot, so replaying missed ticks can
+    // amplify both allocations and LKG persistence after a short stall.
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    timer
 }
 
 type NodeRuntime = RuntimeGraphSlot;
