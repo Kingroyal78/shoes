@@ -81,7 +81,7 @@ use crate::v2board::runtime_model::{
     normalize_node_without_users,
 };
 use crate::v2board::tracker::TrafficTracker;
-use crate::v2board::user_tables::NodeUserTables;
+use crate::v2board::user_tables::{NodeUserTables, NodeUserTablesTxn, UserTableSink};
 use crate::v2board::xhttp::XHttpServerHandler;
 use crate::vless::vless_server_handler::{VlessTcpServerHandler, VlessUsers};
 use crate::vmess::{VmessTcpServerHandler, VmessUsers};
@@ -496,6 +496,44 @@ pub fn map_node(
     resolver: Arc<dyn Resolver>,
     user_tables: &NodeUserTables,
 ) -> std::io::Result<RuntimeNode> {
+    let prepared = prepare_node(
+        app_config,
+        node,
+        server,
+        users,
+        tracker,
+        resolver,
+        user_tables,
+    )?;
+    let (runtime_node, user_tables) = prepared.into_parts();
+    user_tables.commit();
+    Ok(runtime_node)
+}
+
+/// A runtime node whose user table publication is deferred until the caller
+/// has successfully health-gated the containing runtime graph.
+pub struct PreparedRuntime {
+    runtime_node: RuntimeNode,
+    user_tables: NodeUserTablesTxn,
+}
+
+impl PreparedRuntime {
+    /// Split the candidate so the runtime graph can be started first. Drop the
+    /// transaction on any start failure; no live table is changed.
+    pub fn into_parts(self) -> (RuntimeNode, NodeUserTablesTxn) {
+        (self.runtime_node, self.user_tables)
+    }
+}
+
+pub fn prepare_node(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    resolver: Arc<dyn Resolver>,
+    user_tables: &NodeUserTables,
+) -> std::io::Result<PreparedRuntime> {
     if app_config.runtime.tcp_fast_open {
         return invalid(
             "runtime.tcp_fast_open is not supported by the V2Board runtime; set it to false",
@@ -504,14 +542,19 @@ pub fn map_node(
     let spec = normalize_node(app_config, node, server, users)?;
     let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
     report_egress_routing_override(&node.tag, &spec, outbound_dispatcher.is_some());
-    build_runtime_node(
+    let transaction = user_tables.transaction();
+    let runtime_node = build_runtime_node(
         spec,
         tracker,
         resolver,
         app_config.runtime.max_legacy_shadowsocks_users,
         outbound_dispatcher,
-        user_tables,
-    )
+        &transaction,
+    )?;
+    Ok(PreparedRuntime {
+        runtime_node,
+        user_tables: transaction,
+    })
 }
 
 /// Builds the complete raw-SS plus public-plugin listener set for one manifest.
@@ -529,6 +572,45 @@ pub fn map_shadowsocks_plugin_nodes(
     resolver: Arc<dyn Resolver>,
     user_tables: &NodeUserTables,
 ) -> std::io::Result<Vec<RuntimeNode>> {
+    let prepared = prepare_shadowsocks_plugin_nodes(
+        app_config,
+        node,
+        server,
+        users,
+        manifest,
+        tracker,
+        resolver,
+        user_tables,
+    )?;
+    let (nodes, user_tables) = prepared.into_parts();
+    user_tables.commit();
+    Ok(nodes)
+}
+
+/// Builds a plugin runtime candidate while deferring publication of all user
+/// tables until the caller has successfully started the graph.
+pub struct PreparedRuntimeGraph {
+    nodes: Vec<RuntimeNode>,
+    user_tables: NodeUserTablesTxn,
+}
+
+impl PreparedRuntimeGraph {
+    pub fn into_parts(self) -> (Vec<RuntimeNode>, NodeUserTablesTxn) {
+        (self.nodes, self.user_tables)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_shadowsocks_plugin_nodes(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+    users: &[UserInfo],
+    manifest: &PluginRuntimeManifest,
+    tracker: Arc<TrafficTracker>,
+    resolver: Arc<dyn Resolver>,
+    user_tables: &NodeUserTables,
+) -> std::io::Result<PreparedRuntimeGraph> {
     if node.node_type != NodeType::Shadowsocks {
         return invalid("plugin runtime can only be built for a Shadowsocks node");
     }
@@ -564,6 +646,7 @@ pub fn map_shadowsocks_plugin_nodes(
     }
     let outbound_dispatcher = build_outbound_dispatcher(app_config, &node.tag, &resolver)?;
     report_egress_routing_override(&node.tag, &spec, outbound_dispatcher.is_some());
+    let transaction = user_tables.transaction();
     let raw_public = build_runtime_node_with_shadowsocks_mux(
         spec,
         tracker,
@@ -571,10 +654,13 @@ pub fn map_shadowsocks_plugin_nodes(
         app_config.runtime.max_legacy_shadowsocks_users,
         multiplex.map(|mux| mux.padding),
         outbound_dispatcher,
-        user_tables,
+        &transaction,
     )?;
     let Some(plugin) = manifest.plugin.as_ref() else {
-        return Ok(vec![raw_public]);
+        return Ok(PreparedRuntimeGraph {
+            nodes: vec![raw_public],
+            user_tables: transaction,
+        });
     };
     let (raw_handler, tcp_config) = raw_public.tcp_parts()?;
     let raw_loopback = RuntimeNode::new_tcp(
@@ -598,7 +684,10 @@ pub fn map_shadowsocks_plugin_nodes(
             RuntimeNode::new_tcp(node.tag.clone(), public_bind, edge_handler, tcp_config)
         }
     };
-    Ok(vec![raw_loopback, public_edge])
+    Ok(PreparedRuntimeGraph {
+        nodes: vec![raw_loopback, public_edge],
+        user_tables: transaction,
+    })
 }
 
 fn build_shadowsocks_plugin_handler(
@@ -1082,7 +1171,7 @@ fn build_runtime_node(
     resolver: Arc<dyn Resolver>,
     max_legacy_shadowsocks_users: usize,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<RuntimeNode> {
     build_runtime_node_with_shadowsocks_mux(
         spec,
@@ -1102,7 +1191,7 @@ fn build_runtime_node_with_shadowsocks_mux(
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let proxy_selector = Arc::new(build_v2board_proxy_selector(&spec, resolver.clone())?);
@@ -1178,7 +1267,7 @@ fn build_tuic_runtime_node(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (zero_rtt_handshake, congestion_control, udp_relay_mode, disable_sni) = match &spec.protocol
@@ -1266,7 +1355,7 @@ fn build_hysteria2_runtime_node(
     tracker: Arc<TrafficTracker>,
     proxy_selector: Arc<ClientProxySelector>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let (up_mbps, down_mbps, ignore_client_bandwidth, obfs, obfs_password, masquerade) =
@@ -1359,7 +1448,7 @@ fn build_naiveproxy_runtime_node(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<RuntimeNode> {
     let bind_location = bind_location(&spec)?;
     let quic_congestion_control = match &spec.protocol {
@@ -2095,7 +2184,7 @@ fn build_security_handler(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     match &spec.security {
         RuntimeSecurity::None => {
@@ -2147,7 +2236,7 @@ fn secured_inner_protocol(
     inner: Arc<dyn TcpServerHandler>,
     tracker: Arc<TrafficTracker>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<InnerProtocol> {
     if vless_vision_flow(spec).is_some() {
         return Ok(InnerProtocol::VisionVless(VisionVlessConfig {
@@ -2489,7 +2578,7 @@ fn build_protocol_handler(
     max_legacy_shadowsocks_users: usize,
     shadowsocks_mux_padding: Option<bool>,
     outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<Arc<dyn TcpServerHandler>> {
     let server_users = server_users(spec, tracker.clone())?;
 
@@ -2989,6 +3078,164 @@ fn raw_server_users(
     Ok(result)
 }
 
+fn raw_vless_users(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+) -> std::io::Result<VlessUsers> {
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    let mut result = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, spec.node_type, users, |user| {
+        parse_vless_user_id(spec, &user)?;
+        let credential = user.credential.clone();
+        result.push(ServerUser {
+            credential,
+            authenticated_user: authenticated_user_from_runtime(&node_tag, user, &tracker),
+        });
+        Ok(())
+    })?;
+    VlessUsers::new(result)
+}
+
+fn raw_naiveproxy_user_lookup(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    user_tables: &dyn UserTableSink,
+) -> std::io::Result<Arc<SharedUsers<UserLookup>>> {
+    let mut seen = HashMap::with_capacity(users.len());
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    let mut result = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, spec.node_type, users, |user| {
+        let username = user
+            .username
+            .clone()
+            .unwrap_or_else(|| format!("user-{}", user.uid));
+        if username.trim().is_empty() {
+            return invalid(format!(
+                "node `{}` naiveproxy user {} has empty username",
+                spec.tag, user.uid
+            ));
+        }
+        let password = user
+            .password
+            .clone()
+            .unwrap_or_else(|| user.credential.clone());
+        if password.trim().is_empty() {
+            return invalid(format!(
+                "node `{}` naiveproxy user {} has empty password",
+                spec.tag, user.uid
+            ));
+        }
+        let key = format!("{username}\0{password}");
+        if let Some(previous) = seen.insert(key, user.uid) {
+            return invalid(format!(
+                "node `{}` naiveproxy user {} username/password duplicates user {} credentials",
+                spec.tag, user.uid, previous
+            ));
+        }
+        result.push((
+            format!("user-{}", user.uid),
+            username,
+            password,
+            Some(AuthenticatedUser {
+                node_tag: node_tag.clone(),
+                uid: user.uid,
+                user_key: Arc::from(user.user_key),
+                speed_limit: user.policy.speed_limit_mbps,
+                device_limit: user.policy.device_limit,
+                recorder: Some(tracker.clone()),
+                dedicated_ip: None,
+            }),
+        ));
+        Ok(())
+    })?;
+    Ok(user_tables.publish_naiveproxy(UserLookup::new_with_authenticated_users(result)))
+}
+
+fn raw_tuic_server_users(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    user_tables: &dyn UserTableSink,
+) -> std::io::Result<TuicServerUsers> {
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    let mut seen = HashMap::with_capacity(users.len());
+    let mut result = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, spec.node_type, users, |user| {
+        if let Some(previous) = seen.insert(user.credential.clone(), user.uid) {
+            return invalid(format!(
+                "node `{}` tuic user {} credential duplicates user {} credential",
+                spec.tag, user.uid, previous
+            ));
+        }
+        let uuid = crate::uuid_util::parse_uuid(&user.credential).map_err(|e| {
+            invalid_error(format!(
+                "node `{}` user {} has invalid TUIC uuid `{}`: {e}",
+                spec.tag, user.uid, user.credential
+            ))
+        })?;
+        let uuid: [u8; 16] = uuid.try_into().map_err(|_| {
+            invalid_error(format!(
+                "node `{}` user {} has invalid TUIC uuid length",
+                spec.tag, user.uid
+            ))
+        })?;
+        result.push(TuicServerUser::new(
+            uuid,
+            user.credential.clone(),
+            Some(authenticated_user_from_runtime(&node_tag, user, &tracker)),
+        ));
+        Ok(())
+    })?;
+    let table = TuicUserTable::new(result).map_err(|e| {
+        invalid_error(format!(
+            "node `{}` failed to build TUIC users: {e}",
+            spec.tag
+        ))
+    })?;
+    Ok(TuicServerUsers::from_shared(
+        user_tables.publish_tuic(table),
+    ))
+}
+
+fn raw_hysteria2_server_users(
+    spec: &RuntimeNodeSpec,
+    node: &V2BoardNodeConfig,
+    users: &[UserInfo],
+    tracker: Arc<TrafficTracker>,
+    user_tables: &dyn UserTableSink,
+) -> std::io::Result<Hysteria2ServerUsers> {
+    let node_tag: Arc<str> = Arc::from(spec.tag.as_str());
+    let mut seen = HashMap::with_capacity(users.len());
+    let mut result = Vec::with_capacity(users.len());
+    for_each_runtime_user(node, spec.node_type, users, |user| {
+        if let Some(previous) = seen.insert(user.credential.clone(), user.uid) {
+            return invalid(format!(
+                "node `{}` hysteria2 user {} credential duplicates user {} credential",
+                spec.tag, user.uid, previous
+            ));
+        }
+        result.push(Hysteria2ServerUser::new(
+            user.credential.clone(),
+            Some(authenticated_user_from_runtime(&node_tag, user, &tracker)),
+        ));
+        Ok(())
+    })?;
+    let table = Hysteria2UserTable::new(result).map_err(|e| {
+        invalid_error(format!(
+            "node `{}` failed to build hysteria2 users: {e}",
+            spec.tag
+        ))
+    })?;
+    Ok(Hysteria2ServerUsers::from_shared(
+        user_tables.publish_hysteria2(table),
+    ))
+}
+
 fn build_shadowsocks_users_from_raw(
     spec: &RuntimeNodeSpec,
     node: &V2BoardNodeConfig,
@@ -3097,13 +3344,12 @@ pub fn refresh_node_users(
     server: &ServerConfig,
     users: &[UserInfo],
     tracker: Arc<TrafficTracker>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<bool> {
-    // Shadowsocks and VMess are the most common large-user-list nodes.  Their
-    // hot-refresh tables only need protocol credentials, so avoid first
-    // materializing `RuntimeNodeSpec.users` (a second full user vector).  The
-    // remaining protocols retain the established full normalization path until
-    // their protocol-specific builders can be converted with the same care.
+    // Every hot-refresh table only needs immutable node settings plus the
+    // incoming panel rows. Keep the settings normalization separate so no
+    // temporary `RuntimeNodeSpec.users` vector is materialized before the
+    // protocol table is built.
     let lightweight_protocol = match node.node_type {
         NodeType::Shadowsocks | NodeType::Vmess => true,
         NodeType::V2Node => server
@@ -3136,42 +3382,48 @@ pub fn refresh_node_users(
         return Ok(true);
     }
 
-    let spec = normalize_node(app_config, node, server, users)?;
+    let spec = normalize_node_without_users(app_config, node, server)?;
     // Use the resolved runtime protocol, not the panel's wrapper type.  A
     // V2Node is only a transport envelope; rebuilding its generation for
     // every user change pins the previous table behind live connections even
     // though the concrete protocol has a hot-swappable user slot.
     match spec.node_type {
         NodeType::Shadowsocks => {
-            let table = build_shadowsocks_users(
+            let table = build_shadowsocks_users_from_raw(
                 &spec,
+                node,
+                users,
                 tracker,
                 app_config.runtime.max_legacy_shadowsocks_users,
             )?;
             user_tables.publish_shadowsocks(table);
         }
         NodeType::Vless => {
-            // The Vision and plain VLESS listeners share one table.
-            user_tables.publish_vless(vless_vision_users(&spec, tracker)?);
+            user_tables.publish_vless(raw_vless_users(&spec, node, users, tracker)?);
         }
         NodeType::Vmess => {
-            user_tables.publish_vmess(VmessUsers::new(server_users(&spec, tracker)?));
+            user_tables.publish_vmess(VmessUsers::new(raw_server_users(
+                &spec, node, users, tracker, false, None,
+            )?));
         }
         NodeType::Trojan => {
-            user_tables.publish_trojan(TrojanUsers::new(server_users(&spec, tracker)?));
+            user_tables.publish_trojan(TrojanUsers::new(raw_server_users(
+                &spec, node, users, tracker, false, None,
+            )?));
         }
         NodeType::Anytls => {
-            validate_duplicate_credentials(&spec, "anytls")?;
-            user_tables.publish_anytls(AnyTlsUsers::new(server_users(&spec, tracker)?));
+            user_tables.publish_anytls(AnyTlsUsers::new(raw_server_users(
+                &spec, node, users, tracker, true, None,
+            )?));
         }
         NodeType::Tuic => {
-            tuic_server_users(&spec, tracker, user_tables)?;
+            raw_tuic_server_users(&spec, node, users, tracker, user_tables)?;
         }
         NodeType::Hysteria => {
-            hysteria2_server_users(&spec, tracker, user_tables)?;
+            raw_hysteria2_server_users(&spec, node, users, tracker, user_tables)?;
         }
         NodeType::Naiveproxy => {
-            naiveproxy_user_lookup(&spec, tracker, user_tables)?;
+            raw_naiveproxy_user_lookup(&spec, node, users, tracker, user_tables)?;
         }
         NodeType::V2Node => unreachable!("normalize_node resolves V2Node before refresh"),
     }
@@ -3311,7 +3563,7 @@ fn server_users(
 fn naiveproxy_user_lookup(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<Arc<SharedUsers<UserLookup>>> {
     let mut seen = HashMap::with_capacity(spec.users.len());
     // One allocation for the node, shared by every user and by every
@@ -3376,7 +3628,7 @@ fn naiveproxy_user_lookup(
 fn tuic_server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<TuicServerUsers> {
     validate_duplicate_credentials(spec, "tuic")?;
     // One allocation for the node, shared by every user and by every
@@ -3433,7 +3685,7 @@ fn tuic_server_users(
 fn hysteria2_server_users(
     spec: &RuntimeNodeSpec,
     tracker: Arc<TrafficTracker>,
-    user_tables: &NodeUserTables,
+    user_tables: &dyn UserTableSink,
 ) -> std::io::Result<Hysteria2ServerUsers> {
     validate_duplicate_credentials(spec, "hysteria2")?;
     // One allocation for the node, shared by every user and by every
@@ -3993,6 +4245,41 @@ mod tests {
         let after = tables.shadowsocks().expect("still published");
         assert!(Arc::ptr_eq(&published, &after));
         assert_eq!(published.load().len(), 1);
+    }
+
+    #[test]
+    fn deferred_runtime_build_does_not_leak_candidate_users_on_abort() {
+        let tables = NodeUserTables::new();
+        let initial =
+            shadowsocks_spec("aes-128-gcm", None, vec![runtime_user(1, "user-one", None)]);
+        let _listener =
+            build_runtime_node(initial, test_tracker(), test_resolver(), 10, None, &tables)
+                .expect("initial listener builds");
+        let published = tables.shadowsocks().expect("initial table published");
+
+        let candidate_spec =
+            shadowsocks_spec("aes-128-gcm", None, vec![runtime_user(2, "user-two", None)]);
+        let transaction = tables.transaction();
+        let _candidate = build_runtime_node(
+            candidate_spec,
+            test_tracker(),
+            test_resolver(),
+            10,
+            None,
+            &transaction,
+        )
+        .expect("candidate listener builds");
+
+        assert!(published.load().contains_uid(1));
+        assert!(!published.load().contains_uid(2));
+        transaction.abort();
+        assert!(
+            tables
+                .shadowsocks()
+                .is_some_and(|current| Arc::ptr_eq(&current, &published))
+        );
+        assert!(published.load().contains_uid(1));
+        assert!(!published.load().contains_uid(2));
     }
 
     #[test]

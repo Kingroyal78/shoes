@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -26,15 +27,15 @@ const FLUSH_THROTTLE_MILLIS: u64 = 2000;
 /// independent along. A power of two so the shard is a mask, not a division.
 const SHARD_COUNT: usize = 32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrafficTracker {
-    snapshot_path: PathBuf,
-    shards: Box<[Mutex<TrackerState>]>,
+    snapshot_path: Arc<PathBuf>,
+    shards: Arc<[Mutex<TrackerState>]>,
     /// Millis (unix) of the last synchronous close-flush, for throttling.
-    last_flush: AtomicU64,
+    last_flush: Arc<AtomicU64>,
     /// Test-only count of synchronous persists.
     #[cfg(test)]
-    flush_count: std::sync::atomic::AtomicUsize,
+    flush_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,21 @@ struct TrackerState {
 struct TrafficCounter {
     upload: u64,
     download: u64,
+}
+
+/// An owned, compact copy of the traffic state used while writing the
+/// restart snapshot.  The live state is sharded for concurrent updates, while
+/// the on-disk format is grouped by node.  Keeping the copy in vectors avoids
+/// rebuilding a second set of HashMaps just for serialization.
+#[derive(Debug)]
+struct TrafficSnapshot {
+    nodes: Vec<TrafficNodeSnapshot>,
+}
+
+#[derive(Debug)]
+struct TrafficNodeSnapshot {
+    node_tag: String,
+    users: Vec<(u64, TrafficCounter)>,
 }
 
 /// Borrow a node's map, creating it only when the node is genuinely new.
@@ -136,13 +152,15 @@ impl TrafficTracker {
 
     fn empty(snapshot_path: PathBuf) -> Self {
         Self {
-            snapshot_path,
-            shards: (0..SHARD_COUNT)
-                .map(|_| Mutex::new(TrackerState::default()))
-                .collect(),
-            last_flush: AtomicU64::new(0),
+            snapshot_path: Arc::new(snapshot_path),
+            shards: Arc::from(
+                (0..SHARD_COUNT)
+                    .map(|_| Mutex::new(TrackerState::default()))
+                    .collect::<Box<[_]>>(),
+            ),
+            last_flush: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
-            flush_count: std::sync::atomic::AtomicUsize::new(0),
+            flush_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -153,7 +171,7 @@ impl TrafficTracker {
 
     pub fn snapshot_traffic(&self, node_tag: &str, min_traffic: u64) -> TrafficPayload {
         let mut payload = TrafficPayload::default();
-        for shard in &self.shards {
+        for shard in self.shards.iter() {
             let mut state = shard.lock();
             let Some(node) = state.traffic.get_mut(node_tag) else {
                 continue;
@@ -195,7 +213,7 @@ impl TrafficTracker {
 
     pub fn snapshot_alive(&self, node_tag: &str, node_id: u64, min_traffic: u64) -> AliveSnapshot {
         let mut collected = Vec::new();
-        for shard in &self.shards {
+        for shard in self.shards.iter() {
             let state = shard.lock();
             let Some(node) = state.alive.get(node_tag) else {
                 continue;
@@ -283,7 +301,7 @@ impl TrafficTracker {
     /// accumulate in memory and in `traffic-pending.json` forever. Users still
     /// in the list are untouched, so pending sub-minimum traffic is preserved.
     pub fn reconcile_users(&self, node_tag: &str, active_uids: &std::collections::HashSet<u64>) {
-        for shard in &self.shards {
+        for shard in self.shards.iter() {
             let mut state = shard.lock();
             let mut removed_traffic = false;
             if let Some(node) = state.traffic.get_mut(node_tag) {
@@ -335,63 +353,98 @@ impl TrafficTracker {
     }
 
     pub async fn persist(&self) -> std::io::Result<()> {
-        let bytes = self.snapshot_bytes()?;
-        persist_atomic(&self.snapshot_path, &bytes).await
+        let tracker = self.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        let bytes = tokio::task::spawn_blocking(move || tracker.snapshot_bytes())
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("traffic snapshot task failed: {error}"))
+            })??;
+        persist_atomic(snapshot_path.as_ref(), &bytes).await
     }
 
-    fn snapshot_bytes(&self) -> std::io::Result<Vec<u8>> {
-        // Keep the file's historical `{traffic: {node: {uid: counter}}}`
-        // shape, but serialize one node at a time.  The old implementation
-        // first merged every shard into a second full HashMap and only then
-        // encoded it, so a push briefly held the live shard maps, the merged
-        // maps, and the JSON buffer together.
+    /// Copy the traffic counters while all shard guards are held, then release
+    /// every guard before sorting or encoding.  Taking all guards in shard
+    /// order preserves the old snapshot cut: no traffic operation can clear or
+    /// add a counter halfway through the copy.  Only the cheap owned copy is
+    /// inside the critical section; JSON encoding no longer blocks data-plane
+    /// updates across all 32 shards.
+    fn capture_traffic_snapshot(&self) -> TrafficSnapshot {
         let guards = self
             .shards
             .iter()
             .map(|shard| shard.lock())
             .collect::<Vec<_>>();
-        let mut node_tags = guards
-            .iter()
-            .flat_map(|state| state.traffic.keys().cloned())
-            .collect::<Vec<_>>();
-        node_tags.sort_unstable();
-        node_tags.dedup();
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(br#"{"traffic":{"#);
-        for (node_index, node_tag) in node_tags.iter().enumerate() {
-            if node_index > 0 {
-                bytes.push(b',');
-            }
-            serde_json::to_writer(&mut bytes, node_tag)
-                .map_err(|e| std::io::Error::other(format!("encode traffic node: {e}")))?;
-            bytes.push(b':');
-            bytes.push(b'{');
-            let mut user_index = 0usize;
-            for state in &guards {
-                let Some(users) = state.traffic.get(node_tag) else {
-                    continue;
-                };
-                for (uid, counter) in users {
-                    if user_index > 0 {
-                        bytes.push(b',');
-                    }
-                    user_index += 1;
-                    // JSON object keys are strings even though the logical
-                    // user id is numeric.
-                    serde_json::to_writer(&mut bytes, &uid.to_string())
-                        .map_err(|e| std::io::Error::other(format!("encode traffic user: {e}")))?;
-                    bytes.push(b':');
-                    serde_json::to_writer(&mut bytes, counter).map_err(|e| {
-                        std::io::Error::other(format!("encode traffic counter: {e}"))
-                    })?;
+        let mut nodes = Vec::new();
+        for state in &guards {
+            nodes.extend(state.traffic.iter().map(|(node_tag, users)| {
+                TrafficNodeSnapshot {
+                    node_tag: node_tag.clone(),
+                    users: users
+                        .iter()
+                        .map(|(uid, counter)| (*uid, *counter))
+                        .collect(),
                 }
-            }
-            bytes.push(b'}');
+            }));
         }
-        bytes.extend_from_slice(b"}}");
-        Ok(bytes)
+        drop(guards);
+
+        // `sort_by` is stable, so users from equal node tags remain in shard
+        // order, matching the old serializer's traversal order.
+        nodes.sort_by(|left, right| left.node_tag.cmp(&right.node_tag));
+
+        TrafficSnapshot { nodes }
     }
+
+    fn snapshot_bytes(&self) -> std::io::Result<Vec<u8>> {
+        let snapshot = self.capture_traffic_snapshot();
+        encode_traffic_snapshot(&snapshot)
+    }
+}
+
+/// Encode the historical `{traffic: {node: {uid: counter}}}` shape without
+/// borrowing any live tracker locks.  A node can have one vector per shard;
+/// these adjacent entries are grouped into one JSON object on output.
+fn encode_traffic_snapshot(snapshot: &TrafficSnapshot) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(br#"{"traffic":{"#);
+
+    let mut node_index = 0usize;
+    while node_index < snapshot.nodes.len() {
+        if node_index > 0 {
+            bytes.push(b',');
+        }
+
+        let node_tag = snapshot.nodes[node_index].node_tag.as_str();
+        serde_json::to_writer(&mut bytes, node_tag)
+            .map_err(|e| std::io::Error::other(format!("encode traffic node: {e}")))?;
+        bytes.push(b':');
+        bytes.push(b'{');
+
+        let mut user_index = 0usize;
+        while node_index < snapshot.nodes.len() && snapshot.nodes[node_index].node_tag == node_tag {
+            let node = &snapshot.nodes[node_index];
+            for (uid, counter) in &node.users {
+                if user_index > 0 {
+                    bytes.push(b',');
+                }
+                user_index += 1;
+                // JSON object keys are strings even though the logical user id
+                // is numeric.
+                serde_json::to_writer(&mut bytes, &uid.to_string())
+                    .map_err(|e| std::io::Error::other(format!("encode traffic user: {e}")))?;
+                bytes.push(b':');
+                serde_json::to_writer(&mut bytes, counter)
+                    .map_err(|e| std::io::Error::other(format!("encode traffic counter: {e}")))?;
+            }
+            node_index += 1;
+        }
+        bytes.push(b'}');
+    }
+
+    bytes.extend_from_slice(b"}}");
+    Ok(bytes)
 }
 
 /// Atomically writes `bytes` to `path` via a temporary file + rename, so a
@@ -491,24 +544,26 @@ impl TrafficRecorder for TrafficTracker {
         #[cfg(test)]
         self.flush_count.fetch_add(1, Ordering::SeqCst);
 
-        let bytes = match self.snapshot_bytes() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::warn!("failed to encode pending V2Board traffic: {e}");
-                return;
-            }
-        };
+        let tracker = self.clone();
         let path = self.snapshot_path.clone();
         let write = move || {
-            if let Err(e) = persist_atomic_blocking(&path, &bytes) {
+            let bytes = match tracker.snapshot_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!("failed to encode pending V2Board traffic: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = persist_atomic_blocking(path.as_ref(), &bytes) {
                 log::warn!("failed to persist pending V2Board traffic after connection flush: {e}");
             }
         };
 
-        // This is reached from a connection's teardown, on a runtime worker. A
-        // synchronous write there stalls every other connection that worker is
-        // driving for as long as the filesystem takes. Nothing waits on it: the
-        // push loop persists unconditionally each cycle, so this copy only
+        // This is reached from a connection's teardown, on a runtime worker.
+        // Both snapshot copying/encoding and the synchronous rename are handed
+        // to the blocking pool, so neither the data-plane worker nor its shard
+        // locks are held during JSON encoding or file I/O. Nothing waits on it:
+        // the push loop persists unconditionally each cycle, so this copy only
         // narrows the crash-loss window and may land after the connection has
         // finished closing.
         match tokio::runtime::Handle::try_current() {
@@ -788,6 +843,19 @@ mod tests {
         assert_eq!(payload.get("10"), Some(&[7, 9]));
     }
 
+    #[tokio::test]
+    async fn persist_writes_snapshot_after_blocking_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = TrafficTracker::new(dir.path().to_path_buf()).await.unwrap();
+        tracker.add_traffic("node-a", 10, 11, 13);
+
+        tracker.persist().await.unwrap();
+
+        let reloaded = TrafficTracker::new(dir.path().to_path_buf()).await.unwrap();
+        let payload = reloaded.snapshot_traffic("node-a", 0);
+        assert_eq!(payload.get("10"), Some(&[11, 13]));
+    }
+
     #[test]
     fn state_spread_over_shards_still_reads_back_as_one_node() {
         let tracker = tracker();
@@ -816,6 +884,57 @@ mod tests {
         for uid in keep {
             assert_eq!(payload.get(&uid.to_string()), Some(&[1, 2]));
         }
+    }
+
+    #[test]
+    fn traffic_snapshot_releases_shards_before_encoding() {
+        let tracker = tracker();
+        tracker.add_traffic("node-a", 10, 1, 2);
+
+        let snapshot = tracker.capture_traffic_snapshot();
+        // The capture owns every counter it needs, so no shard guard may
+        // remain held while JSON encoding (or any caller-side work) runs.
+        assert!(tracker.shard(10).try_lock().is_some());
+
+        let bytes = encode_traffic_snapshot(&snapshot).unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(encoded["traffic"]["node-a"]["10"]["upload"], 1);
+        assert_eq!(encoded["traffic"]["node-a"]["10"]["download"], 2);
+    }
+
+    #[test]
+    fn writes_after_capture_remain_live_for_the_next_snapshot() {
+        let tracker = tracker();
+        tracker.add_traffic("node-a", 10, 1, 2);
+        let snapshot = tracker.capture_traffic_snapshot();
+
+        // Neither capture nor encoding consumes the live counter.  Updates
+        // racing with the lock-free encoding must still be present in the
+        // following snapshot, including restored push-failure traffic.
+        tracker.add_traffic("node-a", 10, 3, 4);
+        tracker.restore_traffic("node-a", &HashMap::from([("10".to_string(), [5, 6])]));
+
+        let first: serde_json::Value =
+            serde_json::from_slice(&encode_traffic_snapshot(&snapshot).unwrap()).unwrap();
+        assert_eq!(first["traffic"]["node-a"]["10"]["upload"], 1);
+        assert_eq!(first["traffic"]["node-a"]["10"]["download"], 2);
+
+        let current = tracker.snapshot_traffic("node-a", 0);
+        assert_eq!(current.get("10"), Some(&[9, 12]));
+    }
+
+    #[test]
+    fn traffic_snapshot_does_not_change_alive_state() {
+        let tracker = tracker();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        assert!(tracker.add_alive_ip_and_check_limit("node-a", 10, ip, None));
+        tracker.add_traffic("node-a", 10, 3, 0);
+
+        let before = tracker.snapshot_alive("node-a", 7, 1);
+        let _ = tracker.snapshot_bytes().unwrap();
+        let after = tracker.snapshot_alive("node-a", 7, 1);
+
+        assert_eq!(before.payload(), after.payload());
     }
 
     #[test]

@@ -42,6 +42,66 @@ pub enum UserListFetch {
     },
 }
 
+/// The V2Board control-plane operations used by a node controller.
+///
+/// Keeping the panel transport behind this small seam lets controller tests
+/// provide deterministic responses without starting an HTTP server.  The
+/// interface is intentionally crate-private: it is an implementation detail
+/// of the V2Board runtime, not another public client API for callers to build
+/// against.
+#[async_trait::async_trait]
+pub(crate) trait V2BoardApi: Send + Sync {
+    async fn get_server_config(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        etag: Option<&str>,
+    ) -> std::io::Result<FetchResult<ServerConfig>>;
+
+    async fn get_user_list(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        previous_etag: Option<&str>,
+        last_body_hash: Option<&[u8; 32]>,
+        since: Option<u64>,
+    ) -> std::io::Result<UserListFetch>;
+
+    async fn get_alive_list(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+    ) -> std::io::Result<AliveList>;
+
+    async fn push_traffic(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        payload: &TrafficPayload,
+    ) -> std::io::Result<()>;
+
+    async fn push_alive(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        payload: &AlivePayload,
+    ) -> std::io::Result<()>;
+
+    async fn get_plugin_config(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        etag: Option<&OpaqueEtag>,
+    ) -> Result<PluginConfigObserved, PluginApiError>;
+
+    async fn post_plugin_status(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        status: &PluginStatusReport,
+    ) -> Result<(), PluginApiError>;
+}
+
 impl V2BoardClient {
     pub fn new(config: &AppConfig) -> std::io::Result<Self> {
         let http = reqwest::Client::builder()
@@ -365,6 +425,74 @@ impl V2BoardClient {
     }
 }
 
+#[async_trait::async_trait]
+impl V2BoardApi for V2BoardClient {
+    async fn get_server_config(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        etag: Option<&str>,
+    ) -> std::io::Result<FetchResult<ServerConfig>> {
+        V2BoardClient::get_server_config(self, app_config, node, etag).await
+    }
+
+    async fn get_user_list(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        previous_etag: Option<&str>,
+        last_body_hash: Option<&[u8; 32]>,
+        since: Option<u64>,
+    ) -> std::io::Result<UserListFetch> {
+        V2BoardClient::get_user_list(self, app_config, node, previous_etag, last_body_hash, since)
+            .await
+    }
+
+    async fn get_alive_list(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+    ) -> std::io::Result<AliveList> {
+        V2BoardClient::get_alive_list(self, app_config, node).await
+    }
+
+    async fn push_traffic(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        payload: &TrafficPayload,
+    ) -> std::io::Result<()> {
+        V2BoardClient::push_traffic(self, app_config, node, payload).await
+    }
+
+    async fn push_alive(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        payload: &AlivePayload,
+    ) -> std::io::Result<()> {
+        V2BoardClient::push_alive(self, app_config, node, payload).await
+    }
+
+    async fn get_plugin_config(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        etag: Option<&OpaqueEtag>,
+    ) -> Result<PluginConfigObserved, PluginApiError> {
+        V2BoardClient::get_plugin_config(self, app_config, node, etag).await
+    }
+
+    async fn post_plugin_status(
+        &self,
+        app_config: &AppConfig,
+        node: &V2BoardNodeConfig,
+        status: &PluginStatusReport,
+    ) -> Result<(), PluginApiError> {
+        V2BoardClient::post_plugin_status(self, app_config, node, status).await
+    }
+}
+
 async fn drain_response_body(
     response: &mut reqwest::Response,
     limit: usize,
@@ -595,6 +723,13 @@ mod tests {
             rule_providers: Vec::new(),
         };
         (app, node)
+    }
+
+    fn assert_v2board_api<T: V2BoardApi>() {}
+
+    #[test]
+    fn v2board_client_implements_the_controller_client_seam() {
+        assert_v2board_api::<V2BoardClient>();
     }
 
     #[test]

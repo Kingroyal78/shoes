@@ -232,9 +232,24 @@ pub fn normalize_node(
     server: &ServerConfig,
     users: &[UserInfo],
 ) -> std::io::Result<RuntimeNodeSpec> {
+    let mut spec = normalize_node_settings(app_config, node, server)?;
+    spec.users = normalize_users(node, spec.node_type, users)?;
+    Ok(spec)
+}
+
+/// Normalize the immutable portion of a node runtime.
+///
+/// This is intentionally separate from [`normalize_node`]: users-only syncs
+/// already have the panel rows and should feed them directly into the
+/// protocol table builders rather than first allocating a `Vec<RuntimeUser>`
+/// that is immediately projected into another table.
+pub(crate) fn normalize_node_settings(
+    app_config: &AppConfig,
+    node: &V2BoardNodeConfig,
+    server: &ServerConfig,
+) -> std::io::Result<RuntimeNodeSpec> {
     let node_type = runtime_node_type(node, server)?;
     validate_local_protocol_overrides(node, node_type, server)?;
-    let users = normalize_users(node, node_type, users)?;
 
     // A zero server_port would bind an ephemeral port (or a permanent
     // port-0 retry loop on TCP); reject it so the node fails loudly during
@@ -267,7 +282,7 @@ pub fn normalize_node(
         protocol,
         transport,
         security,
-        users,
+        users: Vec::new(),
         base: RuntimeBaseConfig {
             pull_interval_secs: server.base_config.pull_interval,
             push_interval_secs: server.base_config.push_interval,
@@ -296,7 +311,7 @@ pub(crate) fn normalize_node_without_users(
     node: &V2BoardNodeConfig,
     server: &ServerConfig,
 ) -> std::io::Result<RuntimeNodeSpec> {
-    normalize_node(app_config, node, server, &[])
+    normalize_node_settings(app_config, node, server)
 }
 
 fn validate_local_protocol_overrides(

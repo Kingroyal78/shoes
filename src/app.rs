@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,10 +9,10 @@ use tokio::time::{Interval, MissedTickBehavior, interval};
 use crate::backend_config::{AppConfig, NodeType, V2BoardNodeConfig};
 use crate::resolver::{CachingNativeResolver, Resolver};
 use crate::thread_util::set_num_threads;
-use crate::v2board::client::{FetchResult, UserListFetch, V2BoardClient};
+use crate::v2board::client::{FetchResult, UserListFetch, V2BoardApi, V2BoardClient};
 use crate::v2board::lkg::{self, NodeLkgSnapshot};
 use crate::v2board::mapper::{
-    map_node, map_shadowsocks_plugin_nodes, refresh_node_user_delta, refresh_node_users,
+    prepare_node, prepare_shadowsocks_plugin_nodes, refresh_node_user_delta, refresh_node_users,
 };
 use crate::v2board::plugin_api::{
     AppliedFeature, OpaqueEtag, PluginApiError, PluginConfigApplied, PluginConfigCandidate,
@@ -62,7 +63,7 @@ pub async fn run(config_path: &str, threads: usize) -> std::io::Result<()> {
 
 struct V2BoardApp {
     config: Arc<AppConfig>,
-    client: V2BoardClient,
+    client: Arc<dyn V2BoardApi>,
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
     sync_gate: Arc<Semaphore>,
@@ -72,7 +73,7 @@ impl V2BoardApp {
     async fn load(config_path: &str) -> std::io::Result<Self> {
         let config = Arc::new(AppConfig::load(config_path).await?);
         config.validate().await?;
-        let client = V2BoardClient::new(&config)?;
+        let client: Arc<dyn V2BoardApi> = Arc::new(V2BoardClient::new(&config)?);
         let tracker = Arc::new(TrafficTracker::new(config.runtime.data_dir.clone()).await?);
         let resolver: Arc<dyn Resolver> = Arc::new(CachingNativeResolver::new());
         let sync_gate = Arc::new(Semaphore::new(config.runtime.max_concurrent_v2board_syncs));
@@ -177,7 +178,7 @@ async fn wait_for_shutdown_signal() {
 struct NodeController {
     config: Arc<AppConfig>,
     node: V2BoardNodeConfig,
-    client: V2BoardClient,
+    client: Arc<dyn V2BoardApi>,
     tracker: Arc<TrafficTracker>,
     resolver: Arc<dyn Resolver>,
     server_etag: Option<String>,
@@ -213,7 +214,7 @@ impl NodeController {
     fn new(
         config: Arc<AppConfig>,
         node: V2BoardNodeConfig,
-        client: V2BoardClient,
+        client: Arc<dyn V2BoardApi>,
         tracker: Arc<TrafficTracker>,
         resolver: Arc<dyn Resolver>,
         sync_gate: Arc<Semaphore>,
@@ -337,6 +338,8 @@ impl NodeController {
         let mut next_device_limited_user_count = self.device_limited_user_count;
         let mut next_plugin_candidate = self.plugin_candidate.clone();
         let mut user_delta: Option<UserDelta> = None;
+        let mut next_alive: Option<HashMap<u64, u64>> = None;
+        let mut clear_force_plugin_refresh = false;
 
         // A successful pull used to produce no output at all, which left the
         // routine case -- nothing moved -- indistinguishable from a panel that
@@ -414,7 +417,10 @@ impl NodeController {
                     }
                 }
             }
-            self.force_plugin_refresh = false;
+            // Keep the force-refresh request armed until the complete
+            // candidate has been applied. A mapping/readiness failure must
+            // retry with an unconditional plugin pull on the next interval.
+            clear_force_plugin_refresh = true;
         }
 
         match self
@@ -478,11 +484,6 @@ impl NodeController {
                         users_outcome = "resent unchanged";
                         next_users = self.users.clone();
                     } else {
-                        // The previous snapshot is no longer needed for a
-                        // full replacement.  Drop our ownership before
-                        // constructing the new Arc so the peak does not hold
-                        // two complete panel snapshots unnecessarily.
-                        drop(self.users.take());
                         users_changed = true;
                         users_outcome = "changed";
                         next_users = Some(Arc::new(users));
@@ -499,18 +500,18 @@ impl NodeController {
                         &value.users,
                         &value.removed,
                     );
-                    let base = self
-                        .users
-                        .take()
-                        .and_then(|users| Arc::try_unwrap(users).map_err(|_| ()).ok());
-                    let Some(base) =
-                        base.or_else(|| if value.full { Some(Vec::new()) } else { None })
-                    else {
+                    let Some(current_users) = self.users.as_deref() else {
                         self.invalidate_user_cache();
                         return Err(std::io::Error::other(
-                            "user snapshot is shared; forcing a full user refetch",
+                            "received a user delta without a cached snapshot",
                         ));
                     };
+                    // Keep the currently applied snapshot intact until the
+                    // complete candidate has passed mapping and runtime
+                    // readiness. A clone is intentional here: taking the
+                    // Arc out of `self.users` made a later mapping failure
+                    // partially erase the old controller state.
+                    let base = current_users.to_vec();
                     let delta_updated = value.users.clone();
                     let delta_removed = value.removed.clone();
                     let (merged_users, delta_changed) =
@@ -546,8 +547,7 @@ impl NodeController {
                     return Err(error);
                 }
             };
-            self.tracker
-                .replace_panel_alive(&self.node.tag, alive.alive);
+            next_alive = Some(alive.alive);
         }
 
         log::info!(
@@ -642,6 +642,12 @@ impl NodeController {
         self.users = next_users;
         self.device_limited_user_count = next_device_limited_user_count;
         self.plugin_candidate = next_plugin_candidate;
+        if clear_force_plugin_refresh {
+            self.force_plugin_refresh = false;
+        }
+        if let Some(alive) = next_alive {
+            self.tracker.replace_panel_alive(&self.node.tag, alive);
+        }
 
         // Persist only when the snapshot's *contents* moved, not merely because
         // a fetch came back 200 instead of 304. A panel that does not honour
@@ -719,16 +725,20 @@ impl NodeController {
         server: &ServerConfig,
         users: &[UserInfo],
     ) -> std::io::Result<bool> {
-        self.reconcile_active_users(users);
-
-        refresh_node_users(
+        let transaction = self.user_tables.transaction();
+        let refreshed = refresh_node_users(
             &self.config,
             &self.node,
             server,
             users,
             self.tracker.clone(),
-            &self.user_tables,
-        )
+            &transaction,
+        )?;
+        if refreshed {
+            transaction.commit();
+            self.reconcile_active_users(users);
+        }
+        Ok(refreshed)
     }
 
     /// Apply a panel delta directly to a protocol table when that table has a
@@ -756,15 +766,20 @@ impl NodeController {
             return Ok(true);
         }
 
-        self.reconcile_active_users(users);
-        refresh_node_users(
+        let transaction = self.user_tables.transaction();
+        let refreshed = refresh_node_users(
             &self.config,
             &self.node,
             server,
             users,
             self.tracker.clone(),
-            &self.user_tables,
-        )
+            &transaction,
+        )?;
+        if refreshed {
+            transaction.commit();
+            self.reconcile_active_users(users);
+        }
+        Ok(refreshed)
     }
 
     fn reconcile_active_users(&self, users: &[UserInfo]) {
@@ -780,13 +795,6 @@ impl NodeController {
         users: &[UserInfo],
         plugin_candidate: Option<&PluginConfigCandidate>,
     ) -> std::io::Result<()> {
-        // Reconcile process-global per-user state against the panel truth so
-        // entries for deleted users cannot accumulate forever.
-        let active_uids: std::collections::HashSet<u64> =
-            users.iter().map(|user| user.id).collect();
-        crate::tcp::tcp_server::reconcile_speed_limiters(&self.node.tag, &active_uids);
-        self.tracker.reconcile_users(&self.node.tag, &active_uids);
-
         if self.node.node_type == NodeType::Shadowsocks {
             let candidate = plugin_candidate.ok_or_else(|| {
                 std::io::Error::other(format!(
@@ -794,7 +802,7 @@ impl NodeController {
                     self.node.tag
                 ))
             })?;
-            let nodes = map_shadowsocks_plugin_nodes(
+            let prepared = prepare_shadowsocks_plugin_nodes(
                 &self.config,
                 &self.node,
                 server,
@@ -804,6 +812,7 @@ impl NodeController {
                 self.resolver.clone(),
                 &self.user_tables,
             )?;
+            let (nodes, transaction) = prepared.into_parts();
             let features = plugin_features(candidate);
             let graph = RuntimeGraph::new(
                 self.node.tag.clone(),
@@ -818,10 +827,15 @@ impl NodeController {
                 .clone()
                 .mark_applied(features)
                 .map_err(plugin_io_error)?;
-            self.runtime.replace(graph, self.resolver.clone()).await?;
+            if let Err(error) = self.runtime.replace(graph, self.resolver.clone()).await {
+                transaction.abort();
+                return Err(error);
+            }
+            transaction.commit();
+            self.reconcile_active_users(users);
             self.plugin_applied = Some(applied);
         } else {
-            let runtime_node = map_node(
+            let prepared = prepare_node(
                 &self.config,
                 &self.node,
                 server,
@@ -830,9 +844,17 @@ impl NodeController {
                 self.resolver.clone(),
                 &self.user_tables,
             )?;
-            self.runtime
+            let (runtime_node, transaction) = prepared.into_parts();
+            if let Err(error) = self
+                .runtime
                 .replace(RuntimeGraph::single(runtime_node), self.resolver.clone())
-                .await?;
+                .await
+            {
+                transaction.abort();
+                return Err(error);
+            }
+            transaction.commit();
+            self.reconcile_active_users(users);
         }
         Ok(())
     }
@@ -1469,7 +1491,7 @@ mod tests {
         tracker.add_traffic("node-a", 1001, 123, 456);
         tracker.persist().await.unwrap();
 
-        let client = V2BoardClient::new(&config).unwrap();
+        let client: Arc<dyn V2BoardApi> = Arc::new(V2BoardClient::new(&config).unwrap());
         let resolver: Arc<dyn Resolver> = Arc::new(NoopResolver);
         let mut controller = NodeController::new(
             config,
