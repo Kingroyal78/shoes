@@ -539,6 +539,7 @@ mod tests {
             private_key: [0; 32],
             short_ids: vec![[0; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            selected_alpn: None,
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
