@@ -263,3 +263,110 @@ pub async fn start_quic_servers(
 
     Ok(handles)
 }
+
+/// Per-connection QUIC flow-control windows.
+///
+/// These bound how much data a peer may have in flight to us, and therefore
+/// how much of this process's memory one QUIC client can occupy when the other
+/// side of a proxied stream is slower than the client feeding it: quinn holds
+/// received bytes until the proxy task forwards them, up to the window.
+///
+/// The defaults match the reference TUIC and Hysteria2 servers, which size
+/// them for a fast, high-latency link -- 20 MiB per connection is deliberate
+/// there, not incidental. A node serving many QUIC clients on a small machine
+/// may prefer to trade some of that throughput back for a bound on worst-case
+/// memory, which is what the environment overrides are for:
+///
+/// - `SHOES_QUIC_RECEIVE_WINDOW` -- bytes a connection may have unread
+/// - `SHOES_QUIC_STREAM_RECEIVE_WINDOW` -- the same, per stream
+/// - `SHOES_QUIC_SEND_WINDOW` -- bytes this side may have unacknowledged
+///
+/// Unset, unparsable or zero keeps the default, so a typo never silently
+/// throttles a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicFlowControl {
+    pub receive_window: u32,
+    pub stream_receive_window: u32,
+    pub send_window: u64,
+}
+
+pub(crate) const DEFAULT_QUIC_FLOW_CONTROL: QuicFlowControl = QuicFlowControl {
+    receive_window: 20 * 1024 * 1024,
+    stream_receive_window: 8 * 1024 * 1024,
+    send_window: 16 * 1024 * 1024,
+};
+
+impl QuicFlowControl {
+    /// The windows in effect for this process, read once from the environment.
+    pub(crate) fn from_env() -> Self {
+        static WINDOWS: std::sync::OnceLock<QuicFlowControl> = std::sync::OnceLock::new();
+        *WINDOWS.get_or_init(|| Self::parse(|name| std::env::var(name).ok()))
+    }
+
+    fn parse(read: impl Fn(&str) -> Option<String>) -> Self {
+        fn bytes<T: TryFrom<u64>>(
+            read: &impl Fn(&str) -> Option<String>,
+            name: &str,
+            default: T,
+        ) -> T {
+            read(name)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .and_then(|value| T::try_from(value).ok())
+                .unwrap_or(default)
+        }
+
+        let default = DEFAULT_QUIC_FLOW_CONTROL;
+        Self {
+            receive_window: bytes(&read, "SHOES_QUIC_RECEIVE_WINDOW", default.receive_window),
+            stream_receive_window: bytes(
+                &read,
+                "SHOES_QUIC_STREAM_RECEIVE_WINDOW",
+                default.stream_receive_window,
+            ),
+            send_window: bytes(&read, "SHOES_QUIC_SEND_WINDOW", default.send_window),
+        }
+    }
+
+    /// Apply the windows to a transport config.
+    pub(crate) fn apply(&self, transport: &mut quinn::TransportConfig) {
+        transport
+            .send_window(self.send_window)
+            .receive_window(self.receive_window.into())
+            .stream_receive_window(self.stream_receive_window.into());
+    }
+}
+
+#[cfg(test)]
+mod quic_flow_control_tests {
+    use super::*;
+
+    #[test]
+    fn unset_environment_keeps_the_reference_defaults() {
+        let windows = QuicFlowControl::parse(|_| None);
+        assert_eq!(windows, DEFAULT_QUIC_FLOW_CONTROL);
+    }
+
+    #[test]
+    fn overrides_are_taken_per_window() {
+        let windows = QuicFlowControl::parse(|name| match name {
+            "SHOES_QUIC_RECEIVE_WINDOW" => Some("4194304".to_string()),
+            "SHOES_QUIC_STREAM_RECEIVE_WINDOW" => Some(" 1048576 ".to_string()),
+            _ => None,
+        });
+        assert_eq!(windows.receive_window, 4 * 1024 * 1024);
+        assert_eq!(windows.stream_receive_window, 1024 * 1024);
+        assert_eq!(windows.send_window, DEFAULT_QUIC_FLOW_CONTROL.send_window);
+    }
+
+    #[test]
+    fn a_typo_or_zero_never_silently_throttles_a_node() {
+        let windows = QuicFlowControl::parse(|name| match name {
+            "SHOES_QUIC_RECEIVE_WINDOW" => Some("4MiB".to_string()),
+            "SHOES_QUIC_STREAM_RECEIVE_WINDOW" => Some("0".to_string()),
+            "SHOES_QUIC_SEND_WINDOW" => Some("-1".to_string()),
+            _ => None,
+        });
+        assert_eq!(windows, DEFAULT_QUIC_FLOW_CONTROL);
+    }
+}

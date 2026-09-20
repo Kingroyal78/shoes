@@ -1735,14 +1735,15 @@ pub async fn start_hysteria2_server(
             .max_concurrent_uni_streams(1024_u32.into())
             .max_idle_timeout(Some(idle_timeout))
             .keep_alive_interval(Some(Duration::from_secs(10)))
-            .send_window(16 * 1024 * 1024)
-            .receive_window((20u32 * 1024 * 1024).into())
-            .stream_receive_window((8u32 * 1024 * 1024).into())
             .initial_mtu(1200)
             .min_mtu(1200)
             .mtu_discovery_config(Some(mtu_discovery_config))
             .enable_segmentation_offload(!obfs_enabled)
             .initial_rtt(Duration::from_millis(100));
+
+        // Flow-control windows bound what one client can hold in this
+        // process's memory when its destination is slower than it is.
+        crate::quic_server::QuicFlowControl::from_env().apply(transport);
 
         // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead).
         let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(

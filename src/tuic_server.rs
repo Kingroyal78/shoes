@@ -1047,7 +1047,15 @@ async fn run_udp_session_loop(
         override_local_write_address.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
+    // Only the uni-stream mode frames packets through this buffer. Clients
+    // that use datagram mode -- which is what TUIC does by default -- never
+    // touch it, and taking it unconditionally cost 64 KiB per association for
+    // as long as the association lived.
+    let mut buf = if is_uni_stream {
+        allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice()
+    } else {
+        Vec::new().into_boxed_slice()
+    };
     let mut read_buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
 
@@ -2123,9 +2131,6 @@ pub async fn start_tuic_server(
                 )
             })?))
             .keep_alive_interval(Some(Duration::from_secs(15)))
-            .send_window(16 * 1024 * 1024)
-            .receive_window((20u32 * 1024 * 1024).into())
-            .stream_receive_window((8u32 * 1024 * 1024).into())
             // MTU settings per official TUIC reference
             .initial_mtu(1200)
             .min_mtu(1200)
@@ -2135,6 +2140,10 @@ pub async fn start_tuic_server(
             .enable_segmentation_offload(true)
             // Lower initial RTT estimate for faster initial window growth
             .initial_rtt(Duration::from_millis(100));
+
+        // Flow-control windows bound what one client can hold in this
+        // process's memory when its destination is slower than it is.
+        crate::quic_server::QuicFlowControl::from_env().apply(transport);
 
         // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
         // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
