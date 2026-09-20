@@ -46,6 +46,19 @@ pub fn create_shadowsocks_2022_subkey(
     output_len: usize,
     context: &str,
 ) -> std::io::Result<Box<[u8]>> {
+    let mut subkey = allocate_vec(output_len);
+    write_shadowsocks_2022_subkey(psk, salt, &mut subkey, context)?;
+    Ok(subkey.into_boxed_slice())
+}
+
+/// Derive a subkey into caller-provided storage, so hot paths can use the
+/// stack.
+pub fn write_shadowsocks_2022_subkey(
+    psk: &[u8],
+    salt: &[u8],
+    out: &mut [u8],
+    context: &str,
+) -> std::io::Result<()> {
     if psk.len() != salt.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -60,12 +73,9 @@ pub fn create_shadowsocks_2022_subkey(
     let mut hasher = blake3::Hasher::new_derive_key(context);
     hasher.update(psk);
     hasher.update(salt);
-    let mut output_reader = hasher.finalize_xof();
+    hasher.finalize_xof().fill(out);
 
-    let mut subkey = allocate_vec(output_len);
-    output_reader.fill(&mut subkey);
-
-    Ok(subkey.into_boxed_slice())
+    Ok(())
 }
 
 pub fn create_shadowsocks_2022_identity_subkey(
@@ -99,6 +109,15 @@ impl ShadowsocksKey for Blake3Key {
             SESSION_CONTEXT_STR,
         )
         .unwrap_or_else(|_| allocate_vec(self.session_key_len).into_boxed_slice())
+    }
+
+    fn write_session_key(&self, salt: &[u8], out: &mut [u8]) -> Option<usize> {
+        let out = out.get_mut(..self.session_key_len)?;
+        if write_shadowsocks_2022_subkey(self.key_bytes(), salt, out, SESSION_CONTEXT_STR).is_err()
+        {
+            out.fill(0);
+        }
+        Some(self.session_key_len)
     }
 }
 

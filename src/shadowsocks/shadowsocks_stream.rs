@@ -252,6 +252,10 @@ const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 /// immediate reallocation.
 const INITIAL_BUF_SIZE: usize = 4096;
 
+/// Largest session key any supported AEAD uses, so the multi-user probe can
+/// derive one on the stack.
+const MAX_SESSION_KEY_LEN: usize = 32;
+
 /// How far a peer's handshake timestamp may drift from ours, in either
 /// direction.
 ///
@@ -1037,9 +1041,22 @@ pub fn try_decrypt_aead_length(
             ),
         ));
     }
-    let session_key = key.create_session_key(salt);
-    let mut opening_key = ShadowsocksOpeningKey::new(algorithm, &session_key)?;
-    let mut chunk = encrypted_length.to_vec();
+    // On the multi-user path this runs once per candidate user on every
+    // connection attempt, so it derives and decrypts entirely on the stack:
+    // the heap traffic of the obvious spelling is two allocations per
+    // candidate, which is thousands per connection on a large node.
+    let mut session_key = [0u8; MAX_SESSION_KEY_LEN];
+    let session_key_len = key
+        .write_session_key(salt, &mut session_key)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Shadowsocks session key is longer than the largest supported AEAD key",
+            )
+        })?;
+    let mut opening_key = ShadowsocksOpeningKey::new(algorithm, &session_key[..session_key_len])?;
+    let mut chunk = [0u8; 2 + TAG_LEN];
+    chunk.copy_from_slice(encrypted_length);
     opening_key
         .open_in_place(&mut chunk)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "open failed"))?;
@@ -1275,6 +1292,7 @@ fn check_timestamp_freshness(timestamp_secs: u64, now_secs: u64) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::io::ErrorKind;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};

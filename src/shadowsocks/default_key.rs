@@ -28,16 +28,28 @@ impl aws_lc_rs::hkdf::KeyType for SliceKeyType<'_> {
     }
 }
 
-impl ShadowsocksKey for DefaultKey {
-    fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
-        let mut session_key = allocate_vec(self.key_len);
+impl DefaultKey {
+    fn derive_into(&self, salt: &[u8], out: &mut [u8]) {
         aws_lc_rs::hkdf::Salt::new(aws_lc_rs::hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY, salt)
             .extract(&self.key_bytes)
             .expand(SS_SUBKEY_INFO, SliceKeyType(&self.key_bytes))
             .unwrap()
-            .fill(&mut session_key)
+            .fill(out)
             .unwrap();
+    }
+}
+
+impl ShadowsocksKey for DefaultKey {
+    fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
+        let mut session_key = allocate_vec(self.key_len);
+        self.derive_into(salt, &mut session_key);
         session_key.into_boxed_slice()
+    }
+
+    fn write_session_key(&self, salt: &[u8], out: &mut [u8]) -> Option<usize> {
+        let out = out.get_mut(..self.key_len)?;
+        self.derive_into(salt, out);
+        Some(self.key_len)
     }
 }
 
