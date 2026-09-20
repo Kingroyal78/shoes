@@ -36,7 +36,7 @@ use crate::tcp::tcp_handler::{
     AuthenticatedUser, ServerUser, TcpClientHandler, TcpClientSetupResult, TcpServerHandler,
     TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, write_all};
+use crate::util::{LazyBuffer, write_all};
 
 #[derive(Debug)]
 struct ShadowsocksData {
@@ -201,8 +201,10 @@ struct ParsedTrojanRequest {
 struct TrojanPacketStream {
     stream: Box<dyn AsyncStream>,
     fixed_target: Option<crate::address::NetLocation>,
+    /// Frame staging buffers, taken on demand and given back as soon as they
+    /// drain: a parked UDP session held 128 KiB apiece.
     read_buf: SlideBuffer,
-    write_buf: Box<[u8]>,
+    write_buf: LazyBuffer,
     write_buf_len: usize,
     write_buf_sent: usize,
     is_eof: bool,
@@ -225,7 +227,7 @@ impl TrojanPacketStream {
             stream,
             fixed_target,
             read_buf: SlideBuffer::new(TROJAN_UDP_FRAME_BUFFER_SIZE),
-            write_buf: allocate_vec(TROJAN_UDP_FRAME_BUFFER_SIZE).into_boxed_slice(),
+            write_buf: LazyBuffer::new(TROJAN_UDP_FRAME_BUFFER_SIZE),
             write_buf_len: 0,
             write_buf_sent: 0,
             is_eof: false,
@@ -320,7 +322,12 @@ impl TrojanPacketStream {
                             self.read_buf.advance_write(bytes_read);
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            // Parked between packets, which is where a UDP
+                            // session spends almost all of its life.
+                            self.read_buf.release();
+                            return Poll::Pending;
+                        }
                     }
                 }
             }
@@ -344,6 +351,7 @@ impl TrojanPacketStream {
         }
         self.write_buf_len = 0;
         self.write_buf_sent = 0;
+        self.write_buf.release();
         Poll::Ready(Ok(()))
     }
 
@@ -362,14 +370,17 @@ impl TrojanPacketStream {
                 ),
             ));
         }
+        // The only place bytes enter this buffer; every capacity check reads
+        // the declared size, because a released buffer reports zero.
+        self.write_buf.ensure();
         let addr_len = write_trojan_packet_address(&mut self.write_buf, target)?;
         let total_len = addr_len + 2 + CRLF_BYTES.len() + buf.len();
-        if total_len > self.write_buf.len() {
+        if total_len > self.write_buf.capacity() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "Trojan UDP frame too large: {total_len} > {}",
-                    self.write_buf.len()
+                    self.write_buf.capacity()
                 ),
             ));
         }

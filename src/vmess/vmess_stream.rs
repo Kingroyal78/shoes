@@ -16,7 +16,7 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
-use crate::util::allocate_vec;
+use crate::util::{LazyBuffer, allocate_vec};
 // this should be the same as vmess_handler.rs TAG_LEN.
 const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
@@ -100,10 +100,14 @@ pub struct VmessStream {
     processed_start_offset: usize,
     processed_end_offset: usize,
 
-    write_cache: Box<[u8]>,
+    /// Frame staging buffers, taken on demand and given back once everything
+    /// has reached the transport. Held eagerly these were 16 KiB per TCP
+    /// stream (and 130 KiB per UDP stream) for as long as the connection
+    /// lived, almost all of which is spent with nothing to send.
+    write_cache: LazyBuffer,
     write_cache_size: usize,
 
-    write_packet: Box<[u8]>,
+    write_packet: LazyBuffer,
     write_packet_start_offset: usize,
     write_packet_end_offset: usize,
 
@@ -198,22 +202,22 @@ impl VmessStream {
         let processed_buf = allocate_vec(INITIAL_READ_BUF_SIZE);
 
         let (write_cache, write_packet) = if !is_udp {
-            let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
+            let write_cache = LazyBuffer::new(max_unencrypted_write_data_size);
             const MAX_WRITE_PACKET_SIZE: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
             // we need to be able to send a full packet, and the prefix (response) data all
             // at once. the response is relatively small, check vmess_handler.
-            let write_packet = allocate_vec(MAX_WRITE_PACKET_SIZE + 40).into_boxed_slice();
+            let write_packet = LazyBuffer::new(MAX_WRITE_PACKET_SIZE + 40);
 
             (write_cache, write_packet)
         } else {
             // write_message can be called with a full UDP message, which we need to handle,
             // i.e. packetize into multiple packets and store in write_packet.
-            let write_cache = allocate_vec(65535).into_boxed_slice();
+            let write_cache = LazyBuffer::new(65535);
 
             let write_packet_size = 65535
                 + (65535usize.div_ceil(max_unencrypted_write_data_size)
                     * (MAX_PADDING_LEN * ENCRYPTION_TAG_LEN));
-            let write_packet = allocate_vec(write_packet_size + 40).into_boxed_slice();
+            let write_packet = LazyBuffer::new(write_packet_size + 40);
 
             (write_cache, write_packet)
         };
@@ -590,9 +594,56 @@ impl VmessStream {
         }
     }
 
+    /// Give back whichever write buffer currently holds nothing.
+    ///
+    /// Called once a packet has all reached the transport. A stream with
+    /// nothing queued needs neither buffer, and the cost of being wrong about
+    /// idleness is one allocation when the next frame is built.
+    #[inline]
+    fn release_drained_write_buffers(&mut self) {
+        if self.write_cache_size == 0 {
+            self.write_cache.release();
+        }
+        if self.write_packet_start_offset == self.write_packet_end_offset {
+            self.write_packet_start_offset = 0;
+            self.write_packet_end_offset = 0;
+            self.write_packet.release();
+        }
+    }
+
+    /// Give back the read-side buffers that currently hold nothing. These grow
+    /// on demand up to a full frame; without this a stream that saw one large
+    /// frame kept the grown buffer for the rest of its life.
+    #[inline]
+    fn release_drained_read_buffers(&mut self) {
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+            self.unprocessed_buf = Vec::new();
+        }
+        if self.processed_start_offset == self.processed_end_offset {
+            self.processed_start_offset = 0;
+            self.processed_end_offset = 0;
+            self.processed_buf = Vec::new();
+        }
+    }
+
+    /// Bytes of staging buffer currently held, for tests that pin the idle cost.
+    #[cfg(test)]
+    pub(crate) fn held_buffer_bytes(&self) -> usize {
+        self.unprocessed_buf.capacity()
+            + self.processed_buf.capacity()
+            + self.write_cache.held_bytes()
+            + self.write_packet.held_bytes()
+    }
+
     fn create_write_packet(&mut self) -> bool {
         // If we have a pending prefix, prepend it to the write_packet buffer
         // so that the response header and first data packet go out together.
+        // The only place bytes enter this buffer, so the only place it has to
+        // exist. Every capacity check below reads the size it was created
+        // with, because a released buffer reports a length of zero.
+        self.write_packet.ensure();
         if let Some(prefix) = self.pending_prefix_write.take() {
             assert!(self.write_packet_end_offset == 0);
             let prefix_len = prefix.len();
@@ -601,7 +652,7 @@ impl VmessStream {
         }
 
         // note that this should allow creating an empty packet.
-        let write_packet_space = self.write_packet.len() - self.write_packet_end_offset;
+        let write_packet_space = self.write_packet.capacity() - self.write_packet_end_offset;
         let max_padding_len = if self.write_length_mask.is_some() {
             MAX_PADDING_LEN
         } else {
@@ -627,7 +678,7 @@ impl VmessStream {
         let data_size = std::cmp::min(max_data_size, self.write_cache_size);
 
         let write_packet_size: usize = data_size + padding_len + self.tag_len;
-        assert!(write_packet_size + 2 <= self.write_packet.len());
+        assert!(write_packet_size + 2 <= self.write_packet.capacity());
 
         let mut next_index = self.write_packet_end_offset;
 
@@ -698,6 +749,7 @@ impl VmessStream {
                     if self.write_packet_start_offset == self.write_packet_end_offset {
                         self.write_packet_start_offset = 0;
                         self.write_packet_end_offset = 0;
+                        self.release_drained_write_buffers();
                         return Ok(true);
                     }
                 }
@@ -930,11 +982,24 @@ impl AsyncRead for VmessStream {
                 this.ensure_unprocessed_room();
             }
 
-            let mut read_buf =
-                ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
-            ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
+            let read = {
+                let mut read_buf =
+                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
+                match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(result) => {
+                        result?;
+                        Some(read_buf.filled().len())
+                    }
+                    Poll::Pending => None,
+                }
+            };
 
-            let len = read_buf.filled().len();
+            let Some(len) = read else {
+                // Parked on a peer with nothing to say, which is where a
+                // proxied stream spends almost all of its life.
+                this.release_drained_read_buffers();
+                return Poll::Pending;
+            };
 
             // Make sure we have enough space to store the processed data.
             if len == 0 {
@@ -995,7 +1060,10 @@ impl AsyncWrite for VmessStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
-        let mut cache_space = this.write_cache.len().saturating_sub(this.write_cache_size);
+        let mut cache_space = this
+            .write_cache
+            .capacity()
+            .saturating_sub(this.write_cache_size);
 
         if cache_space == 0 {
             while this.write_cache_size > 0 && this.create_write_packet() {}
@@ -1012,12 +1080,17 @@ impl AsyncWrite for VmessStream {
             // now that we've written out all the packet data, create more packets to free up cache
             // space.
             while this.write_cache_size > 0 && this.create_write_packet() {}
-            cache_space = this.write_cache.len().saturating_sub(this.write_cache_size);
+            cache_space = this
+                .write_cache
+                .capacity()
+                .saturating_sub(this.write_cache_size);
             assert!(cache_space > 0);
         }
 
         let write_count = std::cmp::min(cache_space, buf.len());
 
+        // The only place bytes enter this buffer.
+        this.write_cache.ensure();
         this.write_cache[this.write_cache_size..this.write_cache_size + write_count]
             .copy_from_slice(&buf[0..write_count]);
         this.write_cache_size += write_count;
@@ -1188,11 +1261,24 @@ impl AsyncReadMessage for VmessStream {
                 this.ensure_unprocessed_room();
             }
 
-            let mut read_buf =
-                ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
-            ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
+            let read = {
+                let mut read_buf =
+                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
+                match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(result) => {
+                        result?;
+                        Some(read_buf.filled().len())
+                    }
+                    Poll::Pending => None,
+                }
+            };
 
-            let len = read_buf.filled().len();
+            let Some(len) = read else {
+                // Parked on a peer with nothing to say, which is where a
+                // proxied stream spends almost all of its life.
+                this.release_drained_read_buffers();
+                return Poll::Pending;
+            };
 
             // Make sure we have enough space to store the processed data.
             if len == 0 {
@@ -1248,6 +1334,7 @@ impl AsyncWriteMessage for VmessStream {
             // for UDP streams
             assert!(this.write_packet_end_offset == 0);
             let prefix_len = prefix.len();
+            this.write_packet.ensure();
             this.write_packet[0..prefix_len].copy_from_slice(&prefix);
             this.write_packet_end_offset = prefix_len;
         }
@@ -1271,7 +1358,7 @@ impl AsyncWriteMessage for VmessStream {
 
         let metadata_size = 2 + padding_len + this.tag_len;
 
-        let available_space = this.write_packet.len() - metadata_size;
+        let available_space = this.write_packet.capacity() - metadata_size;
         if available_space < buf.len() {
             return Poll::Ready(Err(std::io::Error::other("write payload is too large")));
         }
@@ -1279,6 +1366,8 @@ impl AsyncWriteMessage for VmessStream {
         let write_packet_size = buf.len() + padding_len + this.tag_len;
         let write_packet_size = (write_packet_size as u16) ^ length_mask;
 
+        // The only place bytes enter this buffer in message mode.
+        this.write_packet.ensure();
         this.write_packet[0] = (write_packet_size >> 8) as u8;
         this.write_packet[1] = (write_packet_size & 0xff) as u8;
 
@@ -1677,6 +1766,65 @@ mod tests {
 
         assert!(matches!(state, DecryptState::Success));
         assert_eq!(stream.processed_end_offset, stream.processed_buf.len());
+    }
+
+    #[tokio::test]
+    async fn parked_stream_gives_back_its_frame_buffers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut peer, stream) = tokio::io::duplex(4096);
+        let mut stream = VmessStream::new(
+            Box::new(TestStream(stream)),
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // A write takes both staging buffers and gives them back once the
+        // frame has reached the transport.
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut framed = [0u8; 7];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_exact(&mut framed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&framed[2..], b"hello");
+
+        // Park on a peer that has not said anything, which is where a proxied
+        // stream spends almost all of its life.
+        let mut out = [0u8; 64];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.read(&mut out))
+                .await
+                .is_err(),
+            "the read must park, otherwise this is not testing the idle path"
+        );
+        assert_eq!(
+            stream.held_buffer_bytes(),
+            0,
+            "a parked VMess stream must not hold frame buffers"
+        );
+
+        // Re-acquiring them must be invisible to the framer.
+        stream.write_all(b"again").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut framed = [0u8; 7];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_exact(&mut framed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&framed[2..], b"again");
     }
 
     #[test]

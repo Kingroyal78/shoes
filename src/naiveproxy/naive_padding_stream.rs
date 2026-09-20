@@ -6,7 +6,7 @@ use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 /// Number of frames to pad in each direction
 pub const NUM_FIRST_PADDINGS: usize = 8;
@@ -166,15 +166,21 @@ pub struct NaivePaddingStream<S> {
     num_read_frames: usize,
     /// Number of frames written so far
     num_written_frames: usize,
-    /// Pre-allocated buffer for incoming frame data
-    read_buffer: Box<[u8]>,
+    /// Staging buffer for incoming frame data.
+    ///
+    /// Padding only covers the first [`NUM_FIRST_PADDINGS`] frames of each
+    /// direction; after that this stream is a pass-through that needs no buffer
+    /// at all, and even during the padding phase a parked connection holds
+    /// nothing. Held eagerly this was 64 KiB per direction for the whole life
+    /// of every NaiveProxy connection.
+    read_buffer: LazyBuffer,
     read_buffer_start: usize,
     read_buffer_end: usize,
     /// Current frame state: (payload_len, padding_len, payload_delivered)
     /// payload_delivered tracks how many payload bytes have been copied to user
     current_frame: Option<(usize, usize, usize)>,
-    /// Pre-allocated buffer for encoded frame writes
-    write_buffer: Box<[u8]>,
+    /// Staging buffer for encoded frame writes; see [`Self::read_buffer`].
+    write_buffer: LazyBuffer,
     write_start: usize,
     write_end: usize,
     /// Original payload length for current write (to return correct count)
@@ -183,9 +189,9 @@ pub struct NaivePaddingStream<S> {
 
 impl<S> NaivePaddingStream<S> {
     pub fn new(inner: S, direction: PaddingDirection, padding_type: PaddingType) -> Self {
-        // Pre-allocate buffers sized for maximum frame
-        let read_buffer = allocate_vec(MAX_FRAME_SIZE).into_boxed_slice();
-        let write_buffer = allocate_vec(MAX_FRAME_SIZE).into_boxed_slice();
+        // Taken on demand and given back as soon as a frame drains.
+        let read_buffer = LazyBuffer::new(MAX_FRAME_SIZE);
+        let write_buffer = LazyBuffer::new(MAX_FRAME_SIZE);
 
         Self {
             inner,
@@ -204,6 +210,18 @@ impl<S> NaivePaddingStream<S> {
         }
     }
 
+    /// Bytes currently held by the read staging buffer.
+    #[cfg(test)]
+    pub(crate) fn held_read_bytes(&self) -> usize {
+        self.read_buffer.held_bytes()
+    }
+
+    /// Bytes currently held by the write staging buffer.
+    #[cfg(test)]
+    pub(crate) fn held_write_bytes(&self) -> usize {
+        self.write_buffer.held_bytes()
+    }
+
     /// Return buffered data to user, reset buffer if empty. Returns bytes copied.
     #[inline]
     fn drain_read_buffer(&mut self, buf: &mut ReadBuf<'_>) -> usize {
@@ -214,6 +232,7 @@ impl<S> NaivePaddingStream<S> {
         if self.read_buffer_start >= self.read_buffer_end {
             self.read_buffer_start = 0;
             self.read_buffer_end = 0;
+            self.read_buffer.release();
         }
         to_copy
     }
@@ -224,6 +243,7 @@ impl<S> NaivePaddingStream<S> {
         if self.read_buffer_start == self.read_buffer_end {
             self.read_buffer_start = 0;
             self.read_buffer_end = 0;
+            self.read_buffer.release();
         }
     }
 
@@ -288,6 +308,10 @@ impl<S> NaivePaddingStream<S> {
         let payload_len = payload.len() as u16;
         let frame_size = PADDING_HEADER_SIZE + payload.len() + padding_size as usize;
 
+        // The only place bytes enter the write buffer, so the only place it
+        // has to exist.
+        self.write_buffer.ensure();
+
         // Write header: payload_len (2 bytes BE) + padding_size (1 byte)
         self.write_buffer[0] = (payload_len >> 8) as u8;
         self.write_buffer[1] = (payload_len & 0xff) as u8;
@@ -319,6 +343,7 @@ impl<S> NaivePaddingStream<S> {
         } else if self.read_buffer_start == self.read_buffer_end {
             self.read_buffer_start = 0;
             self.read_buffer_end = 0;
+            self.read_buffer.release();
         }
     }
 
@@ -429,6 +454,9 @@ impl<S: AsyncWrite + Unpin> NaivePaddingStream<S> {
                 self.write_start += n;
                 if self.write_start >= self.write_end {
                     self.num_written_frames += 1;
+                    self.write_start = 0;
+                    self.write_end = 0;
+                    self.write_buffer.release();
                     Poll::Ready(Ok(Some(self.write_payload_len)))
                 } else {
                     Poll::Ready(Ok(None))
@@ -482,10 +510,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for NaivePaddingStream<S> {
             }
 
             // Need more data
-            if this.read_buffer_end >= this.read_buffer.len() {
+            if this.read_buffer_end >= MAX_FRAME_SIZE {
                 this.reset_read_buffer_offset();
             }
 
+            // The only place bytes enter this buffer. A released buffer
+            // reports a length of zero, so the capacity check above uses the
+            // size it was created with.
+            this.read_buffer.ensure();
             let read_slice = &mut this.read_buffer[this.read_buffer_end..];
             let mut temp_read_buf = ReadBuf::new(read_slice);
 
@@ -493,12 +525,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for NaivePaddingStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled_len = temp_read_buf.filled().len();
                     if filled_len == 0 {
+                        this.maybe_reset_read_buffer();
                         return Poll::Ready(Ok(()));
                     }
                     this.read_buffer_end += filled_len;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Parked with nothing staged. Holding the frame buffer
+                    // here is what made an idle NaiveProxy connection cost
+                    // 64 KiB per direction.
+                    this.maybe_reset_read_buffer();
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1230,5 +1269,58 @@ mod tests {
         let n = stream.read(&mut buf).await.unwrap();
 
         assert_eq!(n, 0);
+    }
+    #[tokio::test]
+    async fn parked_padded_stream_gives_back_its_frame_buffers() {
+        let (mut peer_io, server_io) = tokio::io::duplex(4096);
+        let mut stream =
+            NaivePaddingStream::new(server_io, PaddingDirection::Client, PaddingType::Variant1);
+        let mut out = [0u8; 64];
+
+        // Park on a peer that has not said anything, which is where a proxied
+        // connection spends nearly all of its life.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut out))
+                .await
+                .is_err(),
+            "the read must park, otherwise this is not testing the idle path"
+        );
+        assert_eq!(
+            stream.held_read_bytes(),
+            0,
+            "a parked stream must not hold a read buffer"
+        );
+
+        // Re-acquiring it must be invisible to the frame decoder.
+        peer_io
+            .write_all(&encode_test_frame(b"hello", 12))
+            .await
+            .unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..read], b"hello");
+        assert_eq!(
+            stream.held_read_bytes(),
+            0,
+            "a fully consumed frame must not leave a read buffer behind"
+        );
+
+        // Same on the write side: taken to build the frame, given back once it
+        // has all reached the transport.
+        stream.write_all(b"reply").await.unwrap();
+        stream.flush().await.unwrap();
+        assert_eq!(
+            stream.held_write_bytes(),
+            0,
+            "a fully written frame must not leave a write buffer behind"
+        );
+        let mut header = [0u8; 3];
+        tokio::time::timeout(Duration::from_secs(1), peer_io.read_exact(&mut header))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([header[0], header[1]]) as usize, 5);
     }
 }

@@ -45,6 +45,21 @@ const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 /// cost. This matches the 1024-stream bound used by the H2MUX runtime.
 const MAX_CONCURRENT_STREAMS: usize = 1024;
 
+/// How much frame-encoding scratch a session keeps between frames.
+///
+/// Frames are almost always small, so holding a few KiB keeps the common case
+/// allocation-free; a session that once sent a full-sized frame gives the rest
+/// back instead of holding 64 KiB for as long as it stays connected.
+const WRITE_BUF_RETAIN_CAPACITY: usize = 8 * 1024;
+
+/// Hand back frame-encoding scratch that one large frame grew.
+#[inline]
+fn release_oversized_write_buf(write_buf: &mut BytesMut) {
+    if write_buf.capacity() > WRITE_BUF_RETAIN_CAPACITY {
+        *write_buf = BytesMut::new();
+    }
+}
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -168,8 +183,9 @@ impl AnyTlsSession {
             pkt_counter: AtomicU32::new(0),
             buffering: AtomicBool::new(false),
             buffer: Mutex::new(Vec::new()),
-            // Pre-allocate write buffer for max frame size (64KB + header + some margin)
-            write_buf: Mutex::new(BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE + 64)),
+            // Grown on demand and handed back once a frame is out; see
+            // `WRITE_BUF_RETAIN_CAPACITY`.
+            write_buf: Mutex::new(BytesMut::new()),
             peer_version: AtomicU8::new(0),
             received_client_settings: AtomicBool::new(false),
             // Stream handling dependencies (always required)
@@ -234,7 +250,7 @@ impl AnyTlsSession {
             pkt_counter: AtomicU32::new(0),
             buffering: AtomicBool::new(false),
             buffer: Mutex::new(Vec::new()),
-            write_buf: Mutex::new(BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE + 64)),
+            write_buf: Mutex::new(BytesMut::new()),
             peer_version: AtomicU8::new(0),
             received_client_settings: AtomicBool::new(false),
             resolver: Arc::new(NativeResolver),
@@ -665,7 +681,10 @@ impl AnyTlsSession {
 
     /// Write a frame to the connection with padding applied
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
-        // Use reusable write buffer to avoid allocation
+        // Reused across frames, so small frames cost no allocation, but given
+        // back once a large one is out: a session pre-allocated for the
+        // largest frame it may ever send held 64 KiB for its whole life, and
+        // at any instant most sessions are sending nothing.
         let mut write_buf = self.write_buf.lock().await;
         write_buf.clear();
         frame.encode_into(&mut write_buf);
@@ -674,6 +693,8 @@ impl AnyTlsSession {
         if self.buffering.load(Ordering::Relaxed) {
             let mut buffer = self.buffer.lock().await;
             buffer.extend_from_slice(&write_buf);
+            write_buf.clear();
+            release_oversized_write_buf(&mut write_buf);
             return Ok(());
         }
 
@@ -699,6 +720,7 @@ impl AnyTlsSession {
             if pkt < self.padding.stop() {
                 // Need to take ownership for padding function
                 let data = write_buf.split();
+                release_oversized_write_buf(&mut write_buf);
                 return self.write_with_padding(data, pkt).await;
             } else {
                 self.send_padding.store(false, Ordering::Relaxed);
@@ -708,7 +730,9 @@ impl AnyTlsSession {
         // Write directly
         let mut writer = self.writer.lock().await;
         writer.write_all(&write_buf).await?;
-        writer.flush().await
+        let result = writer.flush().await;
+        release_oversized_write_buf(&mut write_buf);
+        result
     }
 
     /// Write data with padding applied according to scheme

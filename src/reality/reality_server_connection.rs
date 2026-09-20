@@ -35,7 +35,7 @@ use super::reality_util::{
 };
 use crate::address::{Address, NetLocation};
 use crate::slide_buffer::SlideBuffer;
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 /// Configuration for REALITY server connections
 #[derive(Clone)]
@@ -109,8 +109,12 @@ pub struct RealityServerConnection {
     write_seq: u64,
     cipher_suite: Option<CipherSuite>,
 
-    // Pre-allocated buffer for TLS read operations (reused across calls)
-    tls_read_buffer: Box<[u8]>,
+    // Scratch buffer for TLS read operations, taken on demand and given back
+    // whenever the connection parks with nothing buffered. Held eagerly, this
+    // and the two record buffers below were 81 KiB for the whole life of every
+    // REALITY connection, almost all of which is spent waiting on a peer that
+    // is saying nothing.
+    tls_read_buffer: LazyBuffer,
 
     // Buffers for I/O - using SlideBuffer for efficient zero-alloc operations
     ciphertext_read_buf: SlideBuffer, // Incoming encrypted TLS records
@@ -136,7 +140,7 @@ impl RealityServerConnection {
             read_seq: 0,
             write_seq: 0,
             cipher_suite: None,
-            tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
+            tls_read_buffer: LazyBuffer::new(TLS_MAX_RECORD_SIZE),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
@@ -171,7 +175,9 @@ impl RealityServerConnection {
             self.ciphertext_read_buf.compact();
         }
 
-        // Read into pre-allocated buffer
+        // The only place bytes enter the scratch buffer, so the only place it
+        // has to exist.
+        self.tls_read_buffer.ensure();
         let n = rd.read(&mut self.tls_read_buffer[..])?;
         if n > 0 {
             self.ciphertext_read_buf
@@ -1061,6 +1067,36 @@ impl RealityServerConnection {
         // Note: If plaintext buffer has data, the caller should consume it first.
         // If ciphertext buffer has complete records, process_new_packets should be called.
         self.plaintext_read_buf.is_empty()
+    }
+
+    /// Give back every buffer that currently holds nothing.
+    ///
+    /// Called when the stream parks. A REALITY connection that is waiting on
+    /// its peer needs no record buffers at all, and at any instant that is
+    /// almost every connection the node is serving. Buffers still holding
+    /// data are left alone, so this is safe to call unconditionally, and the
+    /// cost of being wrong about idleness is one allocation when the peer
+    /// speaks again.
+    pub fn release_idle_buffers(&mut self) {
+        self.tls_read_buffer.release();
+        self.ciphertext_read_buf.release();
+        self.plaintext_read_buf.release();
+        if self.ciphertext_write_buf.is_empty() && self.ciphertext_write_buf.capacity() > 0 {
+            self.ciphertext_write_buf = Vec::new();
+        }
+        if self.plaintext_write_buf.is_empty() && self.plaintext_write_buf.capacity() > 0 {
+            self.plaintext_write_buf = Vec::new();
+        }
+    }
+
+    /// Bytes of buffer currently held, for tests that pin the idle cost.
+    #[cfg(test)]
+    pub(crate) fn held_buffer_bytes(&self) -> usize {
+        self.tls_read_buffer.held_bytes()
+            + self.ciphertext_read_buf.held_bytes()
+            + self.plaintext_read_buf.held_bytes()
+            + self.ciphertext_write_buf.capacity()
+            + self.plaintext_write_buf.capacity()
     }
 
     /// Queue a close notification alert

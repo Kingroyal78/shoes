@@ -25,7 +25,7 @@ use crate::async_stream::{
     AsyncTargetedMessageStream, AsyncWriteSourcedMessage,
 };
 use crate::slide_buffer::SlideBuffer;
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 /// Buffer size for reading and writing packet-address frames.
 const BUFFER_SIZE: usize = 65535;
@@ -55,8 +55,11 @@ pub struct PacketAddrStream<S> {
     /// Buffer for reading - accumulates bytes until we have a complete packet
     read_buf: SlideBuffer,
 
-    /// Buffer for writing - holds a complete packet before sending (boxed to avoid stack overflow)
-    write_buf: Box<[u8]>,
+    /// Buffer for writing - holds a complete packet before sending. Taken on
+    /// demand and given back once the packet has reached the transport, so an
+    /// idle UDP session costs neither this nor the read buffer instead of
+    /// 128 KiB apiece.
+    write_buf: LazyBuffer,
     write_buf_len: usize,
     write_buf_sent: usize,
 
@@ -69,7 +72,7 @@ impl<S: AsyncStream> PacketAddrStream<S> {
             stream,
             codec,
             read_buf: SlideBuffer::new(BUFFER_SIZE),
-            write_buf: allocate_vec(BUFFER_SIZE).into_boxed_slice(),
+            write_buf: LazyBuffer::new(BUFFER_SIZE),
             write_buf_len: 0,
             write_buf_sent: 0,
             is_eof: false,
@@ -206,6 +209,9 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
                 }
                 Poll::Pending => {
                     log::trace!("PacketAddrStream: poll_read pending");
+                    // Parked with nothing staged, which is where a UDP session
+                    // spends almost all of its life.
+                    this.read_buf.release();
                     return Poll::Pending;
                 }
             }
@@ -243,6 +249,7 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for PacketAddrStream<S> {
         // Reset write buffer
         this.write_buf_len = 0;
         this.write_buf_sent = 0;
+        this.write_buf.release();
 
         // Calculate required space: address + length(2) + payload
         let addr_len = match source {
@@ -251,13 +258,17 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for PacketAddrStream<S> {
         };
         let total_len = addr_len + 2 + buf.len();
 
-        if total_len > this.write_buf.len() {
+        if total_len > this.write_buf.capacity() {
             return Poll::Ready(Err(std::io::Error::other(format!(
                 "packet-address frame too large: {total_len} > {}",
-                this.write_buf.len()
+                this.write_buf.capacity()
             ))));
         }
 
+        // The only place bytes enter this buffer, so the only place it has to
+        // exist; the capacity check above reads the declared size, because a
+        // released buffer reports a length of zero.
+        this.write_buf.ensure();
         let offset = (this.codec.write)(&mut this.write_buf, source);
 
         // Write length prefix (u16be)
@@ -297,6 +308,7 @@ impl<S: AsyncStream> AsyncFlushMessage for PacketAddrStream<S> {
 
         this.write_buf_len = 0;
         this.write_buf_sent = 0;
+        this.write_buf.release();
 
         // Flush the underlying stream
         Pin::new(&mut this.stream).poll_flush(cx)

@@ -59,6 +59,15 @@ impl LazyBuffer {
         }
     }
 
+    /// The size the buffer is grown to on demand.
+    ///
+    /// Callers deriving capacity must read it from here: a released buffer
+    /// reports a length of zero.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
     pub fn release(&mut self) {
         if !self.buf.is_empty() {
             self.buf = Vec::new().into_boxed_slice();

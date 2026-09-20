@@ -242,7 +242,10 @@ where
                     this.state.shutdown_read();
                     Poll::Ready(Ok(()))
                 } else if io_pending {
-                    // We tried to read and got WouldBlock - wait for more data
+                    // We tried to read and got WouldBlock - wait for more data.
+                    // Parked with nothing buffered, which is where a proxied
+                    // connection spends almost all of its life.
+                    this.session.release_idle_buffers();
                     Poll::Pending
                 } else {
                     // wants_read() returned false but no data - need to read from TCP
@@ -264,7 +267,9 @@ where
                             Poll::Pending
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Now properly registered with reactor
+                            // Now properly registered with reactor, and parked
+                            // with nothing buffered.
+                            this.session.release_idle_buffers();
                             Poll::Pending
                         }
                         Err(e) => Poll::Ready(Err(e)),
@@ -549,6 +554,33 @@ mod tests {
             .unwrap()
             .complete_for_test()
             .unwrap()
+    }
+
+    #[test]
+    fn parked_reality_stream_holds_no_record_buffers() {
+        let mut stream = CryptoTlsStream::new(
+            PendingWriteIo,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+        );
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut storage = [0u8; 1024];
+        let mut buf = ReadBuf::new(&mut storage);
+
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending(),
+            "the read must park, otherwise this is not testing the idle path"
+        );
+
+        let CryptoConnection::RealityServer(session) = &stream.session else {
+            unreachable!("built as a REALITY server connection")
+        };
+        assert_eq!(
+            session.held_buffer_bytes(),
+            0,
+            "a parked REALITY connection must not hold record buffers"
+        );
     }
 
     #[test]

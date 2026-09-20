@@ -12,7 +12,7 @@ use crate::async_stream::{
     AsyncTargetedMessageStream, AsyncWriteMessage, AsyncWriteSourcedMessage,
     AsyncWriteTargetedMessage,
 };
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 fn snell_udp_packet_too_large_error(
     payload_len: usize,
@@ -71,9 +71,11 @@ pub struct SnellUdpStream {
     stream: Box<dyn AsyncMessageStream>,
     max_payload_size: usize,
 
-    read_buf: Box<[u8]>,
+    /// Packet staging buffers, taken on demand and given back as soon as they
+    /// drain: a UDP session parked between packets held 128 KiB apiece.
+    read_buf: LazyBuffer,
 
-    write_buf: Box<[u8]>,
+    write_buf: LazyBuffer,
     write_buf_end_offset: usize,
 
     is_eof: bool,
@@ -85,9 +87,9 @@ impl SnellUdpStream {
             stream,
             max_payload_size,
 
-            read_buf: allocate_vec(65535).into_boxed_slice(),
+            read_buf: LazyBuffer::new(65535),
 
-            write_buf: allocate_vec(65535).into_boxed_slice(),
+            write_buf: LazyBuffer::new(65535),
             write_buf_end_offset: 0,
 
             is_eof: false,
@@ -106,10 +108,23 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
             return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
         }
 
-        let mut read_buf = ReadBuf::new(&mut this.read_buf);
-        ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
-
-        let len = read_buf.filled().len();
+        // The only place bytes enter this buffer.
+        this.read_buf.ensure();
+        let len = {
+            let mut read_buf = ReadBuf::new(&mut this.read_buf);
+            match Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf) {
+                Poll::Ready(result) => {
+                    result?;
+                    read_buf.filled().len()
+                }
+                Poll::Pending => {
+                    // Parked between packets, which is where a UDP session
+                    // spends almost all of its life.
+                    this.read_buf.release();
+                    return Poll::Pending;
+                }
+            }
+        };
         if len == 0 {
             this.is_eof = true;
             return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
@@ -211,10 +226,14 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
             buf_len,
             header_len,
             this.max_payload_size,
-            this.write_buf.len(),
+            this.write_buf.capacity(),
         ) {
             return Poll::Ready(Err(e));
         }
+
+        // The only place bytes enter this buffer; the capacity check above
+        // reads the declared size, because a released buffer reports zero.
+        this.write_buf.ensure();
 
         let offset = match source {
             SocketAddr::V4(socket_addr) => {
@@ -247,6 +266,7 @@ impl AsyncFlushMessage for SnellUdpStream {
                     .poll_write_message(cx, &this.write_buf[0..this.write_buf_end_offset])
             )?;
             this.write_buf_end_offset = 0;
+            this.write_buf.release();
         }
         Pin::new(&mut this.stream).poll_flush_message(cx)
     }
@@ -282,9 +302,11 @@ pub struct SnellUdpClientStream {
     stream: Box<dyn AsyncMessageStream>,
     max_payload_size: usize,
 
-    read_buf: Box<[u8]>,
+    /// Packet staging buffers, taken on demand and given back as soon as they
+    /// drain: a UDP session parked between packets held 128 KiB apiece.
+    read_buf: LazyBuffer,
 
-    write_buf: Box<[u8]>,
+    write_buf: LazyBuffer,
     write_buf_end_offset: usize,
 
     is_eof: bool,
@@ -296,9 +318,9 @@ impl SnellUdpClientStream {
             stream,
             max_payload_size,
 
-            read_buf: allocate_vec(65535).into_boxed_slice(),
+            read_buf: LazyBuffer::new(65535),
 
-            write_buf: allocate_vec(65535).into_boxed_slice(),
+            write_buf: LazyBuffer::new(65535),
             write_buf_end_offset: 0,
 
             is_eof: false,
@@ -322,10 +344,23 @@ impl AsyncReadSourcedMessage for SnellUdpClientStream {
             )));
         }
 
-        let mut read_buf = ReadBuf::new(&mut this.read_buf);
-        ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
-
-        let len = read_buf.filled().len();
+        // The only place bytes enter this buffer.
+        this.read_buf.ensure();
+        let len = {
+            let mut read_buf = ReadBuf::new(&mut this.read_buf);
+            match Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf) {
+                Poll::Ready(result) => {
+                    result?;
+                    read_buf.filled().len()
+                }
+                Poll::Pending => {
+                    // Parked between packets, which is where a UDP session
+                    // spends almost all of its life.
+                    this.read_buf.release();
+                    return Poll::Pending;
+                }
+            }
+        };
         if len == 0 {
             this.is_eof = true;
             return Poll::Ready(Ok(SocketAddr::new(
@@ -415,10 +450,14 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
             buf_len,
             header_len,
             this.max_payload_size,
-            this.write_buf.len(),
+            this.write_buf.capacity(),
         ) {
             return Poll::Ready(Err(e));
         }
+
+        // The only place bytes enter this buffer; the capacity check above
+        // reads the declared size, because a released buffer reports zero.
+        this.write_buf.ensure();
 
         this.write_buf[0] = 1; // cmd = data
         let offset = match target.address() {
@@ -465,6 +504,7 @@ impl AsyncFlushMessage for SnellUdpClientStream {
                     .poll_write_message(cx, &this.write_buf[0..this.write_buf_end_offset])
             )?;
             this.write_buf_end_offset = 0;
+            this.write_buf.release();
         }
         Pin::new(&mut this.stream).poll_flush_message(cx)
     }

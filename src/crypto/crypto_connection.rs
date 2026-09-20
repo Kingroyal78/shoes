@@ -113,6 +113,20 @@ impl CryptoConnection {
         )
     }
 
+    /// Give back whatever buffers hold nothing right now.
+    ///
+    /// Called when the stream parks. rustls owns its own buffering and has no
+    /// equivalent, so this only affects REALITY connections, where it is the
+    /// difference between an idle connection costing 81 KiB and costing
+    /// nothing.
+    pub fn release_idle_buffers(&mut self) {
+        match self {
+            CryptoConnection::RustlsServer(_) | CryptoConnection::RustlsClient(_) => {}
+            CryptoConnection::RealityServer(conn) => conn.release_idle_buffers(),
+            CryptoConnection::RealityClient(_) => {}
+        }
+    }
+
     /// Read TLS messages from `rd` into internal buffers
     ///
     /// Returns the number of bytes read, or 0 if the connection is closed.

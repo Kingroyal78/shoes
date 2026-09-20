@@ -34,8 +34,14 @@ use crate::util::allocate_vec;
 /// assert_eq!(buf.as_slice(), b"llo");
 /// ```
 pub struct SlideBuffer {
-    /// Pre-allocated buffer storage
+    /// Buffer storage. Empty until something is written, and given back by
+    /// [`SlideBuffer::release`] once it drains: at any instant most proxied
+    /// connections are parked on a peer that is saying nothing, and a parked
+    /// connection needs no buffer at all.
     data: Box<[u8]>,
+    /// The size `data` is grown to on demand. Capacity is read from here and
+    /// never from `data`, which reports zero while released.
+    capacity: usize,
     /// Start offset of valid data (inclusive)
     start: usize,
     /// End offset of valid data (exclusive)
@@ -49,10 +55,41 @@ impl SlideBuffer {
     #[inline]
     pub fn new(capacity: usize) -> Self {
         Self {
-            data: allocate_vec(capacity).into_boxed_slice(),
+            data: Vec::new().into_boxed_slice(),
+            capacity,
             start: 0,
             end: 0,
         }
+    }
+
+    /// Take the storage if it is not already held. Every write path calls
+    /// this; readers never need it, because an empty buffer reads as empty.
+    #[inline]
+    pub fn ensure(&mut self) {
+        if self.data.is_empty() && self.capacity > 0 {
+            self.data = allocate_vec(self.capacity).into_boxed_slice();
+        }
+    }
+
+    /// Give the storage back when the buffer holds nothing.
+    ///
+    /// A no-op while data is buffered, so callers can park on it
+    /// unconditionally.
+    #[inline]
+    pub fn release(&mut self) {
+        if self.start >= self.end {
+            self.start = 0;
+            self.end = 0;
+            if !self.data.is_empty() {
+                self.data = Vec::new().into_boxed_slice();
+            }
+        }
+    }
+
+    /// Bytes of storage currently held, which is zero while released.
+    #[inline]
+    pub fn held_bytes(&self) -> usize {
+        self.data.len()
     }
 
     /// Returns the number of bytes currently stored in the buffer.
@@ -73,7 +110,7 @@ impl SlideBuffer {
     /// consumed from the front, call `compact()`.
     #[inline]
     pub fn remaining_capacity(&self) -> usize {
-        self.data.len() - self.end
+        self.capacity - self.end
     }
 
     /// Get a slice of the readable data.
@@ -96,6 +133,7 @@ impl SlideBuffer {
     /// ```
     #[inline]
     pub fn write_slice(&mut self) -> &mut [u8] {
+        self.ensure();
         &mut self.data[self.end..]
     }
 
@@ -111,6 +149,7 @@ impl SlideBuffer {
             data.len(),
             self.remaining_capacity()
         );
+        self.ensure();
         let end = self.end;
         self.data[end..end + data.len()].copy_from_slice(data);
         self.end += data.len();
@@ -120,11 +159,11 @@ impl SlideBuffer {
     #[inline]
     pub fn advance_write(&mut self, n: usize) {
         debug_assert!(
-            self.end + n <= self.data.len(),
+            self.end + n <= self.capacity,
             "SlideBuffer advance_write overflow: end={}, n={}, capacity={}",
             self.end,
             n,
-            self.data.len()
+            self.capacity
         );
         self.end += n;
     }

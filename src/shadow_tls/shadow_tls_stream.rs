@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
 use crate::async_stream::{AsyncPing, AsyncStream};
-use crate::util::allocate_vec;
+use crate::util::LazyBuffer;
 
 // see comment in shadow_tls_server_handler.rs
 // TODO: remove duplicated consts
@@ -31,14 +31,20 @@ pub struct ShadowTlsStream {
 
     is_eof: bool,
 
-    unprocessed_buf: Box<[u8]>,
+    /// Record staging buffers, taken on demand and given back as soon as they
+    /// drain.
+    ///
+    /// Sized for the largest record a peer may send, these were 64 KiB apiece
+    /// held for the whole life of every ShadowTLS connection -- 144 KiB with
+    /// the write buffer -- while a parked connection needs none of it.
+    unprocessed_buf: LazyBuffer,
     unprocessed_end_offset: usize,
 
-    processed_buf: Box<[u8]>,
+    processed_buf: LazyBuffer,
     processed_start_offset: usize,
     processed_end_offset: usize,
 
-    write_buf: Box<[u8]>,
+    write_buf: LazyBuffer,
     write_buf_pos: usize,
     write_buf_end: usize,
 }
@@ -51,20 +57,19 @@ impl ShadowTlsStream {
         write_hmac: ShadowTlsHmac,
         handshake_hmac: Option<ShadowTlsHmac>,
     ) -> std::io::Result<Self> {
-        let mut processed_buf = allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice();
-        if initial_processed_data.len() > processed_buf.len() {
+        let mut processed_buf = LazyBuffer::new(TLS_FRAME_MAX_LEN);
+        if initial_processed_data.len() > TLS_FRAME_MAX_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "initial processed data too large for read buffer",
             ));
         }
-        processed_buf[..initial_processed_data.len()].copy_from_slice(initial_processed_data);
+        if !initial_processed_data.is_empty() {
+            processed_buf.ensure();
+            processed_buf[..initial_processed_data.len()].copy_from_slice(initial_processed_data);
+        }
 
-        let mut write_buf = allocate_vec(WRITE_BUF_LEN).into_boxed_slice();
-        // set partial frame header that never changes
-        write_buf[0] = CONTENT_TYPE_APPLICATION_DATA;
-        write_buf[1] = 0x03; // TLS_MAJOR
-        write_buf[2] = 0x03; // TLS_MINOR
+        let write_buf = LazyBuffer::new(WRITE_BUF_LEN);
 
         Ok(Self {
             stream,
@@ -75,7 +80,7 @@ impl ShadowTlsStream {
             processed_buf,
             processed_start_offset: 0,
             processed_end_offset: initial_processed_data.len(),
-            unprocessed_buf: allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice(),
+            unprocessed_buf: LazyBuffer::new(TLS_FRAME_MAX_LEN),
             unprocessed_end_offset: 0,
             write_buf,
             write_buf_pos: 0,
@@ -91,16 +96,42 @@ impl ShadowTlsStream {
             ));
         }
 
-        if data.len() > self.unprocessed_buf.len() {
+        if data.len() > TLS_FRAME_MAX_LEN {
             return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
 
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.unprocessed_buf.ensure();
         self.unprocessed_buf[0..data.len()].copy_from_slice(data);
         self.unprocessed_end_offset = data.len();
 
         Ok(())
+    }
+
+    /// Give back whichever read-side staging buffer currently holds nothing.
+    #[inline]
+    fn release_drained_read_buffers(&mut self) {
+        if self.unprocessed_end_offset == 0 {
+            self.unprocessed_buf.release();
+        }
+        if self.processed_start_offset == self.processed_end_offset {
+            self.processed_start_offset = 0;
+            self.processed_end_offset = 0;
+            self.processed_buf.release();
+        }
+    }
+
+    /// Bytes currently held by the three staging buffers.
+    #[cfg(test)]
+    pub(crate) fn held_buffer_bytes(&self) -> usize {
+        self.unprocessed_buf.held_bytes()
+            + self.processed_buf.held_bytes()
+            + self.write_buf.held_bytes()
     }
 
     #[inline]
@@ -129,6 +160,7 @@ impl ShadowTlsStream {
         if new_processed_start_offset == self.processed_end_offset {
             self.processed_start_offset = 0;
             self.processed_end_offset = 0;
+            self.processed_buf.release();
         } else {
             self.processed_start_offset = new_processed_start_offset;
         }
@@ -187,7 +219,7 @@ impl ShadowTlsStream {
         // frame length minus HMAC
         let payload_len = frame_len - 4;
 
-        if payload_len > self.processed_buf.len() {
+        if payload_len > TLS_FRAME_MAX_LEN {
             return Err(std::io::Error::other(
                 "Payload too large for processed buffer",
             ));
@@ -227,6 +259,9 @@ impl ShadowTlsStream {
         self.read_hmac.update(&expected_digest);
 
         if payload_len > 0 {
+            // The only place bytes enter this buffer, so the only place it has
+            // to exist.
+            self.processed_buf.ensure();
             self.processed_buf[0..payload_len].copy_from_slice(payload);
             self.processed_end_offset = payload_len;
         }
@@ -287,12 +322,16 @@ impl AsyncRead for ShadowTlsStream {
                 }
             }
 
-            if this.unprocessed_end_offset == this.unprocessed_buf.len() {
+            if this.unprocessed_end_offset == TLS_FRAME_MAX_LEN {
                 return Poll::Ready(Err(std::io::Error::other("Unprocessed buffer full")));
             }
         }
 
         loop {
+            // The only place bytes enter this buffer; a released buffer
+            // reports a length of zero, so every capacity check above uses
+            // the size it was created with.
+            this.unprocessed_buf.ensure();
             let mut read_buf =
                 ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
             match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
@@ -300,6 +339,7 @@ impl AsyncRead for ShadowTlsStream {
                     let n = read_buf.filled().len();
                     if n == 0 {
                         this.is_eof = true;
+                        this.release_drained_read_buffers();
                         return Poll::Ready(Ok(()));
                     }
                     this.unprocessed_end_offset += n;
@@ -316,7 +356,12 @@ impl AsyncRead for ShadowTlsStream {
                         }
                     }
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Parked on a peer with nothing to say, which is where a
+                    // proxied stream spends almost all of its life.
+                    this.release_drained_read_buffers();
+                    return Poll::Pending;
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
@@ -360,7 +405,13 @@ impl AsyncWrite for ShadowTlsStream {
 
         let frame_len = consumed_buf_len + 4; // HMAC(4) + payload
 
-        // write_buf[0..2] never changes and is set in the constructor.
+        // The only place bytes enter this buffer. The frame header prefix is
+        // written per frame rather than once in the constructor, because the
+        // buffer is given back whenever it drains.
+        this.write_buf.ensure();
+        this.write_buf[0] = CONTENT_TYPE_APPLICATION_DATA;
+        this.write_buf[1] = 0x03; // TLS_MAJOR
+        this.write_buf[2] = 0x03; // TLS_MINOR
         this.write_buf[3..5].copy_from_slice(&(frame_len as u16).to_be_bytes());
 
         this.write_hmac.update(consumed_buf);
@@ -398,6 +449,7 @@ impl AsyncWrite for ShadowTlsStream {
 
         this.write_buf_pos = 0;
         this.write_buf_end = 0;
+        this.write_buf.release();
 
         Pin::new(&mut this.stream).poll_flush(cx)
     }
@@ -607,5 +659,73 @@ mod tests {
         let mut empty = [];
         let n = stream.read(&mut empty).await.unwrap();
         assert_eq!(n, 0);
+    }
+    #[tokio::test]
+    async fn parked_stream_gives_back_its_record_buffers() {
+        let (mut peer_io, server_io) = duplex(4096);
+        let mut write_hmac = new_hmac();
+        let mut stream = ShadowTlsStream::new(
+            Box::new(TestStream(server_io)),
+            &[],
+            new_hmac(),
+            new_hmac(),
+            None,
+        )
+        .unwrap();
+
+        let mut out = [0u8; 64];
+        // Park on a peer that has not said anything, which is where a proxied
+        // stream spends almost all of its life.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut out))
+                .await
+                .is_err(),
+            "the read must park, otherwise this is not testing the idle path"
+        );
+        assert_eq!(
+            stream.held_buffer_bytes(),
+            0,
+            "a parked stream must not hold record buffers"
+        );
+
+        // Re-acquiring them must be invisible to the deframer.
+        peer_io
+            .write_all(&make_app_data_frame(&mut write_hmac, b"hello"))
+            .await
+            .unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..read], b"hello");
+
+        // Same on the write side: taken to build the record, given back once
+        // it has all reached the transport.
+        stream.write_all(b"reply").await.unwrap();
+        stream.flush().await.unwrap();
+
+        // ...and the read buffer goes back the next time the stream parks,
+        // rather than on every record, so a stream being read continuously
+        // keeps the one buffer it is filling.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut out))
+                .await
+                .is_err(),
+            "the read must park again"
+        );
+        assert_eq!(
+            stream.held_buffer_bytes(),
+            0,
+            "a parked, flushed stream must not hold record buffers"
+        );
+
+        let mut header = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(1), peer_io.read_exact(&mut header))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header[0], CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(&header[1..3], &[0x03, 0x03]);
+        assert_eq!(u16::from_be_bytes([header[3], header[4]]) as usize, 4 + 5);
     }
 }
