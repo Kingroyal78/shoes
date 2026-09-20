@@ -131,22 +131,19 @@ async fn run_tcp_server(
             match process_stream(stream, cloned_handler, cloned_resolver, Some(addr)).await {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
                 Err(StreamFailure::Handshake(e)) => {
-                    let reason = e.to_string();
-                    if should_report_handshake_rejection(&reason, Instant::now()) {
+                    let now = Instant::now();
+                    if handshake_rejection_can_report(now)
+                        && should_report_handshake_rejection(&e.to_string(), now)
+                    {
                         warn!(
                             "{}:{} handshake rejected: {} (identical rejections are logged at debug for the next {}s)",
                             addr.ip(),
                             addr.port(),
-                            reason,
+                            e,
                             HANDSHAKE_REJECTION_REPORT_INTERVAL.as_secs()
                         )
                     } else {
-                        debug!(
-                            "{}:{} handshake rejected: {}",
-                            addr.ip(),
-                            addr.port(),
-                            reason
-                        )
+                        debug!("{}:{} handshake rejected: {}", addr.ip(), addr.port(), e)
                     }
                 }
                 Err(StreamFailure::Proxy(e)) => {
@@ -179,11 +176,13 @@ async fn run_unix_server(
             match process_stream(stream, cloned_handler, cloned_resolver, None).await {
                 Ok(()) => debug!("{addr:?} finished successfully"),
                 Err(StreamFailure::Handshake(e)) => {
-                    let reason = e.to_string();
-                    if should_report_handshake_rejection(&reason, Instant::now()) {
-                        warn!("{addr:?} handshake rejected: {reason}")
+                    let now = Instant::now();
+                    if handshake_rejection_can_report(now)
+                        && should_report_handshake_rejection(&e.to_string(), now)
+                    {
+                        warn!("{addr:?} handshake rejected: {e}")
                     } else {
-                        debug!("{addr:?} handshake rejected: {reason}")
+                        debug!("{addr:?} handshake rejected: {e}")
                     }
                 }
                 Err(StreamFailure::Proxy(e)) => error!("{addr:?} finished with error: {e:?}"),
@@ -230,6 +229,48 @@ const HANDSHAKE_REJECTION_REASON_CHARS: usize = 160;
 static HANDSHAKE_REJECTIONS: LazyLock<Mutex<std::collections::HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Reference point for [`HANDSHAKE_REJECTION_QUIET_UNTIL_MILLIS`], because
+/// `Instant` cannot be stored in an atomic.
+static HANDSHAKE_REJECTION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// While every slot is taken by a reason already surfaced, the instant at which
+/// the first of them expires -- before that, no rejection can produce a log
+/// line.
+///
+/// Rejections are what a scanned listener does most: one per refused
+/// connection, on every core at once. Discovering that there is nothing to say
+/// still cost an error string, this module's lock and a walk of the set, so a
+/// scanner decided how much of the node's time went into not logging. Zero
+/// means nothing is holding reports back.
+static HANDSHAKE_REJECTION_QUIET_UNTIL_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+fn handshake_rejection_millis(at: Instant) -> u64 {
+    at.saturating_duration_since(*HANDSHAKE_REJECTION_EPOCH)
+        .as_millis() as u64
+}
+
+/// Whether a rejection arriving now could be surfaced at all.
+///
+/// Deliberately cheap: one relaxed load, no allocation and no lock. A false
+/// positive only means the slower path runs and decides for itself.
+fn handshake_rejection_can_report(now: Instant) -> bool {
+    let quiet_until = HANDSHAKE_REJECTION_QUIET_UNTIL_MILLIS.load(Ordering::Relaxed);
+    quiet_until == 0 || handshake_rejection_millis(now) >= quiet_until
+}
+
+/// When the remembered set is full, the instant its oldest entry expires;
+/// zero while there is still room.
+fn handshake_rejection_quiet_until(
+    seen: &std::collections::HashMap<String, Instant>,
+) -> Option<Instant> {
+    if seen.len() < HANDSHAKE_REJECTION_REASONS {
+        return None;
+    }
+    seen.values()
+        .min()
+        .map(|oldest| *oldest + HANDSHAKE_REJECTION_REPORT_INTERVAL)
+}
+
 /// Whether this rejection reason should be surfaced to the operator now.
 ///
 /// A rejected handshake is ordinary background noise on a public listener, so
@@ -242,7 +283,10 @@ static HANDSHAKE_REJECTIONS: LazyLock<Mutex<std::collections::HashMap<String, In
 /// logged.
 fn should_report_handshake_rejection(reason: &str, now: Instant) -> bool {
     let mut seen = HANDSHAKE_REJECTIONS.lock();
-    note_handshake_rejection(&mut seen, reason, now)
+    let report = note_handshake_rejection(&mut seen, reason, now);
+    let quiet_until = handshake_rejection_quiet_until(&seen).map_or(0, handshake_rejection_millis);
+    HANDSHAKE_REJECTION_QUIET_UNTIL_MILLIS.store(quiet_until, Ordering::Relaxed);
+    report
 }
 
 fn note_handshake_rejection(
@@ -3825,6 +3869,36 @@ mod tests {
             "Host does not match",
             start + HANDSHAKE_REJECTION_REPORT_INTERVAL + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn a_full_rejection_set_stays_quiet_until_its_oldest_entry_expires() {
+        // What a scanned listener does most is get refused, and while every
+        // slot holds a reason already surfaced there is nothing a refusal can
+        // report. Knowing when that ends is what lets the hot path skip
+        // formatting an error and taking the lock to find out.
+        let mut seen = std::collections::HashMap::new();
+        let start = Instant::now();
+        for index in 0..HANDSHAKE_REJECTION_REASONS {
+            assert!(note_handshake_rejection(
+                &mut seen,
+                &format!("reason {index}"),
+                start + Duration::from_millis(index as u64)
+            ));
+        }
+
+        assert_eq!(
+            handshake_rejection_quiet_until(&seen),
+            Some(start + HANDSHAKE_REJECTION_REPORT_INTERVAL),
+            "a full set is quiet until the reason reported first expires"
+        );
+
+        seen.remove("reason 0");
+        assert_eq!(
+            handshake_rejection_quiet_until(&seen),
+            None,
+            "a set with room must never hold back a new reason"
+        );
     }
 
     #[test]
