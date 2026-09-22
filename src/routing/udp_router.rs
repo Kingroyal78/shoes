@@ -164,7 +164,7 @@ fn note_udp_warning(
     true
 }
 
-fn report_udp_io_error(context: &str, error: &io::Error) {
+pub fn report_udp_io_error(context: &str, error: &io::Error) {
     if is_expected_udp_lifecycle_error(context, error) {
         debug!("UDP {context}: {error}");
     } else if note_udp_warning(&mut UDP_WARNINGS.lock(), context, error, Instant::now()) {

@@ -7,4 +7,6 @@
 
 mod udp_router;
 
-pub use udp_router::{LIVE_UDP_ROUTERS, LIVE_UDP_ROUTERS_READ_EOF, ServerStream, run_udp_routing};
+pub use udp_router::{
+    LIVE_UDP_ROUTERS, LIVE_UDP_ROUTERS_READ_EOF, ServerStream, report_udp_io_error, run_udp_routing,
+};

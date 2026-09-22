@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -40,6 +40,15 @@ const SNAPPY_STREAM_IDENTIFIER: &[u8; 10] = b"\xff\x06\x00\x00sNaPpY";
 #[derive(Clone, Debug)]
 pub struct KcptunServerLimits {
     pub max_sessions: usize,
+    /// How much of `max_sessions` one source address may hold.
+    ///
+    /// A session is created by the first datagram that decrypts, and the
+    /// Kcptun key is one per-node secret every user shares, so without this
+    /// any single user opens sessions from as many source ports as they like
+    /// and fills the table for everyone. The cap is per IP rather than per
+    /// `SocketAddr` because the port is what an abuser varies, and it is
+    /// generous enough that a carrier NAT sharing one address still fits.
+    pub max_sessions_per_ip: usize,
     pub inbound_packets_per_session: usize,
     pub outbound_packets_per_session: usize,
     pub max_stream_buffer: usize,
@@ -51,6 +60,7 @@ impl Default for KcptunServerLimits {
     fn default() -> Self {
         Self {
             max_sessions: 4096,
+            max_sessions_per_ip: 256,
             inbound_packets_per_session: 256,
             outbound_packets_per_session: 256,
             max_stream_buffer: 16 * 1024 * 1024,
@@ -63,6 +73,7 @@ impl Default for KcptunServerLimits {
 impl KcptunServerLimits {
     fn validate(&self) -> io::Result<()> {
         if self.max_sessions == 0
+            || self.max_sessions_per_ip == 0
             || self.inbound_packets_per_session == 0
             || self.outbound_packets_per_session == 0
             || self.max_stream_buffer == 0
@@ -404,8 +415,7 @@ async fn run_server(
     stats: Arc<SharedStats>,
 ) -> io::Result<()> {
     let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
-    let mut sessions: HashMap<SessionKey, SessionEntry> = HashMap::new();
-    let mut active_peer: HashMap<SocketAddr, u32> = HashMap::new();
+    let mut table = SessionTable::new();
     let mut generation = 0_u64;
     let mut receive_buffer = vec![0_u8; UDP_RECEIVE_BUFFER];
 
@@ -413,15 +423,21 @@ async fn run_server(
         tokio::select! {
             _ = cancellation.cancelled() => break,
             Some(closed) = closed_rx.recv() => {
-                remove_if_generation(
-                    &mut sessions,
-                    &mut active_peer,
-                    closed,
-                    &stats,
-                );
+                table.remove_if_generation(closed, &stats);
             }
             received = socket.recv_from(&mut receive_buffer) => {
                 let (length, peer) = received?;
+                // A datagram longer than the configured MTU cannot be one a
+                // real peer sent: the send path refuses to emit one (see the
+                // MTU check in the outbound loop). Rejecting it on length,
+                // before the cipher runs, is what stops an unverified source
+                // address -- nothing has authenticated this peer yet -- from
+                // buying a full decrypt pass over the whole receive buffer
+                // with a single oversized packet.
+                if length > config.mtu as usize {
+                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let plaintext = match crypt.open(&receive_buffer[..length]) {
                     Ok(packet) => packet,
                     Err(_) => {
@@ -429,7 +445,7 @@ async fn run_server(
                         continue;
                     }
                 };
-                let route = match route_packet(&plaintext, peer, &active_peer) {
+                let route = match route_packet(&plaintext, peer, table.active_peers()) {
                     Ok(Some(route)) => route,
                     Ok(None) => {
                         stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
@@ -443,7 +459,7 @@ async fn run_server(
                 let route_key = route.key;
                 let route_sequence_number = route.sequence_number;
 
-                if let Some(current_conv) = active_peer.get(&peer).copied()
+                if let Some(current_conv) = table.active_conversation(&peer)
                     && current_conv != route_key.conversation
                 {
                     if route_sequence_number != Some(0) {
@@ -451,20 +467,22 @@ async fn run_server(
                         continue;
                     }
                     let old_key = SessionKey { peer, conversation: current_conv };
-                    if let Some(old) = sessions.remove(&old_key) {
+                    if let Some(old) = table.remove(&old_key) {
                         old.cancellation.cancel();
                         stats.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     }
-                    active_peer.remove(&peer);
+                    table.forget_peer(&peer);
                 }
 
-                if let Some(entry) = sessions.get(&route_key) {
+                if let Some(entry) = table.get(&route_key) {
                     if entry.inbound.try_send(plaintext).is_err() {
                         stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
-                if sessions.len() >= limits.max_sessions {
+                if table.len() >= limits.max_sessions
+                    || table.sessions_for_ip(&peer.ip()) >= limits.max_sessions_per_ip
+                {
                     stats.rejected_sessions.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -485,7 +503,7 @@ async fn run_server(
                     continue;
                 }
                 let session_cancel = cancellation.child_token();
-                sessions.insert(
+                table.insert(
                     route_key,
                     SessionEntry {
                         generation,
@@ -493,7 +511,6 @@ async fn run_server(
                         cancellation: session_cancel.clone(),
                     },
                 );
-                active_peer.insert(peer, route_key.conversation);
                 stats.active_sessions.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(run_session(
                     route_key,
@@ -512,28 +529,101 @@ async fn run_server(
         }
     }
 
-    for (_, session) in sessions.drain() {
+    for session in table.drain() {
         session.cancellation.cancel();
     }
     stats.active_sessions.store(0, Ordering::Relaxed);
     Ok(())
 }
 
-fn remove_if_generation(
-    sessions: &mut HashMap<SessionKey, SessionEntry>,
-    active_peer: &mut HashMap<SocketAddr, u32>,
-    closed: SessionClosed,
-    stats: &SharedStats,
-) {
-    if sessions
-        .get(&closed.key)
-        .is_some_and(|entry| entry.generation == closed.generation)
-    {
-        sessions.remove(&closed.key);
-        if active_peer.get(&closed.key.peer) == Some(&closed.key.conversation) {
-            active_peer.remove(&closed.key.peer);
+/// The live session map, the per-peer conversation index, and the
+/// per-source-IP census the admission cap reads.
+///
+/// All three live behind one type because the census has to be adjusted on
+/// exactly the same edges as the map. A drifted count does not lose a
+/// session -- it permanently refuses one source's next one, which is a much
+/// worse failure than the one the cap exists to prevent.
+struct SessionTable {
+    sessions: HashMap<SessionKey, SessionEntry>,
+    active_peer: HashMap<SocketAddr, u32>,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+impl SessionTable {
+    fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            active_peer: HashMap::new(),
+            per_ip: HashMap::new(),
         }
-        stats.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn get(&self, key: &SessionKey) -> Option<&SessionEntry> {
+        self.sessions.get(key)
+    }
+
+    fn active_peers(&self) -> &HashMap<SocketAddr, u32> {
+        &self.active_peer
+    }
+
+    fn active_conversation(&self, peer: &SocketAddr) -> Option<u32> {
+        self.active_peer.get(peer).copied()
+    }
+
+    fn sessions_for_ip(&self, ip: &IpAddr) -> usize {
+        self.per_ip.get(ip).copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, key: SessionKey, entry: SessionEntry) {
+        if self.sessions.insert(key, entry).is_none() {
+            *self.per_ip.entry(key.peer.ip()).or_insert(0) += 1;
+        }
+        self.active_peer.insert(key.peer, key.conversation);
+    }
+
+    fn remove(&mut self, key: &SessionKey) -> Option<SessionEntry> {
+        let entry = self.sessions.remove(key)?;
+        // Drop the counter slot at zero rather than leaving a 0 behind, so a
+        // stream of one-packet sources cannot grow this map without bound.
+        if let std::collections::hash_map::Entry::Occupied(mut slot) =
+            self.per_ip.entry(key.peer.ip())
+        {
+            let remaining = slot.get().saturating_sub(1);
+            if remaining == 0 {
+                slot.remove();
+            } else {
+                *slot.get_mut() = remaining;
+            }
+        }
+        if self.active_peer.get(&key.peer) == Some(&key.conversation) {
+            self.active_peer.remove(&key.peer);
+        }
+        Some(entry)
+    }
+
+    fn forget_peer(&mut self, peer: &SocketAddr) {
+        self.active_peer.remove(peer);
+    }
+
+    fn remove_if_generation(&mut self, closed: SessionClosed, stats: &SharedStats) {
+        if self
+            .sessions
+            .get(&closed.key)
+            .is_some_and(|entry| entry.generation == closed.generation)
+        {
+            self.remove(&closed.key);
+            stats.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = SessionEntry> + '_ {
+        self.active_peer.clear();
+        self.per_ip.clear();
+        self.sessions.drain().map(|(_, entry)| entry)
     }
 }
 
@@ -1322,6 +1412,160 @@ mod tests {
         })
         .await
         .expect("idle Kcptun session was not scavenged");
+
+        server.shutdown();
+        server.wait().await.unwrap();
+    }
+
+    /// A session-creating datagram: one FEC data header wrapping a single
+    /// well-formed KCP PUSH segment carrying `payload_len` bytes. Everything
+    /// about it is internally consistent, so the only thing that can reject it
+    /// is its size on the wire.
+    fn kcp_session_datagram(conversation: u32, payload_len: usize) -> Vec<u8> {
+        let mut kcp_packet = vec![0_u8; KCP_OVERHEAD + payload_len];
+        kcp_packet[..4].copy_from_slice(&conversation.to_le_bytes());
+        kcp_packet[4] = 81; // IKCP_CMD_PUSH
+        kcp_packet[6..8].copy_from_slice(&128_u16.to_le_bytes());
+        kcp_packet[20..24].copy_from_slice(&(payload_len as u32).to_le_bytes());
+
+        let mut datagram = vec![0_u8; FEC_DATA_HEADER_SIZE];
+        datagram[4..6].copy_from_slice(&FEC_TYPE_DATA.to_le_bytes());
+        // The FEC data header carries the shard length over `FEC_HEADER_SIZE`,
+        // which covers this field itself. The decoder rejects a packet whose
+        // declared length disagrees, so omitting it builds a datagram that
+        // opens a session and then immediately loses it -- which would let
+        // both tests below pass without ever observing what they name.
+        let declared = u16::try_from(kcp_packet.len() + 2).expect("shard fits a u16");
+        datagram[6..8].copy_from_slice(&declared.to_le_bytes());
+        datagram.extend_from_slice(&kcp_packet);
+        datagram
+    }
+
+    fn null_crypt_config() -> KcptunConfig {
+        KcptunConfig {
+            crypt: KcptunCrypt::Null,
+            mode: KcptunMode::Manual,
+            no_compression: true,
+            interval_ms: 10,
+            data_shards: 2,
+            parity_shards: 1,
+            ..KcptunConfig::default()
+        }
+    }
+
+    /// A datagram larger than the configured MTU is refused on its length,
+    /// before the cipher ever runs. The payload here is otherwise completely
+    /// valid -- it would open a session at any legal size -- so the only thing
+    /// under test is the size guard.
+    #[tokio::test]
+    async fn oversized_datagram_is_refused_before_decryption() {
+        let config = null_crypt_config();
+        let mtu = config.mtu as usize;
+        let server = KcptunServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+            KcptunServerLimits::default(),
+            Arc::new(HoldingHandler),
+        )
+        .await
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Comfortably past the MTU, and still a packet every later stage
+        // would have accepted.
+        let oversized = kcp_session_datagram(0x2222_3333, mtu);
+        assert!(oversized.len() > mtu);
+        client
+            .send_to(&oversized, server.local_addr())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server.stats().invalid_packets >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("oversized Kcptun datagram was not counted as invalid");
+        assert_eq!(
+            server.stats().active_sessions,
+            0,
+            "an oversized datagram opened a session"
+        );
+
+        // The same shape, within the MTU, still opens one: the guard is about
+        // size, not about the packet being malformed.
+        let accepted = kcp_session_datagram(0x4444_5555, 0);
+        assert!(accepted.len() <= mtu);
+        client
+            .send_to(&accepted, server.local_addr())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server.stats().active_sessions == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a within-MTU Kcptun datagram did not open a session");
+
+        server.shutdown();
+        server.wait().await.unwrap();
+    }
+
+    /// One source address cannot take more than its share of the session
+    /// table by varying its source port.
+    #[tokio::test]
+    async fn per_source_ip_session_cap_is_enforced() {
+        let server = KcptunServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            null_crypt_config(),
+            KcptunServerLimits {
+                max_sessions: 16,
+                max_sessions_per_ip: 2,
+                ..KcptunServerLimits::default()
+            },
+            Arc::new(HoldingHandler),
+        )
+        .await
+        .unwrap();
+
+        // Three source ports, one source IP. The cap is per IP, so the third
+        // is refused even though the global table has room.
+        let mut clients = Vec::new();
+        for index in 0..3_u32 {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client
+                .send_to(
+                    &kcp_session_datagram(0x1000_0000 + index, 0),
+                    server.local_addr(),
+                )
+                .await
+                .unwrap();
+            clients.push(client);
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server.stats().rejected_sessions >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("third session from one IP was not refused");
+        assert_eq!(
+            server.stats().active_sessions,
+            2,
+            "per-IP cap did not bound the session table"
+        );
 
         server.shutdown();
         server.wait().await.unwrap();

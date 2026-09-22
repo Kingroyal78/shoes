@@ -9,7 +9,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use log::{debug, error, warn};
+use log::{debug, error};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
@@ -58,6 +58,7 @@ use crate::hysteria2_obfs::Hysteria2Obfs;
 use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
+use crate::routing::report_udp_io_error;
 use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult};
@@ -1285,11 +1286,17 @@ async fn run_udp_local_to_remote_loop(
                             remote_location,
                         }) => (chain_group, remote_location),
                         Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
+                            // A blocked destination is a routine policy
+                            // outcome, not a fault: with an ad blocklist
+                            // loaded this fires on ordinary traffic, once per
+                            // datagram, at a rate the client chooses.
+                            debug!("Blocked UDP forward to {remote_location}");
                             continue;
                         }
                         Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
+                            // Also once per datagram, so it goes through the
+                            // same reason-keyed gate the UDP router uses.
+                            report_udp_io_error("hysteria2 forward judge", &e);
                             continue;
                         }
                     };
@@ -1349,7 +1356,11 @@ async fn run_udp_local_to_remote_loop(
             // The session's upstream stream is target-fixed at dial time; a
             // mid-session destination change from the client cannot be
             // honored (the client should open a new session for a new target).
-            warn!(
+            // The client picks both the session id and the destination, so
+            // alternating two targets on one id emits this per datagram --
+            // debug, because the condition is already handled here and says
+            // nothing an operator needs per packet.
+            debug!(
                 "Location changed during ongoing UDP session: {} (was {})",
                 remote_location, session.last_location
             );

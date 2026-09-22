@@ -451,6 +451,22 @@ async fn serve_mux_cool(
         };
         match metadata.status {
             STATUS_NEW => {
+                // Reclaim slots whose logical stream is gone. Mux.Cool only
+                // removes an entry when the peer sends End, so a stream this
+                // side closed leaves a tombstone behind; without this reclaim
+                // a peer that never reciprocates walks the map up to
+                // `max_concurrent_streams` and trips it -- which breaks the
+                // read loop and tears down every live logical stream sharing
+                // the physical session. The inbound receiver lives exactly as
+                // long as its `VirtualStream`, so a closed sender is precisely
+                // the "this stream is finished" signal. Same reclaim as smux's
+                // CMD_SYN arm, for the same reason.
+                streams.retain(|_, state| {
+                    state
+                        .inbound
+                        .as_ref()
+                        .is_some_and(|inbound| !inbound.is_closed())
+                });
                 // Mux.Cool reclaims a map slot when the peer sends End, so
                 // this is the one point where the session's stream count is
                 // allowed to grow; reap here too, or a finished task would sit

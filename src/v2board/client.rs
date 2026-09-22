@@ -133,9 +133,12 @@ impl V2BoardClient {
             return Ok(FetchResult::NotModified);
         }
 
-        let response = self.ensure_success(response).await?;
+        let mut response = self.ensure_success(response).await?;
         let etag = response_etag(response.headers());
-        let value = response.json::<ServerConfig>().await.map_err(http_error)?;
+        let bytes =
+            read_body_limited(&mut response, self.user_list_body_limit, "server config").await?;
+        let value = serde_json::from_slice::<ServerConfig>(&bytes)
+            .map_err(|e| std::io::Error::other(format!("failed to decode server config: {e}")))?;
         Ok(FetchResult::Updated { etag, value })
     }
 
@@ -176,7 +179,8 @@ impl V2BoardClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let bytes = read_user_body_limited(&mut response, self.user_list_body_limit).await?;
+        let bytes =
+            read_body_limited(&mut response, self.user_list_body_limit, "user list").await?;
 
         let body_hash = *blake3::hash(&bytes).as_bytes();
         if last_body_hash == Some(&body_hash) {
@@ -218,8 +222,14 @@ impl V2BoardClient {
             .send()
             .await
             .map_err(http_error)?;
-        let response = self.ensure_success(response).await?;
-        response.json::<AliveList>().await.map_err(http_error)
+        let mut response = self.ensure_success(response).await?;
+        // `/alivelist` scales with the panel's online-device count, which is
+        // the one body here that grows with load rather than with config, so
+        // it gets the same ceiling as the user list.
+        let bytes =
+            read_body_limited(&mut response, self.user_list_body_limit, "alive list").await?;
+        serde_json::from_slice::<AliveList>(&bytes)
+            .map_err(|e| std::io::Error::other(format!("failed to decode alive list: {e}")))
     }
 
     pub async fn push_traffic(
@@ -519,9 +529,16 @@ async fn drain_response_body(
     Ok(())
 }
 
-async fn read_user_body_limited(
+/// Buffer a panel response body, refusing to allocate past `limit`.
+///
+/// Every panel body this client buffers goes through here. `reqwest`'s
+/// `json()` reads to end with no ceiling, so using it means the panel -- or
+/// anything that can answer as the panel -- decides how much memory a pull
+/// costs; `what` only names the endpoint in the resulting error.
+async fn read_body_limited(
     response: &mut reqwest::Response,
     limit: usize,
+    what: &str,
 ) -> std::io::Result<Vec<u8>> {
     if response
         .content_length()
@@ -529,7 +546,7 @@ async fn read_user_body_limited(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("user list response exceeds configured limit: content length exceeds {limit}"),
+            format!("{what} response exceeds configured limit: content length exceeds {limit}"),
         ));
     }
     let mut body = Vec::with_capacity(
@@ -544,7 +561,7 @@ async fn read_user_body_limited(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "user list response exceeds configured limit: {} > {limit}",
+                    "{what} response exceeds configured limit: {} > {limit}",
                     body.len().saturating_add(chunk.len())
                 ),
             ));

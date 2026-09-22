@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -24,6 +24,8 @@ const GECKO_DEFAULT_MIN_PACKET_SIZE: usize = 512;
 const GECKO_DEFAULT_MAX_PACKET_SIZE: usize = 1200;
 const GECKO_REASSEMBLY_TTL: Duration = Duration::from_secs(8);
 const GECKO_MAX_REASSEMBLY: usize = 4096;
+/// Compact `GeckoState::order` once stale keys could have doubled it.
+const GECKO_ORDER_COMPACT_LEN: usize = GECKO_MAX_REASSEMBLY * 2;
 const GECKO_MAX_PER_SOURCE: usize = 8;
 const MIN_RECEIVE_SEGMENTS_WITH_OBFS: usize = 2;
 
@@ -414,6 +416,24 @@ struct GeckoReassemblyEntry {
 struct GeckoState {
     entries: HashMap<GeckoReassemblyKey, GeckoReassemblyEntry>,
     per_source: HashMap<SocketAddr, usize>,
+    /// Keys in insertion order, which is also deadline order: an entry is
+    /// created with a fixed TTL and its deadline is never refreshed.
+    ///
+    /// Eviction pops from the front instead of scanning for the minimum
+    /// deadline. Gecko reassembly runs before QUIC, so the source address is
+    /// unverified, and the scan it replaces was O(`GECKO_MAX_REASSEMBLY`) per
+    /// packet under the per-socket lock that *every* received datagram has to
+    /// take -- one packet from a spoofable source bought 4096 comparisons
+    /// while the whole receive path waited behind it.
+    ///
+    /// An entry removed by completion or expiry leaves its key behind here;
+    /// eviction skips such keys and [`GeckoState::compact_order`] drops them.
+    /// A key re-inserted after removal can appear twice, which at worst
+    /// evicts a younger entry than the strict minimum would have: this table
+    /// is a best-effort reassembly cache, and picking a slightly different
+    /// victim under pressure costs a datagram that QUIC already tolerates
+    /// losing.
+    order: VecDeque<GeckoReassemblyKey>,
     last_sweep: Instant,
 }
 
@@ -422,6 +442,7 @@ impl GeckoState {
         Self {
             entries: HashMap::new(),
             per_source: HashMap::new(),
+            order: VecDeque::new(),
             last_sweep: Instant::now(),
         }
     }
@@ -443,6 +464,11 @@ impl GeckoState {
             if self.entries.len() >= GECKO_MAX_REASSEMBLY {
                 self.evict_oldest();
             }
+            // Bound the stale keys that accumulate between sweeps, so a high
+            // completion rate cannot grow `order` without limit.
+            if self.order.len() >= GECKO_ORDER_COMPACT_LEN {
+                self.compact_order();
+            }
             self.entries.insert(
                 key,
                 GeckoReassemblyEntry {
@@ -452,6 +478,7 @@ impl GeckoState {
                     deadline: now + GECKO_REASSEMBLY_TTL,
                 },
             );
+            self.order.push_back(key);
             *self.per_source.entry(addr).or_insert(0) += 1;
         }
 
@@ -492,16 +519,25 @@ impl GeckoState {
         }
     }
 
+    /// Drop the oldest live entry, in amortized O(1).
+    ///
+    /// Stale keys left by completion or expiry are discarded on the way past;
+    /// each one is popped at most once, so the scan they cause is paid for by
+    /// the insertion that queued them.
     fn evict_oldest(&mut self) {
-        let Some(key) = self
-            .entries
-            .iter()
-            .min_by_key(|(_key, entry)| entry.deadline)
-            .map(|(key, _entry)| *key)
-        else {
-            return;
-        };
-        self.drop_entry(key);
+        while let Some(key) = self.order.pop_front() {
+            if self.entries.contains_key(&key) {
+                self.drop_entry(key);
+                return;
+            }
+        }
+    }
+
+    /// Drop keys whose entry is already gone. O(`order`), but only from the
+    /// two paths that amortize it: the TTL sweep and the length guard.
+    fn compact_order(&mut self) {
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
     }
 
     fn sweep_expired(&mut self, now: Instant) {
@@ -513,6 +549,7 @@ impl GeckoState {
         for key in expired {
             self.drop_entry(key);
         }
+        self.compact_order();
         self.last_sweep = now;
     }
 }
@@ -683,6 +720,99 @@ mod tests {
         assert_eq!(
             decode_salamander_packet_in_place(b"secret", &mut packet),
             None
+        );
+    }
+
+    fn gecko_source(index: usize) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(
+                10,
+                ((index >> 16) & 0xff) as u8,
+                ((index >> 8) & 0xff) as u8,
+                (index & 0xff) as u8,
+            )),
+            443,
+        )
+    }
+
+    /// One chunk of a two-chunk message, so the entry stays pending.
+    fn gecko_partial(msg_id: u8) -> GeckoChunk<'static> {
+        GeckoChunk {
+            msg_id,
+            chunk_index: 0,
+            total_chunks: 2,
+            payload: b"a",
+        }
+    }
+
+    /// Eviction takes the oldest entry. Insertion order is deadline order --
+    /// the TTL is fixed and never refreshed -- so the FIFO that replaced the
+    /// per-packet minimum scan has to pick the same victim the scan would.
+    #[test]
+    fn gecko_reassembly_evicts_the_oldest_entry() {
+        let mut state = GeckoState::new();
+        let sources = GECKO_MAX_REASSEMBLY / GECKO_MAX_PER_SOURCE;
+        for source in 0..sources {
+            let addr = gecko_source(source);
+            for msg_id in 0..GECKO_MAX_PER_SOURCE {
+                assert!(
+                    state
+                        .accept_chunk(addr, gecko_partial(msg_id as u8))
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(state.entries.len(), GECKO_MAX_REASSEMBLY);
+
+        let oldest = GeckoReassemblyKey {
+            addr: gecko_source(0),
+            msg_id: 0,
+        };
+        assert!(state.entries.contains_key(&oldest));
+
+        // A fresh source has per-source room, so this insert is admitted and
+        // has to displace something.
+        assert!(
+            state
+                .accept_chunk(gecko_source(sources + 1), gecko_partial(0))
+                .is_none()
+        );
+        assert_eq!(state.entries.len(), GECKO_MAX_REASSEMBLY);
+        assert!(
+            !state.entries.contains_key(&oldest),
+            "eviction did not take the oldest entry"
+        );
+    }
+
+    /// Completed messages leave their key behind in the ordering queue. The
+    /// compaction guard has to reclaim those, or a steady stream of healthy
+    /// traffic grows the queue without bound.
+    #[test]
+    fn gecko_reassembly_order_stays_bounded_under_completions() {
+        let mut state = GeckoState::new();
+        let addr = gecko_source(1);
+        for round in 0..(GECKO_ORDER_COMPACT_LEN * 2) {
+            let msg_id = (round % 251) as u8;
+            assert!(state.accept_chunk(addr, gecko_partial(msg_id)).is_none());
+            assert!(
+                state
+                    .accept_chunk(
+                        addr,
+                        GeckoChunk {
+                            msg_id,
+                            chunk_index: 1,
+                            total_chunks: 2,
+                            payload: b"b",
+                        },
+                    )
+                    .is_some()
+            );
+        }
+        assert!(state.entries.is_empty());
+        assert!(
+            state.order.len() <= GECKO_ORDER_COMPACT_LEN,
+            "ordering queue grew to {} keys",
+            state.order.len()
         );
     }
 

@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{debug, error, warn};
+use log::{debug, error};
 use lru::LruCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
@@ -29,6 +29,7 @@ use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::protocol_sniff::{sniff_tcp_protocol, sniff_udp_protocol};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
+use crate::routing::report_udp_io_error;
 use crate::shared_users::SharedUsers;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{AuthenticatedUser, TcpClientSetupResult};
@@ -1785,8 +1786,11 @@ async fn forward_udp_packet(
     if last_location != remote_location {
         // The session's upstream stream is target-fixed at dial time; a
         // mid-session destination change from the client cannot be honored
-        // (the client should open a new assoc for a new target).
-        warn!(
+        // (the client should open a new assoc for a new target). The client
+        // picks both the assoc id and the destination, so alternating two
+        // targets on one id emits this per datagram -- debug, because the
+        // condition is already handled here.
+        debug!(
             "Location changed during ongoing UDP session: {} (was {})",
             remote_location, last_location
         );
@@ -2096,7 +2100,10 @@ async fn run_datagram_loop(
         )
         .await
         {
-            error!("Failed to process datagram UDP packet: {e}");
+            // One per malformed datagram, at whatever rate the peer sends
+            // them, so it goes through the reason-keyed gate rather than
+            // straight to the log.
+            report_udp_io_error("tuic datagram", &e);
         }
     }
 }
