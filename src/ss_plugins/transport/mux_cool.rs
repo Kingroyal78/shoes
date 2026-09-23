@@ -11,7 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::smux::{BackpressureCause, record_backpressure_drop};
 use super::virtual_stream::{
     BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
-    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ReceiveBudget, VirtualStream,
+    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ProgressWriter, ReceiveBudget,
+    SessionProgress, VirtualStream,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -371,7 +372,11 @@ async fn serve_mux_cool(
     limits: MuxCoolLimits,
     listener_budget: Arc<ReceiveBudget>,
 ) -> io::Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, writer) = tokio::io::split(stream);
+    // Logical streams judge their waits on the writer by what it has moved, so
+    // every write the physical stream accepts is recorded for them.
+    let progress = SessionProgress::new();
+    let mut writer = ProgressWriter::new(writer, progress.clone());
     let (outbound_tx, mut outbound_rx) =
         mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
     let (drop_close_tx, mut drop_close_rx) = mpsc::channel::<u32>(limits.max_concurrent_streams);
@@ -552,6 +557,7 @@ async fn serve_mux_cool(
                     u32::from(metadata.stream_id),
                     InboundChannels::new(inbound_rx, terminal_rx),
                     outbound_tx.clone(),
+                    progress.clone(),
                     u16::MAX as usize,
                 );
                 logical.set_drop_close_permit(close_permit);

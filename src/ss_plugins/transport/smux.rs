@@ -10,8 +10,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::virtual_stream::{
     BudgetBlocked, BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
-    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ReceiveBudget, ReceiveBudgetScope,
-    SmuxV2FlowControl, VirtualStream, WindowUpdate,
+    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ProgressWriter, ReceiveBudget,
+    ReceiveBudgetScope, SessionProgress, SmuxV2FlowControl, VirtualStream, WindowUpdate,
+    with_session_stall_bound,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -147,11 +148,22 @@ const DEFAULT_STREAM_RECEIVE_BUFFER: usize = 256 * 1024;
 /// the client, a dial still in flight -- and dropping the stream there, which
 /// this used to do, failed ordinary uploads a few hundred kilobytes in. A
 /// destination that takes nothing at all for this long is wedged rather than
-/// slow, and its siblings have waited long enough. Twenty seconds rides out TCP
-/// retransmission backoff on the outbound path (1+2+4+8s) and still bounds the
-/// head-of-line stall one wedged stream can impose on everything sharing its
-/// connection.
-pub const DEFAULT_STALLED_STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+/// slow, and its siblings have waited long enough.
+///
+/// "Takes nothing" has to be measured in the time a healthy slow destination
+/// can go between writes, and that is longer than it looks: a socket whose
+/// send buffer is full is only reported writable again once about a third of
+/// it has been acknowledged, which for an upload to a far, slow server is tens
+/// of seconds with the transfer still moving. The twenty seconds this used to
+/// be cut such uploads off. It is the same bound the download direction uses
+/// for its own session writer, for the same reason.
+///
+/// Eviction stays even for a session with a single stream open. The reader
+/// cannot see past the frame it is parked on, and a SYN for the next stream
+/// may already be waiting behind it -- Mihomo opens one stream per session,
+/// but a client multiplexing several would otherwise be wedged for good.
+pub const DEFAULT_STALLED_STREAM_GRACE: std::time::Duration =
+    super::virtual_stream::SESSION_STALL_TIMEOUT;
 
 /// Default ceiling on queued inbound bytes across a listener's sessions.
 /// Far above what healthy traffic queues -- data sits here only while a logical
@@ -617,31 +629,32 @@ impl FrameBatch {
     }
 
     /// Write the batch in one write, flush it, and answer its barrier.
-    async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> io::Result<()> {
+    ///
+    /// Bounded by the session's progress rather than by a clock. A half-open
+    /// physical stream can stall the write or the flush forever, which would
+    /// hold the barrier's oneshot open, wedge the logical stream's shutdown and
+    /// leak the outbound connection in CLOSE_WAIT. A slow one -- a send buffer
+    /// draining at a megabit across a 400 ms path, writable again only every
+    /// ten seconds or more -- is not stalled, and the five-second bound this
+    /// used to have cut it off, taking every stream on the session with it.
+    /// See [`SESSION_STALL_TIMEOUT`](super::virtual_stream::SESSION_STALL_TIMEOUT).
+    async fn write_to<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        progress: &SessionProgress,
+    ) -> io::Result<()> {
         let bytes = std::mem::take(&mut self.bytes);
         let barrier = self.barrier.take();
         if bytes.is_empty() && barrier.is_none() {
             return Ok(());
         }
-        let result = async {
+        let io = async {
             if !bytes.is_empty() {
                 writer.write_all(&bytes).await?;
             }
-            if barrier.is_none() {
-                return writer.flush().await;
-            }
-            // Bound the flush: a half-open physical stream can stall flush
-            // forever, which would hold the barrier's oneshot open, wedge the
-            // logical stream's shutdown, and leak the outbound connection in
-            // CLOSE_WAIT. On timeout report the error so the logical stream
-            // closes anyway.
-            tokio::time::timeout(std::time::Duration::from_secs(5), writer.flush())
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "smux barrier flush timed out")
-                })?
-        }
-        .await;
+            writer.flush().await
+        };
+        let result = with_session_stall_bound(progress, io, "smux session write").await;
         if let Some(complete) = barrier {
             let reported = result
                 .as_ref()
@@ -666,13 +679,17 @@ struct StreamState {
 /// The session's only writer: turns queued frames into writes on the physical
 /// stream, batching whatever is already waiting.
 async fn run_session_writer<W: AsyncWrite + Unpin>(
-    mut writer: W,
+    writer: W,
     version: u8,
     keepalive_interval: Option<std::time::Duration>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
     mut updates_rx: mpsc::Receiver<WindowUpdate>,
     shutdown: Arc<tokio::sync::Notify>,
+    progress: Arc<SessionProgress>,
 ) -> io::Result<()> {
+    // Every write the physical stream accepts is progress the logical streams
+    // waiting on this writer can see.
+    let mut writer = ProgressWriter::new(writer, progress.clone());
     let mut updates_open = true;
     let mut closing = false;
     let ping_period =
@@ -730,7 +747,7 @@ async fn run_session_writer<W: AsyncWrite + Unpin>(
                     Err(_) => break,
                 }
             }
-            batch.write_to(&mut writer).await?;
+            batch.write_to(&mut writer, &progress).await?;
         }
         Ok(())
     }
@@ -804,6 +821,7 @@ async fn serve_smux(
     // depend on every nested sender clone disappearing in a particular order.
     let writer_shutdown = Arc::new(tokio::sync::Notify::new());
     let writer_shutdown_signal = writer_shutdown.clone();
+    let progress = SessionProgress::new();
     let mut writer_task = tokio::spawn(run_session_writer(
         writer,
         version,
@@ -811,6 +829,7 @@ async fn serve_smux(
         outbound_rx,
         updates_rx,
         writer_shutdown_signal,
+        progress.clone(),
     ));
 
     let mut streams: HashMap<u32, StreamState> = HashMap::new();
@@ -905,6 +924,7 @@ async fn serve_smux(
                         frame.stream_id,
                         InboundChannels::new(inbound_rx, terminal_rx),
                         outbound_tx.clone(),
+                        progress.clone(),
                         limits.max_frame_payload,
                         flow,
                         updates_tx.clone(),
@@ -915,6 +935,7 @@ async fn serve_smux(
                         frame.stream_id,
                         InboundChannels::new(inbound_rx, terminal_rx),
                         outbound_tx.clone(),
+                        progress.clone(),
                         limits.max_frame_payload,
                     )
                 };
@@ -1599,6 +1620,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
             flow,
             updates_tx,
@@ -1655,6 +1677,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
             flow,
             updates_tx,
@@ -2599,8 +2622,149 @@ mod tests {
             outbound_rx,
             updates_rx,
             Arc::new(Notify::new()),
+            SessionProgress::new(),
         )
         .await
+    }
+
+    /// A physical stream that takes a few bytes at a time, with a pause
+    /// between writes: the shape of a socket on a slow, high-latency path.
+    struct TricklingWriter {
+        chunk: usize,
+        interval: std::time::Duration,
+        pause: Option<Pin<Box<tokio::time::Sleep>>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for TricklingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(pause) = self.pause.as_mut() {
+                futures::ready!(pause.as_mut().poll(cx));
+            }
+            let accepted = buf.len().min(self.chunk);
+            self.written
+                .lock()
+                .expect("written mutex poisoned")
+                .extend_from_slice(&buf[..accepted]);
+            let interval = self.interval;
+            self.pause = Some(Box::pin(tokio::time::sleep(interval)));
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A physical stream that never accepts another byte: a peer that is gone.
+    struct StuckWriter;
+
+    impl AsyncWrite for StuckWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn run_writer_over<W: AsyncWrite + Unpin>(
+        writer: W,
+        commands: Vec<OutboundCommand>,
+    ) -> io::Result<()> {
+        let (outbound_tx, outbound_rx) = mpsc::channel(commands.len().max(1));
+        for command in commands {
+            outbound_tx
+                .try_send(command)
+                .expect("queue sized for every command");
+        }
+        drop(outbound_tx);
+        let (_updates_tx, updates_rx) = mpsc::channel(1);
+        run_session_writer(
+            writer,
+            VERSION_V1,
+            None,
+            outbound_rx,
+            updates_rx,
+            Arc::new(Notify::new()),
+            SessionProgress::new(),
+        )
+        .await
+    }
+
+    /// The high-latency cut, at the session writer: a batch that takes many
+    /// stall periods to drain, but moves bytes well inside every one of them,
+    /// is slow rather than stalled.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_physical_stream_is_not_mistaken_for_a_stalled_one() {
+        let stall = super::super::virtual_stream::session_stall_timeout();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer = TricklingWriter {
+            chunk: 64,
+            interval: stall / 2,
+            pause: None,
+            written: written.clone(),
+        };
+        let payload: Vec<u8> = (0..4096).map(|index: usize| index as u8).collect();
+        let (complete, barrier) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+
+        run_writer_over(
+            writer,
+            vec![data(1, &payload), OutboundCommand::Barrier { complete }],
+        )
+        .await
+        .expect("a slow but moving physical stream must not end the session");
+
+        assert!(
+            tokio::time::Instant::now() - started > stall * 10,
+            "the batch should have taken many stall periods to drain"
+        );
+        barrier
+            .await
+            .expect("barrier answered")
+            .expect("the barrier behind a slow write completes normally");
+        assert_eq!(
+            *written.lock().expect("written mutex poisoned"),
+            encoded(CMD_PSH, 1, &payload)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_physical_stream_that_accepts_nothing_ends_the_session() {
+        let (complete, barrier) = oneshot::channel();
+        let error = run_writer_over(
+            StuckWriter,
+            vec![
+                data(1, b"never sent"),
+                OutboundCommand::Barrier { complete },
+            ],
+        )
+        .await
+        .expect_err("a physical stream that accepts nothing is dead");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let reported = barrier.await.expect("barrier answered");
+        assert_eq!(
+            reported.expect_err("the barrier hears why").kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[tokio::test]

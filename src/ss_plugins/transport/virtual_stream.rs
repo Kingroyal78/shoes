@@ -758,14 +758,21 @@ pub(super) struct VirtualStream {
     inbound_chunk: Option<InboundData>,
     inbound_offset: usize,
     outbound: mpsc::Sender<OutboundCommand>,
+    /// The session writer's progress, which decides when a wait on it has
+    /// stalled rather than merely taken a while; see [`SESSION_STALL_TIMEOUT`].
+    progress: Arc<SessionProgress>,
     write_permit: Option<PermitFuture>,
     write_timeout: Option<Pin<Box<Sleep>>>,
+    /// When the write currently parked on the session began waiting.
+    write_stalled_since: Option<tokio::time::Instant>,
     finish_permit: Option<PermitFuture>,
     finish_timeout: Option<Pin<Box<Sleep>>>,
+    finish_started: tokio::time::Instant,
     barrier: BarrierState,
     /// Deadline for the barrier currently in flight, reused across barriers so
     /// each flush does not allocate and register fresh timer entries.
     barrier_timeout: Option<Pin<Box<Sleep>>>,
+    barrier_started: tokio::time::Instant,
     /// Whether any payload has been queued since the last completed barrier.
     /// A flush with nothing outstanding is a no-op, so it must not pay for a
     /// round trip through the session writer.
@@ -782,8 +789,10 @@ impl VirtualStream {
         stream_id: u32,
         inbound: InboundChannels,
         outbound: mpsc::Sender<OutboundCommand>,
+        progress: Arc<SessionProgress>,
         max_frame_payload: usize,
     ) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
             stream_id,
             inbound: inbound.data,
@@ -791,12 +800,16 @@ impl VirtualStream {
             inbound_chunk: None,
             inbound_offset: 0,
             outbound,
+            progress,
             write_permit: None,
             write_timeout: None,
+            write_stalled_since: None,
             finish_permit: None,
             finish_timeout: None,
+            finish_started: now,
             barrier: BarrierState::Idle,
             barrier_timeout: None,
+            barrier_started: now,
             write_dirty: false,
             max_frame_payload,
             read_finished: false,
@@ -806,16 +819,18 @@ impl VirtualStream {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_smux_v2(
         stream_id: u32,
         inbound: InboundChannels,
         outbound: mpsc::Sender<OutboundCommand>,
+        progress: Arc<SessionProgress>,
         max_frame_payload: usize,
         flow: Arc<SmuxV2FlowControl>,
         updates: mpsc::Sender<WindowUpdate>,
         receive_window: u32,
     ) -> Self {
-        let mut stream = Self::new(stream_id, inbound, outbound, max_frame_payload);
+        let mut stream = Self::new(stream_id, inbound, outbound, progress, max_frame_payload);
         stream.smux_v2 = Some(SmuxV2StreamState {
             flow,
             updates,
@@ -858,18 +873,22 @@ impl VirtualStream {
     /// allocate and insert another; a flush-heavy session performs this on
     /// every barrier, and the timer wheel is process-wide and lock-guarded.
     fn arm_barrier_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + barrier_timeout();
+        self.barrier_started = tokio::time::Instant::now();
+        let deadline = self.barrier_started + session_stall_timeout();
         match &mut self.barrier_timeout {
             Some(timeout) => timeout.as_mut().reset(deadline),
             None => self.barrier_timeout = Some(Box::pin(tokio::time::sleep_until(deadline))),
         }
     }
 
-    /// Poll the shared barrier deadline. Absent means the barrier just started
-    /// within this call and cannot have expired yet.
+    /// Whether the barrier in flight has waited on a stalled session for a
+    /// full stall timeout. Absent means the barrier just started within this
+    /// call and cannot have expired yet.
     fn poll_barrier_timeout(&mut self, cx: &mut Context<'_>) -> bool {
         match &mut self.barrier_timeout {
-            Some(timeout) => timeout.as_mut().poll(cx).is_ready(),
+            Some(timeout) => {
+                poll_session_stall(timeout.as_mut(), self.barrier_started, &self.progress, cx)
+            }
             None => false,
         }
     }
@@ -989,15 +1008,19 @@ impl VirtualStream {
     }
 
     fn poll_stalled_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let timeout = self
-            .write_timeout
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(barrier_timeout())));
-        if timeout.as_mut().poll(cx).is_pending() {
+        let started = *self
+            .write_stalled_since
+            .get_or_insert_with(tokio::time::Instant::now);
+        let timeout = self.write_timeout.get_or_insert_with(|| {
+            Box::pin(tokio::time::sleep_until(started + session_stall_timeout()))
+        });
+        if !poll_session_stall(timeout.as_mut(), started, &self.progress, cx) {
             return Poll::Pending;
         }
 
         self.write_permit = None;
         self.write_timeout = None;
+        self.write_stalled_since = None;
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "multiplexed stream data write timed out",
@@ -1021,12 +1044,163 @@ impl VirtualStream {
     }
 }
 
-fn barrier_timeout() -> std::time::Duration {
+/// How long a multiplexed session may go without moving a single byte onto
+/// its physical connection before the work waiting on it gives up.
+///
+/// This used to be a fixed five seconds on every flush barrier, queue slot and
+/// close, and that was what cut downloads on high-latency links: the session
+/// writer is not stalled while its socket's send buffer drains, it is waiting
+/// for the kernel to report the socket writable again, which only happens once
+/// roughly a third of that buffer has been acknowledged. With the buffer
+/// autotuned for a 400-800 ms path and a connection getting a megabit or so,
+/// that is well over ten seconds between writes of a perfectly healthy
+/// transfer. Measuring from the last byte the session moved instead of from
+/// when the wait began keeps a slow connection alive for as long as it keeps
+/// moving, and still reclaims one whose peer has vanished -- the half-open
+/// case the bound exists for -- two minutes after it stopped.
+///
+/// Two minutes rather than one leaves room for the worst of both at once: the
+/// writability gap of a sub-megabit connection on an 800 ms path, or TCP's
+/// retransmission backoff (1+2+4+8+16+32 s) on a lossy one.
+pub(super) const SESSION_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub(super) fn session_stall_timeout() -> std::time::Duration {
     if cfg!(test) {
         std::time::Duration::from_millis(20)
     } else {
-        std::time::Duration::from_secs(5)
+        SESSION_STALL_TIMEOUT
     }
+}
+
+/// When a multiplexed session last moved bytes onto its physical connection.
+///
+/// Shared by the session writer, which records every write the transport
+/// accepts, and by the logical streams, which consult it before giving up on
+/// a wait that depends on that writer.
+#[derive(Debug)]
+pub(super) struct SessionProgress {
+    origin: tokio::time::Instant,
+    /// Milliseconds after `origin` of the last recorded progress.
+    last_ms: AtomicU64,
+}
+
+impl SessionProgress {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// The physical connection just accepted bytes.
+    pub(super) fn record(&self) {
+        let elapsed = self.origin.elapsed().as_millis() as u64;
+        self.last_ms.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    /// When a wait that began at `started` should give up, as things stand:
+    /// no sooner than a full stall timeout after it began, and never while the
+    /// session is still moving bytes.
+    pub(super) fn stall_deadline(&self, started: tokio::time::Instant) -> tokio::time::Instant {
+        let last =
+            self.origin + std::time::Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        started.max(last) + session_stall_timeout()
+    }
+}
+
+/// Poll `timer` for a wait that began at `started`, returning whether the
+/// session has now gone a full stall timeout without progress.
+///
+/// The timer is armed for the earliest the wait could expire and only moved
+/// when it fires, so a busy session costs one re-arm per timeout period rather
+/// than one per write.
+fn poll_session_stall(
+    mut timer: Pin<&mut Sleep>,
+    started: tokio::time::Instant,
+    progress: &SessionProgress,
+    cx: &mut Context<'_>,
+) -> bool {
+    loop {
+        if timer.as_mut().poll(cx).is_pending() {
+            return false;
+        }
+        let deadline = progress.stall_deadline(started);
+        if tokio::time::Instant::now() >= deadline {
+            return true;
+        }
+        timer.as_mut().reset(deadline);
+    }
+}
+
+/// A transport wrapper that records every accepted write as session progress.
+pub(super) struct ProgressWriter<W> {
+    inner: W,
+    progress: Arc<SessionProgress>,
+}
+
+impl<W> ProgressWriter<W> {
+    pub(super) fn new(inner: W, progress: Arc<SessionProgress>) -> Self {
+        Self { inner, progress }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result
+            && *written > 0
+        {
+            self.progress.record();
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        if let Poll::Ready(Ok(())) = &result {
+            self.progress.record();
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Run `io` against a session's physical connection, failing it only if the
+/// session goes a full stall timeout without moving a byte.
+pub(super) async fn with_session_stall_bound<T>(
+    progress: &SessionProgress,
+    io: impl Future<Output = io::Result<T>>,
+    what: &str,
+) -> io::Result<T> {
+    let started = tokio::time::Instant::now();
+    tokio::pin!(io);
+    // On the stack, and never registered with the timer wheel unless the
+    // write actually has to wait: most batches complete on their first poll.
+    let timer = tokio::time::sleep_until(started + session_stall_timeout());
+    tokio::pin!(timer);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(result) = io.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        if poll_session_stall(timer.as_mut(), started, progress, cx) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{what}: the physical connection accepted nothing for {}s",
+                    session_stall_timeout().as_secs()
+                ),
+            )));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 fn data_command(stream_id: u32, payload: &[u8]) -> OutboundCommand {
@@ -1215,6 +1389,7 @@ impl AsyncWrite for VirtualStream {
             v2.flow.record_write(length);
         }
         self.write_timeout = None;
+        self.write_stalled_since = None;
         // A later flush now has real work to wait for.
         self.write_dirty = true;
         Poll::Ready(Ok(length))
@@ -1228,7 +1403,10 @@ impl AsyncWrite for VirtualStream {
         if !self.write_finished {
             if self.finish_permit.is_none() {
                 self.finish_permit = Some(Self::reserve(self.outbound.clone()));
-                self.finish_timeout = Some(Box::pin(tokio::time::sleep(barrier_timeout())));
+                self.finish_started = tokio::time::Instant::now();
+                self.finish_timeout = Some(Box::pin(tokio::time::sleep_until(
+                    self.finish_started + session_stall_timeout(),
+                )));
             }
             let permit = match self
                 .finish_permit
@@ -1238,13 +1416,16 @@ impl AsyncWrite for VirtualStream {
                 .poll(cx)
             {
                 Poll::Pending => {
-                    let timed_out = self
-                        .finish_timeout
-                        .as_mut()
-                        .expect("finish timeout initialized with permit")
-                        .as_mut()
-                        .poll(cx)
-                        .is_ready();
+                    let this = &mut *self;
+                    let timed_out = poll_session_stall(
+                        this.finish_timeout
+                            .as_mut()
+                            .expect("finish timeout initialized with permit")
+                            .as_mut(),
+                        this.finish_started,
+                        &this.progress,
+                        cx,
+                    );
                     if timed_out {
                         self.finish_permit = None;
                         self.finish_timeout = None;
@@ -1380,6 +1561,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
         stream.set_drop_close_permit(close_permit);
@@ -1402,6 +1584,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1428,6 +1611,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1460,6 +1644,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1494,6 +1679,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1542,6 +1728,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
         // The queue is already full, so a real write cannot be issued here;
@@ -1573,6 +1760,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1600,6 +1788,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
         );
 
@@ -1626,6 +1815,7 @@ mod tests {
             7,
             InboundChannels::new(inbound_rx, terminal_rx),
             outbound_tx,
+            SessionProgress::new(),
             1024,
             flow,
             updates_tx,
@@ -1641,5 +1831,125 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    fn idle_stream(
+        outbound_tx: mpsc::Sender<OutboundCommand>,
+        progress: Arc<SessionProgress>,
+    ) -> (
+        VirtualStream,
+        mpsc::Sender<InboundEvent>,
+        oneshot::Sender<InboundTerminal>,
+    ) {
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let stream = VirtualStream::new(
+            7,
+            InboundChannels::new(inbound_rx, terminal_rx),
+            outbound_tx,
+            progress,
+            1024,
+        );
+        (stream, inbound_tx, terminal_tx)
+    }
+
+    /// The high-latency cut: a session writer that is slow but still moving
+    /// bytes -- a send buffer draining at a megabit across a 400 ms path is
+    /// writable again only every ten seconds or more -- must not have its
+    /// streams' flushes time out underneath it.
+    #[tokio::test(start_paused = true)]
+    async fn a_barrier_outlives_the_stall_timeout_while_the_session_keeps_moving() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        let progress = SessionProgress::new();
+        let (mut stream, _inbound, _terminal) = idle_stream(outbound_tx, progress.clone());
+        stream.write_all(b"payload").await.unwrap();
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Data { .. })
+        ));
+
+        let stall = session_stall_timeout();
+        let mut flush = Box::pin(stream.flush());
+        for _ in 0..20 {
+            assert!(
+                futures::poll!(flush.as_mut()).is_pending(),
+                "a barrier on a session that is still moving bytes must not time out"
+            );
+            tokio::time::advance(stall / 2).await;
+            progress.record();
+        }
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+
+        let Some(OutboundCommand::Barrier { complete }) = outbound_rx.recv().await else {
+            panic!("flush did not queue a barrier");
+        };
+        complete.send(Ok(())).unwrap();
+        flush
+            .await
+            .expect("the barrier completes once the writer reaches it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_barrier_times_out_once_the_session_stops_moving() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        let progress = SessionProgress::new();
+        let (mut stream, _inbound, _terminal) = idle_stream(outbound_tx, progress.clone());
+        stream.write_all(b"payload").await.unwrap();
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Data { .. })
+        ));
+
+        let stall = session_stall_timeout();
+        let mut flush = Box::pin(stream.flush());
+        for _ in 0..6 {
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            tokio::time::advance(stall / 2).await;
+            progress.record();
+        }
+        let last_progress = tokio::time::Instant::now();
+
+        let error = flush
+            .await
+            .expect_err("a stalled session must fail the barrier");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            tokio::time::Instant::now() >= last_progress + stall,
+            "the stall is measured from the last progress, not from when the barrier began"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waits_on_a_full_queue_while_the_session_keeps_moving() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        outbound_tx
+            .send(OutboundCommand::Data {
+                stream_id: 99,
+                frame: OutboundFrame::copy_from(&[1]),
+            })
+            .await
+            .unwrap();
+        let progress = SessionProgress::new();
+        let (mut stream, _inbound, _terminal) = idle_stream(outbound_tx, progress.clone());
+
+        let stall = session_stall_timeout();
+        {
+            let mut write = Box::pin(stream.write(b"queued"));
+            for _ in 0..20 {
+                assert!(
+                    futures::poll!(write.as_mut()).is_pending(),
+                    "a write parked on a busy session must not time out"
+                );
+                tokio::time::advance(stall / 2).await;
+                progress.record();
+            }
+            // The writer finally takes the frame ahead of this one.
+            assert!(outbound_rx.recv().await.is_some());
+            assert_eq!(write.await.unwrap(), 6);
+        }
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(OutboundCommand::Data { .. })
+        ));
     }
 }
