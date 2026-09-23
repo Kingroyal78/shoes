@@ -501,6 +501,15 @@ impl ResolverCache {
     /// is exactly the traffic pattern a UDP relay sees.
     pub const DEFAULT_MAX_ENTRIES: usize = 512;
 
+    /// Upper bound on hostname lookups that may be waiting at once.
+    ///
+    /// A completed-result cap alone does not bound a peer that keeps naming
+    /// new destinations while DNS is slow: every distinct name stays in
+    /// `pending` until its shared future completes. Refuse new work once this
+    /// ceiling is reached so the cache cannot retain an unbounded set of
+    /// resolver futures and wakers.
+    pub const DEFAULT_MAX_PENDING: usize = 256;
+
     pub fn new(resolver: Arc<dyn Resolver>) -> Self {
         Self::new_with_timeout(resolver, Self::DEFAULT_RESULT_TIMEOUT_SECS)
     }
@@ -584,16 +593,27 @@ impl ResolverCache {
             self.cache.remove(target);
         }
 
-        // Get or create shared future for this target
-        let mut shared_fut = self
-            .pending
-            .entry(target.clone())
-            .or_insert_with(|| {
-                let fut = self.resolver.resolve_location(target);
-                // Wrap error in Arc for Clone requirement, then make shared
-                fut.map(|r| r.map_err(Arc::new)).boxed().shared()
-            })
-            .clone();
+        // Get or create shared future for this target. A connection can name
+        // many destinations while DNS is stalled, so bound the number of
+        // retained futures before allocating another one.
+        let mut shared_fut = if let Some(shared_fut) = self.pending.get(target).cloned() {
+            shared_fut
+        } else {
+            if self.pending.len() >= Self::DEFAULT_MAX_PENDING {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "too many pending DNS lookups (maximum {})",
+                        Self::DEFAULT_MAX_PENDING
+                    ),
+                )));
+            }
+            let fut = self.resolver.resolve_location(target);
+            // Wrap error in Arc for Clone requirement, then make shared.
+            let shared_fut = fut.map(|r| r.map_err(Arc::new)).boxed().shared();
+            self.pending.insert(target.clone(), shared_fut.clone());
+            shared_fut
+        };
 
         // Poll the shared future
         match shared_fut.poll_unpin(cx) {
@@ -714,6 +734,43 @@ mod tests {
 
     fn test_addrs() -> Vec<SocketAddr> {
         vec!["127.0.0.1:80".parse().unwrap()]
+    }
+
+    #[derive(Debug)]
+    struct PendingResolver;
+
+    impl Resolver for PendingResolver {
+        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn unique_location(index: usize) -> NetLocation {
+        NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
+    }
+
+    #[test]
+    fn resolver_cache_bounds_pending_lookups() {
+        let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
+        let mut cache = ResolverCache::new(resolver);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        for index in 0..ResolverCache::DEFAULT_MAX_PENDING {
+            assert!(matches!(
+                cache.poll_resolve_location(&mut cx, &unique_location(index)),
+                Poll::Pending
+            ));
+        }
+
+        let result = cache.poll_resolve_location(
+            &mut cx,
+            &unique_location(ResolverCache::DEFAULT_MAX_PENDING),
+        );
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(cache.pending.len(), ResolverCache::DEFAULT_MAX_PENDING);
     }
 
     #[tokio::test]

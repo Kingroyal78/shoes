@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::smux::{BackpressureCause, record_backpressure_drop};
 use super::virtual_stream::{
     BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
-    OutboundCommand, ReceiveBudget, VirtualStream,
+    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ReceiveBudget, VirtualStream,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -334,6 +334,28 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     writer.write_all(&frame).await
 }
 
+/// Write a data frame, finishing its header in the room the logical stream
+/// reserved in front of the payload so the payload is not copied again.
+async fn write_data_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    stream_id: u16,
+    frame: OutboundFrame,
+) -> io::Result<()> {
+    if frame.payload().is_empty() {
+        return write_frame(writer, stream_id, STATUS_KEEP, &[]).await;
+    }
+    let length = u16::try_from(frame.payload().len())
+        .map_err(|_| invalid_error("Mux.Cool payload exceeds 65535 bytes"))?;
+    let mut header = [0u8; OUTBOUND_HEADER_ROOM];
+    header[..2].copy_from_slice(&4u16.to_be_bytes());
+    header[2..4].copy_from_slice(&stream_id.to_be_bytes());
+    header[4] = STATUS_KEEP;
+    header[5] = OPTION_DATA;
+    header[6..].copy_from_slice(&length.to_be_bytes());
+    // One complete frame per write, for the reason `write_frame` gives.
+    writer.write_all(&frame.into_frame(header)).await
+}
+
 struct LogicalStreamState {
     inbound: Option<mpsc::Sender<InboundEvent>>,
     terminal: Option<oneshot::Sender<InboundTerminal>>,
@@ -379,10 +401,10 @@ async fn serve_mux_cool(
                 command = outbound_rx.recv() => {
                     let Some(command) = command else { break };
                     match command {
-                        OutboundCommand::Data { stream_id, data } => {
+                        OutboundCommand::Data { stream_id, frame } => {
                             let stream_id = u16::try_from(stream_id)
                                 .map_err(|_| invalid_error("Mux.Cool stream ID exceeds u16"))?;
-                            write_frame(&mut writer, stream_id, STATUS_KEEP, &data).await?;
+                            write_data_frame(&mut writer, stream_id, frame).await?;
                         }
                         OutboundCommand::Finished { stream_id } => {
                             let stream_id = u16::try_from(stream_id)

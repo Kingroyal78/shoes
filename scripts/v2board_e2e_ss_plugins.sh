@@ -213,6 +213,34 @@ mysql_query() {
     -e "$1" 2>/dev/null
 }
 
+# V2Board deployments in the wild use both cache-prefix spellings: older
+# installs include the separator after the configured prefix while the local
+# Docker panel currently stores the key without it. Read and clear both forms
+# so the readiness gate checks the panel's actual capability status instead of
+# silently timing out on a prefix formatting difference.
+redis_capability_get() {
+  local node_id="$1"
+  local key value
+  for key in \
+    "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" \
+    "v2board_database_v2board_cacheSERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}"; do
+    value="$(docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 GET "${key}" 2>/dev/null || true)"
+    if [[ -n "${value}" ]]; then
+      printf '%s\n' "${value}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+redis_capability_del() {
+  local node_id="$1"
+  docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 DEL \
+    "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" \
+    "v2board_database_v2board_cacheSERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" \
+    >/dev/null 2>&1 || true
+}
+
 discover_server_token() {
   if [[ -n "${V2BOARD_SERVER_TOKEN:-}" ]]; then
     printf '%s\n' "${V2BOARD_SERVER_TOKEN}"
@@ -319,8 +347,7 @@ DELETE FROM v2_stat_user WHERE user_id=${user_id};
 SQL
 
   e2e_redis_hdel_user_traffic "${V2BOARD_REDIS_CONTAINER}" "${user_id}"
-  docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 DEL \
-    "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" >/dev/null 2>&1 || true
+  redis_capability_del "${node_id}"
 }
 
 free_port() {
@@ -380,8 +407,7 @@ wait_capability_ready() {
 
   start="$(date +%s)"
   while true; do
-    raw_status="$(docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 GET \
-      "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" 2>/dev/null || true)"
+    raw_status="$(redis_capability_get "${node_id}")"
     if printf '%s' "${raw_status}" \
       | python3 "${TMP_DIR}/capability_check.py" "${expected_revision}" "${expected_feature}"; then
       return 0
@@ -409,8 +435,7 @@ capability_ready_within() {
 
   start="$(date +%s)"
   while true; do
-    raw_status="$(docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 GET \
-      "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" 2>/dev/null || true)"
+    raw_status="$(redis_capability_get "${node_id}")"
     if printf '%s' "${raw_status}" \
       | python3 "${TMP_DIR}/capability_check.py" "${expected_revision}" "${expected_feature}"; then
       return 0
@@ -880,8 +905,7 @@ cleanup_fixtures() {
           DELETE FROM v2_stat_user WHERE user_id=${user_id};
           DELETE FROM v2_stat_server WHERE server_id=${node_id} AND server_type='shadowsocks';" \
       >/dev/null 2>&1 || true
-    docker exec "${V2BOARD_REDIS_CONTAINER}" redis-cli -n 1 DEL \
-      "v2board_database_v2board_cache:SERVER_SHADOWSOCKS_CAPABILITY_STATUS_${node_id}" >/dev/null 2>&1 || true
+    redis_capability_del "${node_id}"
     index=$((index + 1))
   done
 }

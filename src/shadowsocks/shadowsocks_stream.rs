@@ -222,17 +222,31 @@ pub struct ShadowsocksStream {
     sealing_key: ShadowsocksSealingKey,
     opening_key: Option<ShadowsocksOpeningKey>,
 
+    /// Bytes received from the transport. Its length is exactly how much has
+    /// been filled, so growing it never initialises bytes that the next read
+    /// overwrites anyway, and nothing ever sees memory that was not written.
+    ///
+    /// A chunk is decrypted where it lies, and its plaintext is handed to the
+    /// caller straight from here: `plaintext_start..plaintext_end`, followed
+    /// by the chunk's (spent) tag, followed by ciphertext not yet decrypted
+    /// from `unprocessed_start_offset`. At most one chunk is decrypted ahead
+    /// of the caller, which bounds buffered plaintext to one packet.
     unprocessed_buf: Vec<u8>,
     unprocessed_start_offset: usize,
-    unprocessed_end_offset: usize,
     unprocessed_pending_len: Option<usize>,
-    processed_buf: Vec<u8>,
-    processed_start_offset: usize,
-    processed_end_offset: usize,
+    plaintext_start: usize,
+    plaintext_end: usize,
+    /// Most bytes buffered at once since the buffer was last reacquired. It
+    /// sizes the next reacquisition, so a bulk transfer takes one allocation
+    /// per wake instead of doubling up from `INITIAL_BUF_SIZE` every time,
+    /// while a stream carrying small messages goes back to a small buffer.
+    unprocessed_high_water: usize,
+    unprocessed_reacquire_size: usize,
 
+    /// Encrypted bytes waiting for the transport; its length is the end of
+    /// what is queued, for the same reason as `unprocessed_buf`.
     write_cache: Vec<u8>,
     write_cache_start_offset: usize,
-    write_cache_end_offset: usize,
 
     is_initial_read: bool,
     is_initial_write: bool,
@@ -241,7 +255,6 @@ pub struct ShadowsocksStream {
 
 enum DecryptState {
     NeedData,
-    BufferFull,
     Success,
 }
 
@@ -306,9 +319,8 @@ impl ShadowsocksStream {
         // protocol maximum up front costs ~192 KB per stream and two streams
         // per proxied connection, which dominates the heap at high connection
         // counts even though most connections never carry a full-sized packet.
-        let unprocessed_buf = allocate_vec(INITIAL_BUF_SIZE);
-        let processed_buf = allocate_vec(INITIAL_BUF_SIZE);
-        let write_cache = allocate_vec(INITIAL_BUF_SIZE);
+        let unprocessed_buf = Vec::with_capacity(INITIAL_BUF_SIZE);
+        let write_cache = Vec::with_capacity(INITIAL_BUF_SIZE);
 
         let mut encrypt_iv = allocate_vec(salt_len).into_boxed_slice();
         generate_iv(&mut encrypt_iv);
@@ -333,15 +345,14 @@ impl ShadowsocksStream {
 
             unprocessed_buf,
             unprocessed_start_offset: 0,
-            unprocessed_end_offset: 0,
             unprocessed_pending_len: None,
-            processed_buf,
-            processed_start_offset: 0,
-            processed_end_offset: 0,
+            plaintext_start: 0,
+            plaintext_end: 0,
+            unprocessed_high_water: 0,
+            unprocessed_reacquire_size: INITIAL_BUF_SIZE,
 
             write_cache,
             write_cache_start_offset: 0,
-            write_cache_end_offset: 0,
 
             is_initial_read: true,
             is_initial_write: true,
@@ -357,18 +368,20 @@ impl ShadowsocksStream {
         Ok(())
     }
 
+    /// Decrypt the next chunk in place, if all of it has arrived.
+    ///
+    /// Only called once the previous chunk's plaintext has been handed out:
+    /// the plaintext stays where it was decrypted, so there is never more than
+    /// one chunk of it buffered.
     fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
-        // returns true if a full packet was decrypted, false if not (ie. more data required)
+        debug_assert!(!self.has_plaintext());
 
-        let available_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
+        let available_len = self.unprocessed_buf.len() - self.unprocessed_start_offset;
 
         let pending_len = match self.unprocessed_pending_len {
             Some(len) => {
                 if available_len < len + TAG_LEN {
                     return Ok(DecryptState::NeedData);
-                }
-                if !self.ensure_processed_room(len) {
-                    return Ok(DecryptState::BufferFull);
                 }
                 self.unprocessed_pending_len = None;
                 len
@@ -414,15 +427,8 @@ impl ShadowsocksStream {
 
                 if available_len - data_length_len < data_len_no_tag + TAG_LEN {
                     self.unprocessed_pending_len = Some(data_len_no_tag);
-                    if self.unprocessed_start_offset == self.unprocessed_end_offset {
-                        self.unprocessed_start_offset = 0;
-                        self.unprocessed_end_offset = 0;
-                    }
+                    self.discard_consumed_unprocessed();
                     return Ok(DecryptState::NeedData);
-                }
-
-                if !self.ensure_processed_room(data_len_no_tag) {
-                    return Ok(DecryptState::BufferFull);
                 }
 
                 data_len_no_tag
@@ -446,18 +452,12 @@ impl ShadowsocksStream {
             ));
         }
 
-        self.processed_buf[self.processed_end_offset..self.processed_end_offset + pending_len]
-            .copy_from_slice(
-                &self.unprocessed_buf
-                    [self.unprocessed_start_offset..self.unprocessed_start_offset + pending_len],
-            );
-
-        self.processed_end_offset += pending_len;
+        // The plaintext is read out from right here; see `read_plaintext`.
+        self.plaintext_start = self.unprocessed_start_offset;
+        self.plaintext_end = self.unprocessed_start_offset + pending_len;
         self.unprocessed_start_offset += pending_len_with_tag;
-
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
+        if !self.has_plaintext() {
+            self.discard_consumed_unprocessed();
         }
 
         // this previously returned a Result<usize> but then we can't tell if it's a
@@ -466,69 +466,92 @@ impl ShadowsocksStream {
         Ok(DecryptState::Success)
     }
 
-    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) {
-        assert!(
-            self.processed_end_offset > 0,
-            "called without any processed data"
-        );
+    #[inline]
+    fn has_plaintext(&self) -> bool {
+        self.plaintext_start < self.plaintext_end
+    }
 
-        let available_len = self.processed_end_offset - self.processed_start_offset;
-
-        let unfilled_len = buf.remaining();
-
-        let write_amount = std::cmp::min(unfilled_len, available_len);
-        assert!(
-            write_amount > 0,
-            "no data to write (available_len = {available_len}, unfilled_len = {unfilled_len})",
-        );
-
+    /// Hand out decrypted bytes from where they were decrypted.
+    fn read_plaintext(&mut self, buf: &mut ReadBuf<'_>) {
+        let available_len = self.plaintext_end - self.plaintext_start;
+        let write_amount = std::cmp::min(buf.remaining(), available_len);
         buf.put_slice(
-            &self.processed_buf
-                [self.processed_start_offset..self.processed_start_offset + write_amount],
+            &self.unprocessed_buf[self.plaintext_start..self.plaintext_start + write_amount],
         );
-
-        let new_processed_start_offset = self.processed_start_offset + write_amount;
-        if new_processed_start_offset == self.processed_end_offset {
-            self.processed_start_offset = 0;
-            self.processed_end_offset = 0;
-        } else {
-            self.processed_start_offset = new_processed_start_offset;
+        self.plaintext_start += write_amount;
+        if !self.has_plaintext() {
+            self.plaintext_start = 0;
+            self.plaintext_end = 0;
+            self.discard_consumed_unprocessed();
         }
+    }
+
+    /// Forget everything before `unprocessed_start_offset` once it has all
+    /// been consumed, which costs nothing when no ciphertext is left over.
+    fn discard_consumed_unprocessed(&mut self) {
+        if !self.has_plaintext() && self.unprocessed_start_offset == self.unprocessed_buf.len() {
+            self.unprocessed_buf.clear();
+            self.unprocessed_start_offset = 0;
+        }
+    }
+
+    /// Read more ciphertext from the transport into the unfilled tail.
+    ///
+    /// The tail is handed over uninitialised: only the bytes the transport
+    /// reports as filled become part of the buffer, so no allocation is ever
+    /// zeroed only to be overwritten.
+    fn poll_fill_unprocessed(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<usize>> {
+        debug_assert!(self.unprocessed_buf.len() < self.unprocessed_buf.capacity());
+        let filled_len = self.unprocessed_buf.len();
+        let mut read_buf = ReadBuf::uninit(self.unprocessed_buf.spare_capacity_mut());
+        ready!(Pin::new(&mut self.stream).poll_read(cx, &mut read_buf))?;
+        let len = read_buf.filled().len();
+        // SAFETY: `ReadBuf` only reports bytes as filled once they have been
+        // initialised, and it was built over the spare capacity that starts at
+        // `filled_len`, so the first `filled_len + len` bytes are initialised.
+        unsafe {
+            self.unprocessed_buf.set_len(filled_len + len);
+        }
+        self.unprocessed_high_water = self.unprocessed_high_water.max(filled_len + len);
+        Poll::Ready(Ok(len))
     }
 
     fn encrypt_single(&mut self, input: &[u8], write_length_header: bool) -> std::io::Result<()> {
         let input_len = input.len();
         let header_len = if write_length_header { 2 + TAG_LEN } else { 0 };
-        self.ensure_write_cache(self.write_cache_end_offset + header_len + input_len + TAG_LEN);
-        let output = &mut self.write_cache[self.write_cache_end_offset..];
+        self.ensure_write_cache(header_len + input_len + TAG_LEN);
+        let chunk_start = self.write_cache.len();
+        let result = self.seal_into_write_cache(input, write_length_header);
+        if result.is_err() {
+            self.write_cache.truncate(chunk_start);
+        }
+        result
+    }
 
-        let mut written = if write_length_header {
-            output[0] = (input_len >> 8) as u8;
-            output[1] = (input_len & 0xff) as u8;
-
+    /// Append one sealed chunk to `write_cache`: the input is copied in once
+    /// and sealed where it lands.
+    fn seal_into_write_cache(
+        &mut self,
+        input: &[u8],
+        write_length_header: bool,
+    ) -> std::io::Result<()> {
+        if write_length_header {
+            let input_len = input.len();
+            let length_start = self.write_cache.len();
+            self.write_cache
+                .extend_from_slice(&[(input_len >> 8) as u8, (input_len & 0xff) as u8]);
             let tag = self
                 .sealing_key
-                .seal_in_place_separate_tag(&mut output[0..2])?;
+                .seal_in_place_separate_tag(&mut self.write_cache[length_start..])?;
+            self.write_cache.extend_from_slice(&tag);
+        }
 
-            output[2..2 + TAG_LEN].copy_from_slice(&tag[0..TAG_LEN]);
-
-            2 + TAG_LEN
-        } else {
-            0
-        };
-
-        output[written..written + input_len].copy_from_slice(input);
-
+        let payload_start = self.write_cache.len();
+        self.write_cache.extend_from_slice(input);
         let tag = self
             .sealing_key
-            .seal_in_place_separate_tag(&mut output[written..written + input_len])?;
-        written += input_len;
-
-        output[written..written + TAG_LEN].copy_from_slice(&tag[0..TAG_LEN]);
-
-        written += TAG_LEN;
-
-        self.write_cache_end_offset += written;
+            .seal_in_place_separate_tag(&mut self.write_cache[payload_start..])?;
+        self.write_cache.extend_from_slice(&tag);
 
         Ok(())
     }
@@ -536,10 +559,9 @@ impl ShadowsocksStream {
     #[inline]
     fn do_write_cache(&mut self, cx: &mut Context<'_>) -> std::io::Result<bool> {
         loop {
-            match Pin::new(&mut self.stream).poll_write(
-                cx,
-                &self.write_cache[self.write_cache_start_offset..self.write_cache_end_offset],
-            ) {
+            match Pin::new(&mut self.stream)
+                .poll_write(cx, &self.write_cache[self.write_cache_start_offset..])
+            {
                 Poll::Ready(Ok(written)) => {
                     if written == 0 {
                         return Err(std::io::Error::new(
@@ -548,9 +570,9 @@ impl ShadowsocksStream {
                         ));
                     }
                     self.write_cache_start_offset += written;
-                    if self.write_cache_start_offset == self.write_cache_end_offset {
+                    if self.write_cache_start_offset == self.write_cache.len() {
                         self.write_cache_start_offset = 0;
-                        self.write_cache_end_offset = 0;
+                        self.write_cache.clear();
                         return Ok(true);
                     }
                 }
@@ -566,7 +588,7 @@ impl ShadowsocksStream {
 
     #[inline]
     fn poll_flush_cache(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        while self.write_cache_end_offset > 0 {
+        while !self.write_cache.is_empty() {
             match self.do_write_cache(cx) {
                 Ok(all_written) => {
                     if !all_written {
@@ -587,10 +609,7 @@ impl ShadowsocksStream {
         self.stream_type.max_payload_len() + METADATA_SIZE
     }
 
-    /// Make room to read more ciphertext: compact consumed bytes first, then
-    /// grow (doubling, capped at one full packet). Preserves the invariant
-    /// that a full packet always fits once the buffer has grown.
-    /// Hand back whichever of the three buffers currently holds nothing.
+    /// Hand back whichever of the buffers currently holds nothing.
     ///
     /// Measured at 20,000 concurrent idle streams, these were exactly 3.00
     /// allocations of `INITIAL_BUF_SIZE` per stream -- 12 KiB apiece, 72% of
@@ -598,76 +617,99 @@ impl ShadowsocksStream {
     /// built and never given back, so a connection that had gone quiet hours
     /// ago still held all three.
     ///
-    /// Safe to do here because every use goes through one of the `ensure_*`
-    /// helpers below, and each of those already grows correctly from a
-    /// zero-length buffer. The cost of being wrong about idleness is one
-    /// regrow when the peer speaks again.
+    /// Safe to do here because every use goes through `ensure_unprocessed_room`
+    /// or `ensure_write_cache`, and each of those grows correctly from an empty
+    /// buffer. The cost of being wrong about idleness is one allocation when
+    /// the peer speaks again.
     fn release_drained_buffers(&mut self) {
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+        if !self.has_plaintext() && self.unprocessed_start_offset == self.unprocessed_buf.len() {
+            // Size the next reacquisition by what this burst needed, so a bulk
+            // transfer reacquires its working size in one step and a quiet
+            // stream falls back to a small buffer.
+            self.unprocessed_reacquire_size = self
+                .unprocessed_high_water
+                .clamp(INITIAL_BUF_SIZE, self.max_packet_len());
+            self.unprocessed_high_water = 0;
             self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
             self.unprocessed_buf = Vec::new();
         }
-        if self.processed_start_offset == self.processed_end_offset {
-            self.processed_start_offset = 0;
-            self.processed_end_offset = 0;
-            self.processed_buf = Vec::new();
-        }
-        if self.write_cache_start_offset == self.write_cache_end_offset {
+        if self.write_cache_start_offset == self.write_cache.len() {
             self.write_cache_start_offset = 0;
-            self.write_cache_end_offset = 0;
             self.write_cache = Vec::new();
         }
     }
 
+    /// Make room to read the rest of the chunk being assembled.
+    ///
+    /// Only called with no plaintext buffered -- nothing is read from the
+    /// transport while there is still something to hand out -- so whatever
+    /// precedes `unprocessed_start_offset` is spent and may be overwritten.
+    /// Once the chunk's length has been decrypted its full size is known, and
+    /// the buffer is sized for it in one step rather than doubled towards it.
     fn ensure_unprocessed_room(&mut self) {
-        if self.unprocessed_end_offset == self.unprocessed_buf.len()
-            && self.unprocessed_start_offset > 0
-        {
-            self.reset_unprocessed_buf_offset();
-        }
-        if self.unprocessed_end_offset == self.unprocessed_buf.len() {
-            let max = self.max_packet_len();
-            let grown = (self.unprocessed_buf.len() * 2).clamp(INITIAL_BUF_SIZE, max);
-            self.unprocessed_buf.resize(grown, 0);
-        }
-    }
+        debug_assert!(!self.has_plaintext());
+        let max_packet_len = self.max_packet_len();
+        // Bytes the chunk being assembled needs from `unprocessed_start_offset`.
+        let needed = match self.unprocessed_pending_len {
+            Some(len) => len + TAG_LEN,
+            None => 2 + TAG_LEN,
+        };
+        let start = self.unprocessed_start_offset;
+        let filled = self.unprocessed_buf.len();
+        let capacity = self.unprocessed_buf.capacity();
 
-    /// Grow `processed_buf` to hold `len` more plaintext bytes after what is
-    /// already buffered. Returns false when the caller must pause with
-    /// `DecryptState::BufferFull`, matching the fixed-buffer semantics so a
-    /// burst cannot accumulate unbounded plaintext.
-    fn ensure_processed_room(&mut self, len: usize) -> bool {
-        let needed = self.processed_end_offset.saturating_add(len);
-        if needed > self.stream_type.max_payload_len() {
-            return false;
-        }
-        if self.processed_buf.len() < needed {
-            self.processed_buf.resize(needed, 0);
-        }
-        true
-    }
+        // Room for the chunk being assembled and the start of the next one
+        // behind it, so a bulk stream does not end every read on a partial
+        // chunk that then has to be moved to the front.
+        let grown_for_needed = needed.saturating_mul(2).min(max_packet_len);
 
-    /// Grow `write_cache` so `needed` bytes fit, never past a full packet.
-    fn ensure_write_cache(&mut self, needed: usize) {
-        let needed = needed.min(self.max_packet_len());
-        if self.write_cache.len() < needed {
-            self.write_cache.resize(needed, 0);
+        if capacity == 0 {
+            // Reacquiring after a park, with nothing buffered.
+            let size = if needed > self.unprocessed_reacquire_size {
+                grown_for_needed
+            } else {
+                self.unprocessed_reacquire_size
+            };
+            self.unprocessed_buf = Vec::with_capacity(size);
+            self.unprocessed_start_offset = 0;
+            return;
         }
-    }
 
-    fn reset_unprocessed_buf_offset(&mut self) {
-        assert!(
-            self.unprocessed_start_offset > 0
-                && self.unprocessed_end_offset > self.unprocessed_start_offset
-        );
+        if needed <= capacity {
+            if start + needed > capacity || filled == capacity {
+                // The chunk fits once the spent prefix is dropped.
+                self.unprocessed_buf.copy_within(start..filled, 0);
+                self.unprocessed_buf.truncate(filled - start);
+                self.unprocessed_start_offset = 0;
+            }
+            // An incomplete chunk is shorter than `needed`, so this only
+            // triggers if a caller broke that precondition; reading into a
+            // full buffer would otherwise look exactly like EOF.
+            if self.unprocessed_buf.len() == self.unprocessed_buf.capacity() {
+                self.unprocessed_buf.reserve_exact(needed);
+            }
+            return;
+        }
 
-        self.unprocessed_buf.copy_within(
-            self.unprocessed_start_offset..self.unprocessed_end_offset,
-            0,
-        );
-        self.unprocessed_end_offset -= self.unprocessed_start_offset;
+        // Too small for this chunk: move what is buffered into a buffer sized
+        // for it, which is the only copy growing costs.
+        let mut buf = Vec::with_capacity(grown_for_needed);
+        buf.extend_from_slice(&self.unprocessed_buf[start..filled]);
+        self.unprocessed_buf = buf;
         self.unprocessed_start_offset = 0;
+    }
+
+    /// Make sure `additional` more bytes can be appended to `write_cache`,
+    /// never growing it past a full packet.
+    fn ensure_write_cache(&mut self, additional: usize) {
+        let needed = self.write_cache.len() + additional;
+        let capacity = self.write_cache.capacity();
+        if needed <= capacity {
+            return;
+        }
+        let grown = needed.max(capacity.saturating_mul(2).min(self.max_packet_len()));
+        self.write_cache
+            .reserve_exact(grown - self.write_cache.len());
     }
 
     fn read_header_len(&self) -> usize {
@@ -810,10 +852,7 @@ impl ShadowsocksStream {
             }
         }
 
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
+        self.discard_consumed_unprocessed();
 
         Ok(())
     }
@@ -822,12 +861,11 @@ impl ShadowsocksStream {
         match self.stream_type {
             ShadowsocksStreamType::Aead => {
                 self.ensure_write_cache(self.salt_len);
-                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
-                self.write_cache_end_offset = self.salt_len;
+                self.write_cache.extend_from_slice(&self.encrypt_iv);
 
                 let handled_len = std::cmp::min(
                     buf.len(),
-                    self.max_packet_len() - self.write_cache_end_offset - METADATA_SIZE,
+                    self.max_packet_len() - self.write_cache.len() - METADATA_SIZE,
                 );
                 if handled_len == 0 {
                     return Err(shadowsocks_initial_payload_too_large_error(buf.len(), 0));
@@ -854,8 +892,7 @@ impl ShadowsocksStream {
                 })?;
 
                 self.ensure_write_cache(self.salt_len);
-                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
-                self.write_cache_end_offset = self.salt_len;
+                self.write_cache.extend_from_slice(&self.encrypt_iv);
 
                 let mut response_header = allocate_vec(1 + 8 + self.salt_len + 2);
 
@@ -886,8 +923,7 @@ impl ShadowsocksStream {
             }
             ShadowsocksStreamType::AEAD2022Client => {
                 self.ensure_write_cache(self.salt_len);
-                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
-                self.write_cache_end_offset = self.salt_len;
+                self.write_cache.extend_from_slice(&self.encrypt_iv);
 
                 let mut request_header = allocate_vec(1 + 8 + 2);
 
@@ -938,16 +974,22 @@ impl ShadowsocksStream {
 
         if this.is_initial_read && !this.is_eof {
             loop {
-                let mut read_buf =
-                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
-                ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
-                let len = read_buf.filled().len();
+                if this.unprocessed_buf.len() == this.unprocessed_buf.capacity() {
+                    this.unprocessed_buf.reserve_exact(INITIAL_BUF_SIZE);
+                }
+                let len = match this.poll_fill_unprocessed(cx) {
+                    Poll::Ready(result) => result?,
+                    Poll::Pending => {
+                        // Waiting on the peer's header holds nothing either.
+                        this.release_drained_buffers();
+                        return Poll::Pending;
+                    }
+                };
                 if len == 0 {
                     this.is_eof = true;
                     return Poll::Ready(Ok(()));
                 }
-                this.unprocessed_end_offset += len;
-                if this.unprocessed_end_offset >= this.read_header_len() {
+                if this.unprocessed_buf.len() >= this.read_header_len() {
                     break;
                 }
             }
@@ -956,35 +998,28 @@ impl ShadowsocksStream {
             this.is_initial_read = false;
         }
 
+        let filled_before = buf.filled().len();
         loop {
-            if this.unprocessed_end_offset > 0 {
-                // Process some data to free up unprocessed_buf space.
-                loop {
-                    match this.try_decrypt()? {
-                        DecryptState::NeedData => {
-                            break;
-                        }
-                        DecryptState::BufferFull => {
-                            assert!(this.processed_end_offset > 0);
-                            break;
-                        }
-                        DecryptState::Success => {
-                            if !fill_buffer && this.processed_end_offset > 0 {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
+            if this.has_plaintext() {
+                this.read_plaintext(buf);
+                // A message read is one chunk, and a full buffer is a full
+                // buffer; otherwise carry on into whatever else is buffered.
+                if buf.remaining() == 0 || !fill_buffer {
+                    return Poll::Ready(Ok(()));
                 }
             }
 
-            // Compact consumed bytes, growing the buffer if the remaining
-            // unprocessed data still fills it.
-            this.ensure_unprocessed_room();
+            // Nothing left to hand out: open the next chunk if all of it has
+            // arrived. A zero-length chunk yields nothing and the loop simply
+            // moves on to the one after it.
+            if this.unprocessed_start_offset < this.unprocessed_buf.len()
+                && let DecryptState::Success = this.try_decrypt()?
+            {
+                continue;
+            }
 
-            if this.processed_end_offset > 0 {
-                // Return the data we just got.
-                this.read_processed(buf);
+            if buf.filled().len() > filled_before {
+                // Return what was already buffered rather than wait for more.
                 return Poll::Ready(Ok(()));
             }
 
@@ -992,16 +1027,10 @@ impl ShadowsocksStream {
                 return Poll::Ready(Ok(()));
             }
 
-            let read = {
-                let mut read_buf =
-                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
-                match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
-                    Poll::Ready(result) => {
-                        result?;
-                        Some(read_buf.filled().len())
-                    }
-                    Poll::Pending => None,
-                }
+            this.ensure_unprocessed_room();
+            let read = match this.poll_fill_unprocessed(cx) {
+                Poll::Ready(result) => Some(result?),
+                Poll::Pending => None,
             };
             let Some(len) = read else {
                 // Parked on a peer with nothing to say, which is where a
@@ -1010,12 +1039,9 @@ impl ShadowsocksStream {
                 return Poll::Pending;
             };
 
-            // Make sure we have enough space to store the processed data.
             if len == 0 {
                 // We've reached EOF. Return any available data first.
                 this.is_eof = true;
-            } else {
-                this.unprocessed_end_offset += len;
             }
 
             // We don't want to return zero bytes, and we haven't yet hit a Poll::Pending,
@@ -1096,7 +1122,7 @@ impl AsyncWrite for ShadowsocksStream {
 
         if this.is_initial_write {
             let handled_len = this.process_write_header(buf)?;
-            if handled_len == 0 || this.write_cache_end_offset == 0 {
+            if handled_len == 0 || this.write_cache.is_empty() {
                 return Poll::Ready(Err(shadowsocks_initial_payload_too_large_error(
                     buf.len(),
                     0,
@@ -1111,7 +1137,7 @@ impl AsyncWrite for ShadowsocksStream {
             return Poll::Ready(Ok(handled_len));
         }
 
-        let mut write_cache_space = this.max_packet_len() - this.write_cache_end_offset;
+        let mut write_cache_space = this.max_packet_len() - this.write_cache.len();
 
         if write_cache_space <= METADATA_SIZE {
             match this.do_write_cache(cx) {
@@ -1125,7 +1151,7 @@ impl AsyncWrite for ShadowsocksStream {
                 }
             };
             // if we got here, then everything was written.
-            assert!(this.write_cache_start_offset == 0 && this.write_cache_end_offset == 0);
+            assert!(this.write_cache_start_offset == 0 && this.write_cache.is_empty());
             write_cache_space = this.max_packet_len();
         }
 
@@ -1205,7 +1231,7 @@ impl AsyncWriteMessage for ShadowsocksStream {
             return Poll::Ready(Ok(()));
         }
 
-        let mut write_cache_space = this.max_packet_len() - this.write_cache_end_offset;
+        let mut write_cache_space = this.max_packet_len() - this.write_cache.len();
         let packet_size = buf.len().checked_add(METADATA_SIZE).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1221,7 +1247,7 @@ impl AsyncWriteMessage for ShadowsocksStream {
 
         if packet_size > write_cache_space {
             ready!(this.poll_flush_cache(cx))?;
-            write_cache_space = this.max_packet_len() - this.write_cache_end_offset;
+            write_cache_space = this.max_packet_len() - this.write_cache.len();
             if packet_size > write_cache_space {
                 return Poll::Pending;
             }
@@ -1495,13 +1521,13 @@ mod tests {
             .unwrap();
         assert_eq!(accepted, b"payload".len());
         assert_eq!(written.lock().unwrap().len(), 1);
-        assert!(stream.write_cache_end_offset > 0);
+        assert!(!stream.write_cache.is_empty());
 
         poll_fn(|cx| Pin::new(&mut stream).poll_shutdown(cx))
             .await
             .unwrap();
 
-        assert!(stream.write_cache_end_offset == 0);
+        assert!(stream.write_cache.is_empty());
         assert!(written.lock().unwrap().len() > 1);
     }
 
@@ -1608,5 +1634,478 @@ mod tests {
             .to_string();
         assert!(behind.contains("300"), "{behind}");
         assert!(behind.contains("old"), "{behind}");
+    }
+
+    /// In-memory transport for round trips: records everything written, and
+    /// serves reads from a shared inbound buffer in a repeating pattern of
+    /// sizes, so chunk and header boundaries land at every offset. With
+    /// `park_between_reads` it reports `Pending` once after every read, which
+    /// is what makes the stream park, release its buffers and reacquire them
+    /// in the middle of chunks.
+    struct ScriptedTransport {
+        inbound: StdArc<StdMutex<Vec<u8>>>,
+        inbound_pos: usize,
+        outbound: StdArc<StdMutex<Vec<u8>>>,
+        read_sizes: Vec<usize>,
+        read_step: usize,
+        park_between_reads: bool,
+        just_read: bool,
+    }
+
+    impl ScriptedTransport {
+        fn new(read_sizes: &[usize], park_between_reads: bool) -> Self {
+            Self {
+                inbound: StdArc::new(StdMutex::new(Vec::new())),
+                inbound_pos: 0,
+                outbound: StdArc::new(StdMutex::new(Vec::new())),
+                read_sizes: read_sizes.to_vec(),
+                read_step: 0,
+                park_between_reads,
+                just_read: false,
+            }
+        }
+    }
+
+    impl AsyncRead for ScriptedTransport {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.park_between_reads && self.just_read {
+                self.just_read = false;
+                return Poll::Pending;
+            }
+            let inbound = self.inbound.clone();
+            let inbound = inbound.lock().unwrap();
+            let remaining = inbound.len() - self.inbound_pos;
+            if remaining == 0 {
+                // Reads after the scripted bytes are EOF.
+                return Poll::Ready(Ok(()));
+            }
+            let size = self.read_sizes[self.read_step % self.read_sizes.len()];
+            self.read_step += 1;
+            let len = size.min(remaining).min(buf.remaining());
+            buf.put_slice(&inbound[self.inbound_pos..self.inbound_pos + len]);
+            self.inbound_pos += len;
+            self.just_read = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ScriptedTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.outbound.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ScriptedTransport {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ScriptedTransport {}
+
+    struct ScriptedStream {
+        stream: ShadowsocksStream,
+        inbound: StdArc<StdMutex<Vec<u8>>>,
+        outbound: StdArc<StdMutex<Vec<u8>>>,
+    }
+
+    fn scripted_stream(
+        stream_type: ShadowsocksStreamType,
+        aead2022: bool,
+        read_sizes: &[usize],
+        park_between_reads: bool,
+    ) -> ScriptedStream {
+        let cipher: ShadowsocksCipher = "aes-128-gcm".try_into().unwrap();
+        let key: Arc<dyn ShadowsocksKey> = if aead2022 {
+            Arc::new(super::super::blake3_key::Blake3Key::new(
+                vec![7u8; cipher.key_len()].into_boxed_slice(),
+                cipher.key_len(),
+            ))
+        } else {
+            Arc::new(DefaultKey::new("test-password", cipher.key_len()))
+        };
+        let transport = ScriptedTransport::new(read_sizes, park_between_reads);
+        let inbound = transport.inbound.clone();
+        let outbound = transport.outbound.clone();
+        ScriptedStream {
+            stream: ShadowsocksStream::new(
+                Box::new(transport),
+                stream_type,
+                cipher.algorithm(),
+                cipher.salt_len(),
+                key,
+                None,
+            ),
+            inbound,
+            outbound,
+        }
+    }
+
+    fn noop_context() -> Context<'static> {
+        Context::from_waker(futures::task::noop_waker_ref())
+    }
+
+    fn write_all_now(stream: &mut ShadowsocksStream, mut data: &[u8]) {
+        let mut cx = noop_context();
+        while !data.is_empty() {
+            match Pin::new(&mut *stream).poll_write(&mut cx, data) {
+                Poll::Ready(Ok(written)) => data = &data[written..],
+                other => panic!("write did not complete: {other:?}"),
+            }
+        }
+        flush_now(stream);
+    }
+
+    fn flush_now(stream: &mut ShadowsocksStream) {
+        let mut cx = noop_context();
+        assert!(matches!(
+            Pin::new(stream).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    /// Every park must leave nothing allocated that holds nothing: the only
+    /// thing a parked stream may keep is a partial chunk it cannot yet open.
+    fn assert_parked_state(stream: &ShadowsocksStream) {
+        assert!(!stream.has_plaintext(), "parked with plaintext undelivered");
+        if stream.unprocessed_start_offset == stream.unprocessed_buf.len() {
+            assert_eq!(
+                stream.unprocessed_buf.capacity(),
+                0,
+                "idle read buffer kept"
+            );
+        }
+        if stream.write_cache.is_empty() {
+            assert_eq!(stream.write_cache.capacity(), 0, "idle write cache kept");
+        }
+    }
+
+    /// Read until EOF, cycling through `caller_sizes` for the caller buffer.
+    fn read_to_end_now(
+        stream: &mut ShadowsocksStream,
+        caller_sizes: &[usize],
+        message: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut cx = noop_context();
+        let mut reads = Vec::new();
+        let mut step = 0;
+        let mut parks = 0;
+        loop {
+            let size = caller_sizes[step % caller_sizes.len()];
+            step += 1;
+            let mut storage = vec![0u8; size];
+            let mut buf = ReadBuf::new(&mut storage);
+            let poll = if message {
+                Pin::new(&mut *stream).poll_read_message(&mut cx, &mut buf)
+            } else {
+                Pin::new(&mut *stream).poll_read(&mut cx, &mut buf)
+            };
+            match poll {
+                Poll::Ready(Ok(())) if buf.filled().is_empty() => return reads,
+                Poll::Ready(Ok(())) => reads.push(buf.filled().to_vec()),
+                Poll::Ready(Err(error)) => panic!("read failed: {error}"),
+                Poll::Pending => {
+                    assert_parked_state(stream);
+                    parks += 1;
+                    assert!(parks < 1_000_000, "read never completed");
+                }
+            }
+        }
+    }
+
+    fn pattern(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i * 31 + seed * 7) % 251) as u8)
+            .collect()
+    }
+
+    /// Chunk sizes that straddle every boundary that matters: empty-ish,
+    /// around the legacy 0x3FFF cap, exactly the AEAD-2022 0xFFFF maximum,
+    /// and one past it so a single write becomes two chunks.
+    fn round_trip_writes(max_payload_len: usize) -> Vec<Vec<u8>> {
+        [
+            1,
+            2,
+            17,
+            0x3fff,
+            0x4000,
+            0x4001,
+            max_payload_len,
+            max_payload_len + 1,
+            3,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(seed, len)| pattern(len, seed))
+        .collect()
+    }
+
+    fn round_trip(aead2022: bool, read_sizes: &[usize], caller_sizes: &[usize], park: bool) {
+        let (writer_type, reader_type) = if aead2022 {
+            (
+                ShadowsocksStreamType::AEAD2022Client,
+                ShadowsocksStreamType::AEAD2022Server,
+            )
+        } else {
+            (ShadowsocksStreamType::Aead, ShadowsocksStreamType::Aead)
+        };
+        let mut writer = scripted_stream(writer_type, aead2022, &[usize::MAX], false);
+        let mut reader = scripted_stream(reader_type, aead2022, read_sizes, park);
+
+        // AEAD-2022 sends the variable-length request header as its own
+        // first chunk; any first write works for the legacy stream.
+        let mut expected = pattern(37, 99);
+        write_all_now(&mut writer.stream, &expected);
+        for (index, data) in round_trip_writes(writer_type.max_payload_len())
+            .into_iter()
+            .enumerate()
+        {
+            write_all_now(&mut writer.stream, &data);
+            expected.extend_from_slice(&data);
+            if index == 3 {
+                // An empty chunk is legal on the wire and must be skipped.
+                writer.stream.encrypt_single(&[], true).unwrap();
+                flush_now(&mut writer.stream);
+            }
+        }
+        *reader.inbound.lock().unwrap() = writer.outbound.lock().unwrap().clone();
+
+        let received = read_to_end_now(&mut reader.stream, caller_sizes, false).concat();
+        assert_eq!(received.len(), expected.len());
+        assert!(
+            received == expected,
+            "plaintext differs (read sizes {read_sizes:?}, caller sizes {caller_sizes:?}, park {park})"
+        );
+    }
+
+    const SPLIT_READS: &[usize] = &[1, 7, 3, 4096, 13, 65536, 2, 18, 19, 50_000, 34];
+    const ODD_CALLER_READS: &[usize] = &[1, 3, 5, 7, 4096, 17, 65536, 16_383];
+
+    #[test]
+    fn aead2022_round_trip_survives_any_read_split() {
+        for (read_sizes, caller_sizes, park) in [
+            (&[usize::MAX][..], &[65536][..], false),
+            (SPLIT_READS, ODD_CALLER_READS, false),
+            (SPLIT_READS, ODD_CALLER_READS, true),
+            (&[1][..], &[4096][..], true),
+            (&[65536][..], &[1][..], false),
+            (&[16_401][..], &[16_384][..], true),
+        ] {
+            round_trip(true, read_sizes, caller_sizes, park);
+        }
+    }
+
+    #[test]
+    fn legacy_aead_round_trip_survives_any_read_split() {
+        for (read_sizes, caller_sizes, park) in [
+            (&[usize::MAX][..], &[65536][..], false),
+            (SPLIT_READS, ODD_CALLER_READS, true),
+            (&[1][..], &[3][..], false),
+        ] {
+            round_trip(false, read_sizes, caller_sizes, park);
+        }
+    }
+
+    #[test]
+    fn aead2022_client_reads_server_chunks_across_splits() {
+        let mut client = scripted_stream(ShadowsocksStreamType::AEAD2022Client, true, &[1], false);
+        let mut server = scripted_stream(
+            ShadowsocksStreamType::AEAD2022Server,
+            true,
+            &[usize::MAX],
+            false,
+        );
+
+        let request = pattern(40, 1);
+        write_all_now(&mut client.stream, &request);
+        *server.inbound.lock().unwrap() = client.outbound.lock().unwrap().clone();
+        let mut cx = noop_context();
+        let mut storage = vec![0u8; 1024];
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut server.stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), &request[..]);
+
+        let mut expected = Vec::new();
+        for data in round_trip_writes(ShadowsocksStreamType::AEAD2022Server.max_payload_len()) {
+            write_all_now(&mut server.stream, &data);
+            expected.extend_from_slice(&data);
+        }
+        *client.inbound.lock().unwrap() = server.outbound.lock().unwrap().clone();
+
+        // Rebuild the client's transport pattern: splits everywhere, parks
+        // between reads, odd caller sizes.
+        let received = {
+            let transport = ScriptedTransport {
+                inbound: client.inbound.clone(),
+                inbound_pos: 0,
+                outbound: client.outbound.clone(),
+                read_sizes: SPLIT_READS.to_vec(),
+                read_step: 0,
+                park_between_reads: true,
+                just_read: false,
+            };
+            client.stream.stream = Box::new(transport);
+            read_to_end_now(&mut client.stream, ODD_CALLER_READS, false).concat()
+        };
+        assert!(received == expected, "server-to-client plaintext differs");
+    }
+
+    #[test]
+    fn message_reads_return_one_chunk_each() {
+        let mut writer = scripted_stream(ShadowsocksStreamType::AEAD2022Client, true, &[1], false);
+        let mut reader = scripted_stream(
+            ShadowsocksStreamType::AEAD2022Server,
+            true,
+            SPLIT_READS,
+            true,
+        );
+        let messages: Vec<Vec<u8>> = [40, 5, 1, 300, 0xffff, 2, 16_384]
+            .into_iter()
+            .enumerate()
+            .map(|(seed, len)| pattern(len, seed))
+            .collect();
+        let mut cx = noop_context();
+        for message in &messages {
+            assert!(matches!(
+                Pin::new(&mut writer.stream).poll_write_message(&mut cx, message),
+                Poll::Ready(Ok(()))
+            ));
+            flush_now(&mut writer.stream);
+        }
+        *reader.inbound.lock().unwrap() = writer.outbound.lock().unwrap().clone();
+
+        let reads = read_to_end_now(&mut reader.stream, &[0x10000], true);
+        assert_eq!(reads.len(), messages.len());
+        for (read, message) in reads.iter().zip(&messages) {
+            assert!(read == message, "message boundary not preserved");
+        }
+    }
+
+    #[test]
+    fn partial_message_read_resumes_the_same_chunk_only() {
+        let mut writer = scripted_stream(ShadowsocksStreamType::AEAD2022Client, true, &[1], false);
+        let mut reader = scripted_stream(
+            ShadowsocksStreamType::AEAD2022Server,
+            true,
+            &[usize::MAX],
+            false,
+        );
+        let first = pattern(40, 1);
+        let second = pattern(10, 2);
+        let mut cx = noop_context();
+        for message in [&first, &second] {
+            assert!(matches!(
+                Pin::new(&mut writer.stream).poll_write_message(&mut cx, message),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        flush_now(&mut writer.stream);
+        *reader.inbound.lock().unwrap() = writer.outbound.lock().unwrap().clone();
+
+        // A caller buffer shorter than the message gets it in pieces, and the
+        // next message never rides along with the tail of the previous one.
+        let reads = read_to_end_now(&mut reader.stream, &[16, 64], true);
+        assert_eq!(reads.len(), 3);
+        assert_eq!(reads[0], first[..16]);
+        assert_eq!(reads[1], first[16..]);
+        assert_eq!(reads[2], second);
+    }
+
+    #[test]
+    fn bulk_stream_reacquires_its_working_size_after_parking() {
+        let mut writer = scripted_stream(ShadowsocksStreamType::AEAD2022Client, true, &[1], false);
+        let mut reader = scripted_stream(
+            ShadowsocksStreamType::AEAD2022Server,
+            true,
+            &[usize::MAX],
+            true,
+        );
+        write_all_now(&mut writer.stream, &pattern(40, 1));
+        let chunk = pattern(16_384, 2);
+        for _ in 0..8 {
+            write_all_now(&mut writer.stream, &chunk);
+        }
+        *reader.inbound.lock().unwrap() = writer.outbound.lock().unwrap().clone();
+
+        // One transport read per wake, each holding the whole remaining
+        // stream: count how often the buffer had to grow while it was held.
+        let mut cx = noop_context();
+        let mut growths = 0;
+        let mut last_capacity = reader.stream.unprocessed_buf.capacity();
+        let mut received = 0;
+        loop {
+            let mut storage = vec![0u8; 16_384];
+            let mut buf = ReadBuf::new(&mut storage);
+            match Pin::new(&mut reader.stream).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) if buf.filled().is_empty() => break,
+                Poll::Ready(Ok(())) => received += buf.filled().len(),
+                Poll::Ready(Err(error)) => panic!("read failed: {error}"),
+                Poll::Pending => assert_parked_state(&reader.stream),
+            }
+            let capacity = reader.stream.unprocessed_buf.capacity();
+            if last_capacity != 0 && capacity > last_capacity {
+                growths += 1;
+            }
+            last_capacity = capacity;
+        }
+        assert_eq!(received, 40 + 8 * 16_384);
+        // Doubling up from 4 KiB took three reallocations per wake; sizing
+        // from the decrypted length takes one, once.
+        assert!(growths <= 1, "buffer grew {growths} times");
+        assert!(reader.stream.unprocessed_reacquire_size > 16_384 + TAG_LEN);
+    }
+
+    #[test]
+    fn quiet_stream_falls_back_to_a_small_buffer() {
+        let mut writer = scripted_stream(ShadowsocksStreamType::AEAD2022Client, true, &[1], false);
+        let mut reader = scripted_stream(
+            ShadowsocksStreamType::AEAD2022Server,
+            true,
+            &[usize::MAX],
+            true,
+        );
+        write_all_now(&mut writer.stream, &pattern(40, 1));
+        write_all_now(&mut writer.stream, &pattern(0xffff, 2));
+        *reader.inbound.lock().unwrap() = writer.outbound.lock().unwrap().clone();
+        read_to_end_now(&mut reader.stream, &[0x10000], false);
+        assert!(reader.stream.unprocessed_reacquire_size >= 0xffff + TAG_LEN);
+
+        // Then only small chunks: the next reacquisition shrinks back.
+        let offset = writer.outbound.lock().unwrap().len();
+        for seed in 0..4 {
+            write_all_now(&mut writer.stream, &pattern(10, seed));
+        }
+        let more = writer.outbound.lock().unwrap()[offset..].to_vec();
+        reader.inbound.lock().unwrap().extend_from_slice(&more);
+        reader.stream.is_eof = false;
+        let _ = read_to_end_now(&mut reader.stream, &[64], false);
+        assert_eq!(reader.stream.unprocessed_reacquire_size, INITIAL_BUF_SIZE);
     }
 }

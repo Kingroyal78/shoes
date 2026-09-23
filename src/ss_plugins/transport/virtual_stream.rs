@@ -3,13 +3,14 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Sleep;
 
 use crate::async_stream::{AsyncPing, AsyncStream};
@@ -101,6 +102,41 @@ impl std::fmt::Display for ReceiveBudgetExceeded {
 
 impl std::error::Error for ReceiveBudgetExceeded {}
 
+/// A charge refused by [`ReceiveBudget::try_track`], handing the bytes back.
+pub(super) struct BudgetBlocked {
+    pub(super) bytes: Vec<u8>,
+    /// The budget that ran out: the stream's own, its session's, or the
+    /// listener's. Its refunds are what the caller waits for.
+    pub(super) blocked: Arc<ReceiveBudget>,
+    pub(super) scope: ReceiveBudgetScope,
+    /// The charging stream was itself evicted; no amount of waiting admits
+    /// the bytes, and its session will hear of the eviction separately.
+    pub(super) stream_evicted: bool,
+}
+
+/// Resolves once the budget it was taken from is refunded.
+///
+/// Keeps the budget's waiter count raised for as long as it lives, which is
+/// what makes refunders notify at all.
+pub(super) struct RefundWait<'a> {
+    budget: &'a ReceiveBudget,
+    notified: Pin<Box<Notified<'a>>>,
+}
+
+impl Future for RefundWait<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.notified.as_mut().poll(cx)
+    }
+}
+
+impl Drop for RefundWait<'_> {
+    fn drop(&mut self) {
+        self.budget.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BudgetEviction {
     pub(super) stream_id: u32,
@@ -130,6 +166,9 @@ pub(super) struct ReceiveBudget {
     registered: AtomicBool,
     eviction_lock: Arc<Mutex<()>>,
     eviction: Option<EvictionTarget>,
+    /// Readers parked until this budget is refunded; see [`RefundWait`].
+    waiters: AtomicUsize,
+    refunded: Notify,
 }
 
 impl ReceiveBudget {
@@ -142,6 +181,8 @@ impl ReceiveBudget {
             registered: AtomicBool::new(true),
             eviction_lock: Arc::new(Mutex::new(())),
             eviction: None,
+            waiters: AtomicUsize::new(0),
+            refunded: Notify::new(),
         }
     }
 
@@ -182,6 +223,8 @@ impl ReceiveBudget {
             registered: AtomicBool::new(false),
             eviction_lock,
             eviction,
+            waiters: AtomicUsize::new(0),
+            refunded: Notify::new(),
         }
     }
 
@@ -276,6 +319,7 @@ impl ReceiveBudget {
             parent.refund_one(count);
             parent.refund_ancestors(count);
         }
+        self.wake_refund_waiters();
     }
 
     fn refund_ancestors(&self, count: usize) {
@@ -320,6 +364,9 @@ impl ReceiveBudget {
             parent.refund_one(reclaimed);
             parent.refund_ancestors(reclaimed);
         }
+        // Wakes this budget too: a reader parked on an evicted stream has to
+        // stop waiting for room that will never come.
+        self.wake_refund_waiters();
         if let Some(target) = &self.eviction {
             let _ = target.sender.send(BudgetEviction {
                 stream_id: target.stream_id,
@@ -340,6 +387,113 @@ impl ReceiveBudget {
             ReceiveBudgetScope::Listener
         } else {
             ReceiveBudgetScope::Session
+        }
+    }
+
+    fn is_evicted(&self) -> bool {
+        self.state.load(Ordering::Acquire) & BUDGET_EVICTED != 0
+    }
+
+    /// Wake every reader parked on this budget or on any budget above it.
+    ///
+    /// Refunds happen on every read of every logical stream, so the common
+    /// case -- nobody parked -- must cost no more than a load per level. The
+    /// fence pairs with the one in [`ReceiveBudget::refund_wait`]: either the
+    /// refunder sees the waiter's registration and notifies it, or the waiter's
+    /// re-check sees the refund. Without both, each side can read the other's
+    /// stale value and the reader sleeps through the room it was waiting for.
+    fn wake_refund_waiters(&self) {
+        fence(Ordering::SeqCst);
+        let mut current = Some(self);
+        while let Some(budget) = current {
+            if budget.waiters.load(Ordering::Relaxed) > 0 {
+                budget.refunded.notify_waiters();
+            }
+            current = budget.parent.as_deref();
+        }
+    }
+
+    /// Register interest in this budget being refunded.
+    ///
+    /// The caller must re-check its condition *after* this returns and only
+    /// then await the result; a refund landing between the check and the
+    /// registration is otherwise lost. A `Notified` observes `notify_waiters`
+    /// from the moment it is created, so creating it before the fence is what
+    /// makes the re-check safe.
+    pub(super) fn refund_wait(&self) -> RefundWait<'_> {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let mut notified = Box::pin(self.refunded.notified());
+        // Register before the post-registration budget check.  Creating a
+        // `Notified` alone does not make `notify_waiters` retain a wakeup; an
+        // unpolled future can otherwise miss a refund between the check and
+        // the select below.
+        notified.as_mut().enable();
+        fence(Ordering::SeqCst);
+        RefundWait {
+            budget: self,
+            notified,
+        }
+    }
+
+    /// Charge `bytes` to this budget and its ancestors without evicting
+    /// anyone.
+    ///
+    /// A reader that can wait -- one that backpressures its physical
+    /// connection instead of dropping frames -- uses this, and decides for
+    /// itself when a stall has lasted long enough to justify
+    /// [`ReceiveBudget::evict_stalled`].
+    pub(super) fn try_track(
+        self: &Arc<Self>,
+        bytes: Vec<u8>,
+    ) -> Result<InboundData, BudgetBlocked> {
+        let length = bytes.len();
+        self.ensure_registered();
+        match self.try_charge(length) {
+            Ok(generation) => Ok(InboundData {
+                bytes,
+                budget: Some(ReceiveBudgetPermit {
+                    budget: self.clone(),
+                    remaining: length,
+                    generation,
+                }),
+            }),
+            Err(blocked) => {
+                let scope = self.scope_of(&blocked);
+                Err(BudgetBlocked {
+                    bytes,
+                    stream_evicted: self.is_evicted(),
+                    scope,
+                    blocked,
+                })
+            }
+        }
+    }
+
+    /// Resolve a stall that made no progress for the caller's grace period.
+    ///
+    /// Nothing under `blocked` has been refunded for that long, so every
+    /// stream holding part of it is stalled; the one holding the most gives
+    /// way, exactly as [`ReceiveBudget::track`] chooses, unless the frame
+    /// being charged would itself be the largest holder. Returns whether it
+    /// was this budget's own stream that was evicted.
+    pub(super) fn evict_stalled(
+        self: &Arc<Self>,
+        blocked: &Arc<Self>,
+        scope: ReceiveBudgetScope,
+        length: usize,
+    ) -> bool {
+        let _eviction = self.eviction_lock.lock();
+        let current_after_charge = self.used().saturating_add(length);
+        let victim = blocked.largest_leaf();
+        if victim
+            .as_ref()
+            .is_none_or(|(victim, used)| Arc::ptr_eq(victim, self) || current_after_charge >= *used)
+        {
+            self.evict(scope);
+            true
+        } else {
+            victim.expect("checked above").0.evict(scope);
+            false
         }
     }
 
@@ -444,10 +598,46 @@ impl InboundData {
     }
 }
 
+/// Room left in front of every outbound payload for the multiplexer's frame
+/// header.
+///
+/// Both protocols that carry these streams frame data with exactly eight
+/// bytes: smux's version, command, length and stream id, and Mux.Cool's
+/// metadata length, id, status, option and data length. Reserving them when
+/// the payload is first copied out of the logical stream lets the session
+/// writer finish the frame in place, so a frame costs one copy on its way to
+/// the physical stream rather than two.
+pub(super) const OUTBOUND_HEADER_ROOM: usize = 8;
+
+/// A payload queued for the session writer, with its frame header's room
+/// already reserved in front of it.
+pub(super) struct OutboundFrame {
+    bytes: Vec<u8>,
+}
+
+impl OutboundFrame {
+    pub(super) fn copy_from(payload: &[u8]) -> Self {
+        let mut bytes = Vec::with_capacity(OUTBOUND_HEADER_ROOM + payload.len());
+        bytes.extend_from_slice(&[0; OUTBOUND_HEADER_ROOM]);
+        bytes.extend_from_slice(payload);
+        Self { bytes }
+    }
+
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.bytes[OUTBOUND_HEADER_ROOM..]
+    }
+
+    /// Write `header` into the reserved room and hand back the whole frame.
+    pub(super) fn into_frame(mut self, header: [u8; OUTBOUND_HEADER_ROOM]) -> Vec<u8> {
+        self.bytes[..OUTBOUND_HEADER_ROOM].copy_from_slice(&header);
+        self.bytes
+    }
+}
+
 pub(super) enum OutboundCommand {
     Data {
         stream_id: u32,
-        data: Vec<u8>,
+        frame: OutboundFrame,
     },
     Finished {
         stream_id: u32,
@@ -644,12 +834,10 @@ impl VirtualStream {
 
     fn reserve(sender: mpsc::Sender<OutboundCommand>) -> PermitFuture {
         Box::pin(async move {
-            sender.reserve_owned().await.map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "multiplexed session writer closed",
-                )
-            })
+            sender
+                .reserve_owned()
+                .await
+                .map_err(|_| writer_closed_error())
         })
     }
 
@@ -705,12 +893,34 @@ impl VirtualStream {
             match &mut self.barrier {
                 BarrierState::Idle => {
                     let (complete_tx, complete_rx) = oneshot::channel();
-                    self.barrier = BarrierState::Reserving {
-                        permit: Self::reserve(self.outbound.clone()),
-                        complete_tx: Some(complete_tx),
-                        complete_rx,
-                    };
+                    let mut complete_tx = Some(complete_tx);
                     self.arm_barrier_timeout();
+                    // A flush follows nearly every write, so the queue almost
+                    // always has room; taking the slot directly skips boxing a
+                    // reservation future and cloning the sender each time.
+                    let refused = match self.outbound.try_reserve() {
+                        Ok(permit) => {
+                            permit.send(OutboundCommand::Barrier {
+                                complete: complete_tx.take().expect("sender not yet used"),
+                            });
+                            None
+                        }
+                        Err(error) => Some(error),
+                    };
+                    match refused {
+                        None => self.barrier = BarrierState::Waiting { complete_rx },
+                        Some(mpsc::error::TrySendError::Full(())) => {
+                            self.barrier = BarrierState::Reserving {
+                                permit: Self::reserve(self.outbound.clone()),
+                                complete_tx,
+                                complete_rx,
+                            };
+                        }
+                        Some(mpsc::error::TrySendError::Closed(())) => {
+                            self.finish_barrier();
+                            return Poll::Ready(Err(writer_closed_error()));
+                        }
+                    }
                 }
                 BarrierState::Reserving {
                     permit,
@@ -817,6 +1027,20 @@ fn barrier_timeout() -> std::time::Duration {
     } else {
         std::time::Duration::from_secs(5)
     }
+}
+
+fn data_command(stream_id: u32, payload: &[u8]) -> OutboundCommand {
+    OutboundCommand::Data {
+        stream_id,
+        frame: OutboundFrame::copy_from(payload),
+    }
+}
+
+fn writer_closed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "multiplexed session writer closed",
+    )
 }
 
 impl AsyncRead for VirtualStream {
@@ -950,22 +1174,6 @@ impl AsyncWrite for VirtualStream {
         } else {
             None
         };
-        if self.write_permit.is_none() {
-            self.write_permit = Some(Self::reserve(self.outbound.clone()));
-        }
-        let permit = match self
-            .write_permit
-            .as_mut()
-            .expect("write permit initialized")
-            .as_mut()
-            .poll(cx)
-        {
-            Poll::Pending => return self.poll_stalled_write(cx),
-            Poll::Ready(result) => {
-                self.write_permit = None;
-                result?
-            }
-        };
         let length = buf
             .len()
             .min(self.max_frame_payload)
@@ -973,10 +1181,36 @@ impl AsyncWrite for VirtualStream {
         if length == 0 {
             return self.poll_stalled_write(cx);
         }
-        permit.send(OutboundCommand::Data {
-            stream_id: self.stream_id,
-            data: buf[..length].to_vec(),
-        });
+        let this = &mut *self;
+        let payload = &buf[..length];
+        loop {
+            match this.write_permit.as_mut() {
+                // Already queued behind a full session queue: keep that place.
+                Some(pending) => match pending.as_mut().poll(cx) {
+                    Poll::Pending => return this.poll_stalled_write(cx),
+                    Poll::Ready(result) => {
+                        this.write_permit = None;
+                        result?.send(data_command(this.stream_id, payload));
+                        break;
+                    }
+                },
+                // The common case has room, and taking the slot directly
+                // avoids boxing a reservation future and cloning the sender
+                // on every write.
+                None => match this.outbound.try_reserve() {
+                    Ok(permit) => {
+                        permit.send(data_command(this.stream_id, payload));
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Full(())) => {
+                        this.write_permit = Some(Self::reserve(this.outbound.clone()));
+                    }
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        return Poll::Ready(Err(writer_closed_error()));
+                    }
+                },
+            }
+        }
         if let Some(v2) = &self.smux_v2 {
             v2.flow.record_write(length);
         }
@@ -1136,7 +1370,7 @@ mod tests {
         outbound_tx
             .send(OutboundCommand::Data {
                 stream_id: 99,
-                data: vec![1],
+                frame: OutboundFrame::copy_from(&[1]),
             })
             .await
             .unwrap();
@@ -1300,7 +1534,7 @@ mod tests {
         outbound_tx
             .send(OutboundCommand::Data {
                 stream_id: 99,
-                data: vec![1],
+                frame: OutboundFrame::copy_from(&[1]),
             })
             .await
             .unwrap();
@@ -1331,7 +1565,7 @@ mod tests {
         outbound_tx
             .send(OutboundCommand::Data {
                 stream_id: 99,
-                data: vec![1],
+                frame: OutboundFrame::copy_from(&[1]),
             })
             .await
             .unwrap();
@@ -1358,7 +1592,7 @@ mod tests {
         outbound_tx
             .send(OutboundCommand::Data {
                 stream_id: 99,
-                data: vec![1],
+                frame: OutboundFrame::copy_from(&[1]),
             })
             .await
             .unwrap();

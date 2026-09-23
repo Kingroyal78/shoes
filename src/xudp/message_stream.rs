@@ -21,6 +21,10 @@ use crate::resolver::{NativeResolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
+/// Bound per-connection XUDP session state so a peer cannot retain one entry
+/// for every 16-bit session id until the maps or allocator become exhausted.
+const MAX_XUDP_SESSIONS: usize = 1024;
+
 pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
@@ -109,6 +113,26 @@ impl XudpMessageStream {
         }
     }
 
+    fn ensure_session_capacity(&self, session_id: Option<u16>) -> std::io::Result<()> {
+        let known = session_id.is_some_and(|session_id| {
+            self.session_to_destination.contains_key(&session_id)
+                || self
+                    .session_to_original_destination
+                    .contains_key(&session_id)
+        });
+        if !known
+            && (self.session_to_destination.len() >= MAX_XUDP_SESSIONS
+                || self.session_to_original_destination.len() >= MAX_XUDP_SESSIONS
+                || self.destination_to_session.len() >= MAX_XUDP_SESSIONS)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("XUDP session limit reached ({MAX_XUDP_SESSIONS})"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get or create session ID for destination, preserving original address
     /// resolved_destination: IP address (used for reverse lookup from UDP responses)
     /// original_destination: Original address from XUDP frame (may be hostname, used in response frames)
@@ -116,15 +140,16 @@ impl XudpMessageStream {
         &mut self,
         resolved_destination: &NetLocation,
         original_destination: &NetLocation,
-    ) -> (u16, bool) {
+    ) -> std::io::Result<(u16, bool)> {
         if let Some(&session_id) = self.destination_to_session.get(resolved_destination) {
             log::debug!(
                 "[XUDP] Found existing session {} for destination {}",
                 session_id,
                 resolved_destination
             );
-            (session_id, false) // Existing session
+            Ok((session_id, false)) // Existing session
         } else {
+            self.ensure_session_capacity(None)?;
             let session_id = self.allocate_session_id();
             log::debug!(
                 "[XUDP] Creating NEW session {} for resolved dest {} (original: {})",
@@ -143,7 +168,7 @@ impl XudpMessageStream {
                 "[XUDP] Session maps updated. Total sessions: {}",
                 self.destination_to_session.len()
             );
-            (session_id, true) // New session
+            Ok((session_id, true)) // New session
         }
     }
 
@@ -213,6 +238,7 @@ impl XudpMessageStream {
 
             // Handle session mappings
             if let Some(ref target) = metadata.target {
+                self.ensure_session_capacity(Some(metadata.session_id))?;
                 log::debug!(
                     "[XUDP READ] Updating session {} mapping to target {}",
                     metadata.session_id,
@@ -296,6 +322,7 @@ impl XudpMessageStream {
 
         // Store/update session mapping for session_id → destination
         if let Some(ref target) = metadata.target {
+            self.ensure_session_capacity(Some(metadata.session_id))?;
             log::debug!(
                 "[XUDP READ] Updating session {} mapping to target {}",
                 metadata.session_id,
@@ -688,7 +715,10 @@ impl AsyncReadSessionMessage for XudpMessageStream {
 
             // Find session ID for resolved destination, preserving original
             let (session_id, _is_new) =
-                this.get_or_create_session(&resolved_destination, &original_destination);
+                match this.get_or_create_session(&resolved_destination, &original_destination) {
+                    Ok(session) => session,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
 
             // Convert to SocketAddr for return
             let socket_addr = futures::ready!(
@@ -742,7 +772,10 @@ impl AsyncReadSessionMessage for XudpMessageStream {
 
                     // Get or create session, preserving original destination (may be hostname)
                     let (session_id, _is_new) =
-                        this.get_or_create_session(&resolved_destination, &destination);
+                        match this.get_or_create_session(&resolved_destination, &destination) {
+                            Ok(session) => session,
+                            Err(error) => return Poll::Ready(Err(error)),
+                        };
                     log::debug!(
                         "[XUDP SESSION READ] Session {} mapped to {}",
                         session_id,
@@ -865,6 +898,9 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         } else {
             // Session doesn't exist yet - this happens when forwarding from another XUDP stream.
             // Create a new session using the target address.
+            if let Err(error) = self.ensure_session_capacity(Some(session_id)) {
+                return Poll::Ready(Err(error));
+            }
             let addr = match target.ip() {
                 std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
                 std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
@@ -1071,6 +1107,29 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn session_table_rejects_new_destinations_at_bound() {
+        let (client_io, _server_io) = duplex(1024);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(client_io)));
+
+        for id in 0..MAX_XUDP_SESSIONS as u16 {
+            let target = NetLocation::new(
+                Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                id.saturating_add(1),
+            );
+            stream.destination_to_session.insert(target.clone(), id);
+            stream.session_to_destination.insert(id, target.clone());
+            stream.session_to_original_destination.insert(id, target);
+        }
+
+        let new_target = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 65_535);
+        let error = stream
+            .get_or_create_session(&new_target, &new_target)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(stream.session_to_destination.len(), MAX_XUDP_SESSIONS);
     }
 
     #[tokio::test]

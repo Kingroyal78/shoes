@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use futures::future::{self, Either};
+use futures::{FutureExt, TryFutureExt};
 use log::{debug, error, warn};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
@@ -125,32 +127,38 @@ async fn run_tcp_server(
             error!("Failed to set TCP nodelay: {e}");
         }
 
-        let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
-            match process_stream(stream, cloned_handler, cloned_resolver, Some(addr)).await {
-                Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
-                Err(StreamFailure::Handshake(e)) => {
-                    let now = Instant::now();
-                    if handshake_rejection_can_report(now)
-                        && should_report_handshake_rejection(&e.to_string(), now)
-                    {
-                        warn!(
-                            "{}:{} handshake rejected: {} (identical rejections are logged at debug for the next {}s)",
-                            addr.ip(),
-                            addr.port(),
-                            e,
-                            HANDSHAKE_REJECTION_REPORT_INTERVAL.as_secs()
-                        )
-                    } else {
-                        debug!("{}:{} handshake rejected: {}", addr.ip(), addr.port(), e)
-                    }
-                }
-                Err(StreamFailure::Proxy(e)) => {
-                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e)
-                }
+        // A combinator rather than an `async move` block: the block would keep
+        // its captures -- the stream, handler and resolver, already moved into
+        // the serving future -- resident beside it for the connection's life.
+        tokio::spawn(
+            process_stream(stream, server_handler.clone(), resolver.clone(), Some(addr))
+                .map(move |result| report_tcp_stream_result(addr, result)),
+        );
+    }
+}
+
+fn report_tcp_stream_result(addr: SocketAddr, result: Result<(), StreamFailure>) {
+    match result {
+        Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
+        Err(StreamFailure::Handshake(e)) => {
+            let now = Instant::now();
+            if handshake_rejection_can_report(now)
+                && should_report_handshake_rejection(&e.to_string(), now)
+            {
+                warn!(
+                    "{}:{} handshake rejected: {} (identical rejections are logged at debug for the next {}s)",
+                    addr.ip(),
+                    addr.port(),
+                    e,
+                    HANDSHAKE_REJECTION_REPORT_INTERVAL.as_secs()
+                )
+            } else {
+                debug!("{}:{} handshake rejected: {}", addr.ip(), addr.port(), e)
             }
-        });
+        }
+        Err(StreamFailure::Proxy(e)) => {
+            error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e)
+        }
     }
 }
 
@@ -170,24 +178,24 @@ async fn run_unix_server(
             }
         };
 
-        let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
-            match process_stream(stream, cloned_handler, cloned_resolver, None).await {
-                Ok(()) => debug!("{addr:?} finished successfully"),
-                Err(StreamFailure::Handshake(e)) => {
-                    let now = Instant::now();
-                    if handshake_rejection_can_report(now)
-                        && should_report_handshake_rejection(&e.to_string(), now)
-                    {
-                        warn!("{addr:?} handshake rejected: {e}")
-                    } else {
-                        debug!("{addr:?} handshake rejected: {e}")
+        tokio::spawn(
+            process_stream(stream, server_handler.clone(), resolver.clone(), None).map(
+                move |result| match result {
+                    Ok(()) => debug!("{addr:?} finished successfully"),
+                    Err(StreamFailure::Handshake(e)) => {
+                        let now = Instant::now();
+                        if handshake_rejection_can_report(now)
+                            && should_report_handshake_rejection(&e.to_string(), now)
+                        {
+                            warn!("{addr:?} handshake rejected: {e}")
+                        } else {
+                            debug!("{addr:?} handshake rejected: {e}")
+                        }
                     }
-                }
-                Err(StreamFailure::Proxy(e)) => error!("{addr:?} finished with error: {e:?}"),
-            }
-        });
+                    Err(StreamFailure::Proxy(e)) => error!("{addr:?} finished with error: {e:?}"),
+                },
+            ),
+        );
     }
 }
 
@@ -204,15 +212,14 @@ async fn bind_unix_listener(path_buf: &PathBuf) -> std::io::Result<tokio::net::U
     crate::socket_util::new_unix_listener(path_buf, 4096)
 }
 
-async fn setup_server_stream<AS>(
-    stream: AS,
+/// Owns the handler only for the handshake, so a connection does not keep the
+/// handler that accepted it -- and with it a superseded runtime generation --
+/// alive for as long as it is proxied.
+async fn setup_server_stream(
+    server_stream: Box<dyn AsyncStream>,
     server_handler: Arc<dyn TcpServerHandler>,
     peer_addr: Option<SocketAddr>,
-) -> std::io::Result<TcpServerSetupResult>
-where
-    AS: AsyncStream + 'static,
-{
-    let server_stream = Box::new(stream);
+) -> std::io::Result<TcpServerSetupResult> {
     server_handler
         .setup_server_stream_with_peer_addr(server_stream, peer_addr)
         .await
@@ -414,15 +421,31 @@ impl Drop for LiveStreamGuard {
     }
 }
 
-pub async fn process_stream<AS>(
+/// Serve one accepted stream, from its inbound handshake to the end of the
+/// proxied connection.
+///
+/// The stream is boxed before the serving future is built. Every live
+/// connection is charged its task's largest state for as long as it lives, and
+/// a stream held by value stayed part of that state even after the handler had
+/// taken it -- several hundred bytes for a multiplexed logical stream.
+pub fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<SocketAddr>,
-) -> Result<(), StreamFailure>
+) -> impl Future<Output = Result<(), StreamFailure>> + Send + 'static
 where
     AS: AsyncStream + 'static,
 {
+    process_boxed_stream(Box::new(stream), server_handler, resolver, peer_addr)
+}
+
+async fn process_boxed_stream(
+    stream: Box<dyn AsyncStream>,
+    server_handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> Result<(), StreamFailure> {
     let _live = LiveStreamGuard::try_new().map_err(StreamFailure::Handshake)?;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
@@ -450,23 +473,46 @@ where
         .map_err(StreamFailure::Proxy)
 }
 
-pub async fn handle_server_setup_result(
+pub fn handle_server_setup_result(
     setup_result: TcpServerSetupResult,
     resolver: Arc<dyn Resolver>,
     peer_addr: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
     // Multiplexing adapters enter here with logical streams that did not pass
     // through `process_stream`. Give them the same admission, accounting and
     // cancellation lifetime as socket-accepted streams.
-    let _live = LiveStreamGuard::try_new()?;
-    handle_server_setup_result_inner(setup_result, resolver, peer_addr).await
+    //
+    // Admission is still decided on first poll. Only the serving future is
+    // built up front: an `async fn` would also keep its setup-result argument
+    // resident for the life of the stream, after the serving future had
+    // already taken everything out of it.
+    let connection = handle_server_setup_result_inner(setup_result, resolver, peer_addr);
+    future::lazy(|_| LiveStreamGuard::try_new()).and_then(move |live| {
+        connection.map(move |result| {
+            drop(live);
+            result
+        })
+    })
 }
 
-async fn handle_server_setup_result_inner(
+/// A connection's serving future, boxed where it would otherwise set the size
+/// of every connection's task.
+type ConnectionFuture = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'static>>;
+
+/// Pick the future that serves a setup result.
+///
+/// Deliberately not an `async fn`. A task is allocated at the size of the
+/// largest state its future can reach and keeps that allocation for as long
+/// as the connection lives, and one state machine spanning every arm is sized
+/// by whichever arm is largest -- the UDP arms, and the dial -- while the
+/// state a proxied TCP connection actually lives in is a fraction of that.
+/// TCP forwarding, which is nearly every connection, is returned inline; the
+/// rarer UDP arms are boxed so they cannot inflate it.
+fn handle_server_setup_result_inner(
     mut setup_result: TcpServerSetupResult,
     resolver: Arc<dyn Resolver>,
     mut peer_addr: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
     loop {
         return match setup_result {
             TcpServerSetupResult::PeerAddressOverride {
@@ -479,372 +525,513 @@ async fn handle_server_setup_result_inner(
             }
             TcpServerSetupResult::TcpForward {
                 remote_location,
-                stream: mut server_stream,
-                need_initial_flush: server_need_initial_flush,
+                stream,
+                need_initial_flush,
                 proxy_selector,
                 outbound_dispatcher,
                 connection_success_response,
                 initial_remote_data,
                 authenticated_user,
-            } => {
-                let _alive_guard = match check_device_limit(&authenticated_user, peer_addr) {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        let _ = server_stream.shutdown().await;
-                        return Err(e);
-                    }
-                };
-
-                let upload_counter = Arc::new(AtomicU64::new(0));
-                let download_counter = Arc::new(AtomicU64::new(0));
-                let _traffic_flush = TrafficFlushTask::start(
-                    &authenticated_user,
-                    upload_counter.clone(),
-                    download_counter.clone(),
-                );
-                if authenticated_user.is_some() {
-                    server_stream = Box::new(MeteredStream::new(
-                        server_stream,
-                        upload_counter.clone(),
-                        download_counter.clone(),
-                    ));
-                }
-                let speed_limiter = speed_limiter_for(&authenticated_user);
-                if let Some(speed_limiter) = &speed_limiter {
-                    server_stream = Box::new(SpeedLimitedStream::new(
-                        server_stream,
-                        speed_limiter.clone(),
-                    ));
-                }
-
-                let mut initial_remote_data = initial_remote_data.map(Vec::from);
-                let pre_metered_initial_upload_len =
-                    initial_remote_data.as_ref().map_or(0, Vec::len);
-                let sniffed_protocol = if proxy_selector.requires_protocol_sniff()
-                    || outbound_dispatcher
-                        .as_ref()
-                        .is_some_and(|dispatcher| dispatcher.requires_protocol_sniff())
-                {
-                    sniff_tcp_forward_protocol(&mut server_stream, &mut initial_remote_data).await?
-                } else {
-                    None
-                };
-
-                // The dedicated egress binding lives on the authenticated user;
-                // it is read here because this is the last scope that still has
-                // the user before the dial path takes over.
-                let dedicated_egress = authenticated_user
-                    .as_ref()
-                    .and_then(|user| user.dedicated_ip.clone());
-
-                let setup_client_stream_future = timeout(
-                    Duration::from_secs(60),
-                    setup_client_tcp_stream(
-                        proxy_selector,
-                        resolver,
-                        remote_location.clone(),
-                        sniffed_protocol,
-                        outbound_dispatcher.as_deref(),
-                        dedicated_egress,
-                    ),
-                );
-
-                let TcpClientSetupResult {
-                    mut client_stream,
-                    early_data: upstream_early_data,
-                } = match setup_client_stream_future.await {
-                    Ok(Ok(Some(result))) => result,
-                    Ok(Ok(None)) => {
-                        // Must have been blocked.
-                        let _ = server_stream.shutdown().await;
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        let _ = server_stream.shutdown().await;
-                        return Err(std::io::Error::new(
-                            e.kind(),
-                            format!("failed to setup client stream to {remote_location}: {e}"),
-                        ));
-                    }
-                    Err(elapsed) => {
-                        let _ = server_stream.shutdown().await;
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!("client setup to {remote_location} timed out: {elapsed}"),
-                        ));
-                    }
-                };
-
-                if let Some(data) = connection_success_response {
-                    write_all(&mut server_stream, &data).await?;
-                    // server_need_initial_flush should be set to true by the handler if
-                    // it's needed.
-                }
-
-                // Strictly after the protocol response: these are the target's
-                // own first bytes, handed over by an upstream proxy alongside
-                // its connect reply. Ahead of the response they would be read
-                // as one -- a VLESS client parses the first byte as a version
-                // and gives up.
-                if let Some(data) = upstream_early_data {
-                    write_all(&mut server_stream, &data).await?;
-                    server_stream.flush().await?;
-                }
-
-                let client_need_initial_flush = match initial_remote_data {
-                    Some(data) => {
-                        let pre_metered_len = pre_metered_initial_upload_len.min(data.len());
-                        if pre_metered_len > 0 {
-                            if let Some(speed_limiter) = &speed_limiter
-                                && let Some(delay) = speed_limiter.reserve_delay(pre_metered_len)
-                            {
-                                tokio::time::sleep(delay).await;
-                            }
-                            if authenticated_user.is_some() {
-                                upload_counter.fetch_add(pre_metered_len as u64, Ordering::Relaxed);
-                            }
-                        }
-                        write_all(&mut client_stream, &data).await?;
-                        true
-                    }
-                    None => false,
-                };
-
-                let copy_result = copy_bidirectional(
-                    &mut server_stream,
-                    &mut client_stream,
-                    server_need_initial_flush,
-                    client_need_initial_flush,
-                )
-                .await;
-
-                shutdown_tcp_stream_pair(
-                    &mut *server_stream,
-                    &mut *client_stream,
-                    stream_shutdown_timeout(),
-                )
-                .await;
-
-                copy_result?;
-                Ok(())
-            }
+            } => Either::Left(run_tcp_forward(Box::pin(connect_tcp_forward(
+                TcpForwardSetup {
+                    remote_location,
+                    server_stream: stream,
+                    server_need_initial_flush: need_initial_flush,
+                    proxy_selector,
+                    outbound_dispatcher,
+                    connection_success_response,
+                    initial_remote_data,
+                    authenticated_user,
+                },
+                resolver,
+                peer_addr,
+            )))),
             TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
-                stream: mut server_stream,
-                need_initial_flush: server_need_initial_flush,
+                stream,
+                need_initial_flush,
                 proxy_selector,
                 outbound_dispatcher,
                 authenticated_user,
-            } => {
-                let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
-                let upload_counter = Arc::new(AtomicU64::new(0));
-                let download_counter = Arc::new(AtomicU64::new(0));
-                let _traffic_flush = TrafficFlushTask::start(
-                    &authenticated_user,
-                    upload_counter.clone(),
-                    download_counter.clone(),
-                );
-                if authenticated_user.is_some() {
-                    server_stream = Box::new(MeteredMessageStream::new(
-                        server_stream,
-                        upload_counter.clone(),
-                        download_counter.clone(),
-                    ));
-                }
-                if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
-                    server_stream =
-                        Box::new(SpeedLimitedMessageStream::new(server_stream, speed_limiter));
-                }
-                // Same read as the TCP branch: this is the last scope that
-                // still has the user before the dial.
-                let dedicated_egress = authenticated_user
-                    .as_ref()
-                    .and_then(|user| user.dedicated_ip.clone());
-                let (sniffed_protocol, initial_udp_data) = if proxy_selector
-                    .requires_protocol_sniff()
-                    || outbound_dispatcher
-                        .as_ref()
-                        .is_some_and(|d| d.requires_protocol_sniff())
-                {
-                    sniff_bidirectional_udp_protocol(&mut server_stream).await?
-                } else {
-                    (None, None)
-                };
-                let action = proxy_selector
-                    .judge_with_protocol(remote_location.into(), &resolver, sniffed_protocol)
-                    .await?;
-                match action {
-                    ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    } => {
-                        // A dedicated egress replaces the dial, exactly as on
-                        // the TCP path. An upstream-proxy egress has no UDP to
-                        // offer -- neither SOCKS5 nor HTTP client hops carry
-                        // UDP-over-TCP here -- so its chain refuses the dial
-                        // and the datagram is dropped rather than sent out of
-                        // the node's own address, which is what the buyer paid
-                        // not to happen.
-                        let egress_chain = egress::chain_group_for_dial(
-                            dedicated_egress.as_ref(),
-                            outbound_dispatcher.as_deref(),
-                            chain_group,
-                            &resolver,
-                            &remote_location,
-                        );
-
-                        let mut client_stream = match (&outbound_dispatcher, &egress_chain) {
-                            (_, Some(chain)) => {
-                                let target_desc = remote_location.to_string();
-                                let dial =
-                                    chain.connect_udp_bidirectional(&resolver, remote_location);
-                                tokio::time::timeout(Duration::from_secs(60), dial)
-                                    .await
-                                    .map_err(|_| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::TimedOut,
-                                            format!(
-                                                "timed out dialing dedicated egress UDP to {target_desc}"
-                                            ),
-                                        )
-                                    })??
-                            }
-                            (Some(dispatcher), None) => {
-                                let dial = dispatcher.connect_udp_bidirectional(
-                                    &remote_location,
-                                    sniffed_protocol,
-                                    &resolver,
-                                );
-                                tokio::time::timeout(Duration::from_secs(60), dial)
-                                    .await
-                                    .map_err(|_| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::TimedOut,
-                                            format!(
-                                                "timed out dispatching UDP to {remote_location}"
-                                            ),
-                                        )
-                                    })??
-                            }
-                            (None, None) => {
-                                let target_desc = remote_location.to_string();
-                                let dial = chain_group
-                                    .connect_udp_bidirectional(&resolver, remote_location);
-                                tokio::time::timeout(Duration::from_secs(60), dial)
-                                    .await
-                                    .map_err(|_| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::TimedOut,
-                                            format!("timed out dialing UDP chain to {target_desc}"),
-                                        )
-                                    })??
-                            }
-                        };
-                        let client_need_initial_flush = match initial_udp_data {
-                            Some(data) => {
-                                write_udp_message(&mut client_stream, &data).await?;
-                                true
-                            }
-                            None => false,
-                        };
-
-                        run_udp_copy(
-                            server_stream,
-                            client_stream,
-                            server_need_initial_flush,
-                            client_need_initial_flush,
-                        )
-                        .await
-                    }
-                    ConnectDecision::Block => Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "Blocked bidirectional udp forward",
-                    )),
-                }
-            }
+            } => Either::Right(Box::pin(run_bidirectional_udp(
+                remote_location,
+                stream,
+                need_initial_flush,
+                proxy_selector,
+                outbound_dispatcher,
+                authenticated_user,
+                resolver,
+                peer_addr,
+            )) as ConnectionFuture),
             TcpServerSetupResult::MultiDirectionalUdp {
-                stream: mut server_stream,
+                stream,
                 need_initial_flush,
                 proxy_selector,
                 outbound_dispatcher,
                 authenticated_user,
-            } => {
-                let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
-                let upload_counter = Arc::new(AtomicU64::new(0));
-                let download_counter = Arc::new(AtomicU64::new(0));
-                let _traffic_flush = TrafficFlushTask::start(
-                    &authenticated_user,
-                    upload_counter.clone(),
-                    download_counter.clone(),
-                );
-                if authenticated_user.is_some() {
-                    server_stream = Box::new(MeteredTargetedMessageStream::new(
-                        server_stream,
-                        upload_counter.clone(),
-                        download_counter.clone(),
-                    ));
-                }
-                if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
-                    server_stream = Box::new(SpeedLimitedTargetedMessageStream::new(
-                        server_stream,
-                        speed_limiter,
-                    ));
-                }
-                run_udp_routing(
-                    ServerStream::Targeted(server_stream),
-                    proxy_selector,
-                    outbound_dispatcher,
-                    resolver,
-                    need_initial_flush,
-                    authenticated_user
-                        .as_ref()
-                        .and_then(|user| user.dedicated_ip.clone()),
-                )
-                .await
-            }
+            } => Either::Right(Box::pin(run_multi_directional_udp(
+                stream,
+                need_initial_flush,
+                proxy_selector,
+                outbound_dispatcher,
+                authenticated_user,
+                resolver,
+                peer_addr,
+            )) as ConnectionFuture),
             TcpServerSetupResult::SessionBasedUdp {
-                stream: mut server_stream,
+                stream,
                 need_initial_flush,
                 proxy_selector,
                 outbound_dispatcher,
                 authenticated_user,
-            } => {
-                let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
-                let upload_counter = Arc::new(AtomicU64::new(0));
-                let download_counter = Arc::new(AtomicU64::new(0));
-                let _traffic_flush = TrafficFlushTask::start(
-                    &authenticated_user,
-                    upload_counter.clone(),
-                    download_counter.clone(),
-                );
-                if authenticated_user.is_some() {
-                    server_stream = Box::new(MeteredSessionMessageStream::new(
-                        server_stream,
-                        upload_counter.clone(),
-                        download_counter.clone(),
-                    ));
-                }
-                if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
-                    server_stream = Box::new(SpeedLimitedSessionMessageStream::new(
-                        server_stream,
-                        speed_limiter,
-                    ));
-                }
-                run_udp_routing(
-                    ServerStream::Session(server_stream),
-                    proxy_selector,
-                    outbound_dispatcher,
-                    resolver,
-                    need_initial_flush,
-                    authenticated_user
-                        .as_ref()
-                        .and_then(|user| user.dedicated_ip.clone()),
-                )
-                .await
-            }
-            TcpServerSetupResult::ConnectionTask(task) => task.await,
+            } => Either::Right(Box::pin(run_session_based_udp(
+                stream,
+                need_initial_flush,
+                proxy_selector,
+                outbound_dispatcher,
+                authenticated_user,
+                resolver,
+                peer_addr,
+            )) as ConnectionFuture),
+            TcpServerSetupResult::ConnectionTask(task) => Either::Right(task),
         };
     }
+}
+
+/// The fields of [`TcpServerSetupResult::TcpForward`], carried into the dial.
+struct TcpForwardSetup {
+    remote_location: NetLocation,
+    server_stream: Box<dyn AsyncStream>,
+    server_need_initial_flush: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    connection_success_response: Option<Box<[u8]>>,
+    initial_remote_data: Option<Box<[u8]>>,
+    authenticated_user: Option<AuthenticatedUser>,
+}
+
+/// What a TCP forward holds once both ends are connected, and nothing more:
+/// this is the state a proxied connection lives in.
+struct ConnectedTcpForward {
+    server_stream: Box<dyn AsyncStream>,
+    client_stream: Box<dyn AsyncStream>,
+    server_need_initial_flush: bool,
+    client_need_initial_flush: bool,
+    alive_guard: Option<AliveIpGuard>,
+    traffic_flush: TrafficFlushTask,
+}
+
+async fn run_tcp_forward<F>(connect: Pin<Box<F>>) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<Option<ConnectedTcpForward>>>,
+{
+    // Everything up to an established connection -- sniffing, the dial and
+    // its timeout, the handshake replies -- is several times the size of the
+    // copy that follows. Boxed, it is freed as soon as the connection is up
+    // instead of sizing the task for the connection's whole life.
+    let Some(ConnectedTcpForward {
+        mut server_stream,
+        mut client_stream,
+        server_need_initial_flush,
+        client_need_initial_flush,
+        alive_guard,
+        traffic_flush,
+    }) = connect.await?
+    else {
+        return Ok(());
+    };
+
+    let copy_result = copy_bidirectional(
+        &mut server_stream,
+        &mut client_stream,
+        server_need_initial_flush,
+        client_need_initial_flush,
+    )
+    .await;
+
+    shutdown_tcp_stream_pair(
+        &mut *server_stream,
+        &mut *client_stream,
+        stream_shutdown_timeout(),
+    )
+    .await;
+
+    // The release order of the single scope this used to be: the upstream
+    // connection, then the traffic report and the device slot, then the
+    // client's own stream.
+    drop(client_stream);
+    drop(traffic_flush);
+    drop(alive_guard);
+    drop(server_stream);
+
+    copy_result
+}
+
+/// Admit, meter and dial a TCP forward, and send whatever has to reach either
+/// end before the copy starts. `None` means the destination was blocked and
+/// the client stream has already been shut down.
+async fn connect_tcp_forward(
+    setup: TcpForwardSetup,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> std::io::Result<Option<ConnectedTcpForward>> {
+    let TcpForwardSetup {
+        remote_location,
+        mut server_stream,
+        server_need_initial_flush,
+        proxy_selector,
+        outbound_dispatcher,
+        connection_success_response,
+        initial_remote_data,
+        authenticated_user,
+    } = setup;
+
+    let alive_guard = match check_device_limit(&authenticated_user, peer_addr) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = server_stream.shutdown().await;
+            return Err(e);
+        }
+    };
+
+    let upload_counter = Arc::new(AtomicU64::new(0));
+    let download_counter = Arc::new(AtomicU64::new(0));
+    let traffic_flush = TrafficFlushTask::start(
+        &authenticated_user,
+        upload_counter.clone(),
+        download_counter.clone(),
+    );
+    if authenticated_user.is_some() {
+        server_stream = Box::new(MeteredStream::new(
+            server_stream,
+            upload_counter.clone(),
+            download_counter.clone(),
+        ));
+    }
+    let speed_limiter = speed_limiter_for(&authenticated_user);
+    if let Some(speed_limiter) = &speed_limiter {
+        server_stream = Box::new(SpeedLimitedStream::new(
+            server_stream,
+            speed_limiter.clone(),
+        ));
+    }
+
+    let mut initial_remote_data = initial_remote_data.map(Vec::from);
+    let pre_metered_initial_upload_len = initial_remote_data.as_ref().map_or(0, Vec::len);
+    let sniffed_protocol = if proxy_selector.requires_protocol_sniff()
+        || outbound_dispatcher
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.requires_protocol_sniff())
+    {
+        sniff_tcp_forward_protocol(&mut server_stream, &mut initial_remote_data).await?
+    } else {
+        None
+    };
+
+    // The dedicated egress binding lives on the authenticated user;
+    // it is read here because this is the last scope that still has
+    // the user before the dial path takes over.
+    let dedicated_egress = authenticated_user
+        .as_ref()
+        .and_then(|user| user.dedicated_ip.clone());
+
+    let setup_client_stream_future = timeout(
+        Duration::from_secs(60),
+        setup_client_tcp_stream(
+            proxy_selector,
+            resolver,
+            remote_location.clone(),
+            sniffed_protocol,
+            outbound_dispatcher.as_deref(),
+            dedicated_egress,
+        ),
+    );
+
+    let TcpClientSetupResult {
+        mut client_stream,
+        early_data: upstream_early_data,
+    } = match setup_client_stream_future.await {
+        Ok(Ok(Some(result))) => result,
+        Ok(Ok(None)) => {
+            // Must have been blocked.
+            let _ = server_stream.shutdown().await;
+            return Ok(None);
+        }
+        Ok(Err(e)) => {
+            let _ = server_stream.shutdown().await;
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("failed to setup client stream to {remote_location}: {e}"),
+            ));
+        }
+        Err(elapsed) => {
+            let _ = server_stream.shutdown().await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("client setup to {remote_location} timed out: {elapsed}"),
+            ));
+        }
+    };
+
+    if let Some(data) = connection_success_response {
+        write_all(&mut server_stream, &data).await?;
+        // server_need_initial_flush should be set to true by the handler if
+        // it's needed.
+    }
+
+    // Strictly after the protocol response: these are the target's
+    // own first bytes, handed over by an upstream proxy alongside
+    // its connect reply. Ahead of the response they would be read
+    // as one -- a VLESS client parses the first byte as a version
+    // and gives up.
+    if let Some(data) = upstream_early_data {
+        write_all(&mut server_stream, &data).await?;
+        server_stream.flush().await?;
+    }
+
+    let client_need_initial_flush = match initial_remote_data {
+        Some(data) => {
+            let pre_metered_len = pre_metered_initial_upload_len.min(data.len());
+            if pre_metered_len > 0 {
+                if let Some(speed_limiter) = &speed_limiter
+                    && let Some(delay) = speed_limiter.reserve_delay(pre_metered_len)
+                {
+                    tokio::time::sleep(delay).await;
+                }
+                if authenticated_user.is_some() {
+                    upload_counter.fetch_add(pre_metered_len as u64, Ordering::Relaxed);
+                }
+            }
+            write_all(&mut client_stream, &data).await?;
+            true
+        }
+        None => false,
+    };
+
+    Ok(Some(ConnectedTcpForward {
+        server_stream,
+        client_stream,
+        server_need_initial_flush,
+        client_need_initial_flush,
+        alive_guard,
+        traffic_flush,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bidirectional_udp(
+    remote_location: NetLocation,
+    mut server_stream: Box<dyn AsyncMessageStream>,
+    server_need_initial_flush: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    authenticated_user: Option<AuthenticatedUser>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
+    let upload_counter = Arc::new(AtomicU64::new(0));
+    let download_counter = Arc::new(AtomicU64::new(0));
+    let _traffic_flush = TrafficFlushTask::start(
+        &authenticated_user,
+        upload_counter.clone(),
+        download_counter.clone(),
+    );
+    if authenticated_user.is_some() {
+        server_stream = Box::new(MeteredMessageStream::new(
+            server_stream,
+            upload_counter.clone(),
+            download_counter.clone(),
+        ));
+    }
+    if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
+        server_stream = Box::new(SpeedLimitedMessageStream::new(server_stream, speed_limiter));
+    }
+    // Same read as the TCP branch: this is the last scope that
+    // still has the user before the dial.
+    let dedicated_egress = authenticated_user
+        .as_ref()
+        .and_then(|user| user.dedicated_ip.clone());
+    let (sniffed_protocol, initial_udp_data) = if proxy_selector.requires_protocol_sniff()
+        || outbound_dispatcher
+            .as_ref()
+            .is_some_and(|d| d.requires_protocol_sniff())
+    {
+        sniff_bidirectional_udp_protocol(&mut server_stream).await?
+    } else {
+        (None, None)
+    };
+    let action = proxy_selector
+        .judge_with_protocol(remote_location.into(), &resolver, sniffed_protocol)
+        .await?;
+    match action {
+        ConnectDecision::Allow {
+            chain_group,
+            remote_location,
+        } => {
+            // A dedicated egress replaces the dial, exactly as on
+            // the TCP path. An upstream-proxy egress has no UDP to
+            // offer -- neither SOCKS5 nor HTTP client hops carry
+            // UDP-over-TCP here -- so its chain refuses the dial
+            // and the datagram is dropped rather than sent out of
+            // the node's own address, which is what the buyer paid
+            // not to happen.
+            let egress_chain = egress::chain_group_for_dial(
+                dedicated_egress.as_ref(),
+                outbound_dispatcher.as_deref(),
+                chain_group,
+                &resolver,
+                &remote_location,
+            );
+
+            let mut client_stream = match (&outbound_dispatcher, &egress_chain) {
+                (_, Some(chain)) => {
+                    let target_desc = remote_location.to_string();
+                    let dial = chain.connect_udp_bidirectional(&resolver, remote_location);
+                    tokio::time::timeout(Duration::from_secs(60), dial)
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("timed out dialing dedicated egress UDP to {target_desc}"),
+                            )
+                        })??
+                }
+                (Some(dispatcher), None) => {
+                    let dial = dispatcher.connect_udp_bidirectional(
+                        &remote_location,
+                        sniffed_protocol,
+                        &resolver,
+                    );
+                    tokio::time::timeout(Duration::from_secs(60), dial)
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("timed out dispatching UDP to {remote_location}"),
+                            )
+                        })??
+                }
+                (None, None) => {
+                    let target_desc = remote_location.to_string();
+                    let dial = chain_group.connect_udp_bidirectional(&resolver, remote_location);
+                    tokio::time::timeout(Duration::from_secs(60), dial)
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("timed out dialing UDP chain to {target_desc}"),
+                            )
+                        })??
+                }
+            };
+            let client_need_initial_flush = match initial_udp_data {
+                Some(data) => {
+                    write_udp_message(&mut client_stream, &data).await?;
+                    true
+                }
+                None => false,
+            };
+
+            run_udp_copy(
+                server_stream,
+                client_stream,
+                server_need_initial_flush,
+                client_need_initial_flush,
+            )
+            .await
+        }
+        ConnectDecision::Block => Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Blocked bidirectional udp forward",
+        )),
+    }
+}
+
+async fn run_multi_directional_udp(
+    mut server_stream: Box<dyn AsyncTargetedMessageStream>,
+    need_initial_flush: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    authenticated_user: Option<AuthenticatedUser>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
+    let upload_counter = Arc::new(AtomicU64::new(0));
+    let download_counter = Arc::new(AtomicU64::new(0));
+    let _traffic_flush = TrafficFlushTask::start(
+        &authenticated_user,
+        upload_counter.clone(),
+        download_counter.clone(),
+    );
+    if authenticated_user.is_some() {
+        server_stream = Box::new(MeteredTargetedMessageStream::new(
+            server_stream,
+            upload_counter.clone(),
+            download_counter.clone(),
+        ));
+    }
+    if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
+        server_stream = Box::new(SpeedLimitedTargetedMessageStream::new(
+            server_stream,
+            speed_limiter,
+        ));
+    }
+    run_udp_routing(
+        ServerStream::Targeted(server_stream),
+        proxy_selector,
+        outbound_dispatcher,
+        resolver,
+        need_initial_flush,
+        authenticated_user
+            .as_ref()
+            .and_then(|user| user.dedicated_ip.clone()),
+    )
+    .await
+}
+
+async fn run_session_based_udp(
+    mut server_stream: Box<dyn AsyncSessionMessageStream>,
+    need_initial_flush: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    outbound_dispatcher: Option<Arc<OutboundDispatcher>>,
+    authenticated_user: Option<AuthenticatedUser>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    let _alive_guard = check_device_limit(&authenticated_user, peer_addr)?;
+    let upload_counter = Arc::new(AtomicU64::new(0));
+    let download_counter = Arc::new(AtomicU64::new(0));
+    let _traffic_flush = TrafficFlushTask::start(
+        &authenticated_user,
+        upload_counter.clone(),
+        download_counter.clone(),
+    );
+    if authenticated_user.is_some() {
+        server_stream = Box::new(MeteredSessionMessageStream::new(
+            server_stream,
+            upload_counter.clone(),
+            download_counter.clone(),
+        ));
+    }
+    if let Some(speed_limiter) = speed_limiter_for(&authenticated_user) {
+        server_stream = Box::new(SpeedLimitedSessionMessageStream::new(
+            server_stream,
+            speed_limiter,
+        ));
+    }
+    run_udp_routing(
+        ServerStream::Session(server_stream),
+        proxy_selector,
+        outbound_dispatcher,
+        resolver,
+        need_initial_flush,
+        authenticated_user
+            .as_ref()
+            .and_then(|user| user.dedicated_ip.clone()),
+    )
+    .await
 }
 
 fn check_device_limit(

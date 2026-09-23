@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, oneshot};
 
 use super::virtual_stream::{
-    BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
-    OutboundCommand, ReceiveBudget, ReceiveBudgetScope, SmuxV2FlowControl, VirtualStream,
-    WindowUpdate,
+    BudgetBlocked, BudgetEviction, InboundChannels, InboundEvent, InboundFailure, InboundTerminal,
+    OUTBOUND_HEADER_ROOM, OutboundCommand, OutboundFrame, ReceiveBudget, ReceiveBudgetScope,
+    SmuxV2FlowControl, VirtualStream, WindowUpdate,
 };
 use crate::async_stream::AsyncStream;
 use crate::resolver::Resolver;
@@ -29,12 +29,13 @@ const CMD_UPD: u8 = 4;
 const HEADER_SIZE: usize = 8;
 const UPDATE_PAYLOAD_SIZE: usize = 8;
 
-/// Logical streams killed because their inbound queue overran.
+/// Logical streams killed because their inbound queue could not drain.
 ///
-/// smux v1 has no per-stream window, so a stream that cannot keep up has to be
-/// dropped rather than backpressured. Whether that is rare enough to live with
-/// or worth trading memory for is a question about the rate, and the rate was
-/// previously only visible at debug level -- which is off in production.
+/// Mux.Cool still drops a stream the moment its queue overruns. smux instead
+/// backpressures the physical connection and only evicts a stream that made no
+/// progress for [`DEFAULT_STALLED_STREAM_GRACE`], so for smux these count
+/// wedged destinations rather than congested ones. The rate was previously only
+/// visible at debug level -- which is off in production.
 pub static STREAMS_DROPPED_BY_BACKPRESSURE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static STREAMS_DROPPED_BY_STREAM_BYTES: std::sync::atomic::AtomicUsize =
@@ -62,8 +63,28 @@ pub(super) fn record_backpressure_drop(
     stream_id: u32,
     cause: BackpressureCause,
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
     log::info!("{protocol} dropped logical stream {stream_id}: {cause}");
+    count_backpressure_drop(cause);
+}
+
+/// The smux counterpart of [`record_backpressure_drop`]: the stream was not
+/// dropped for overrunning its queue, but evicted for making no progress at
+/// all while the session waited on it.
+fn record_stalled_eviction(
+    version: u8,
+    stream_id: u32,
+    cause: BackpressureCause,
+    grace: std::time::Duration,
+) {
+    log::info!(
+        "smux v{version} evicted logical stream {stream_id} after {}s without progress: {cause}",
+        grace.as_secs()
+    );
+    count_backpressure_drop(cause);
+}
+
+fn count_backpressure_drop(cause: BackpressureCause) {
+    use std::sync::atomic::Ordering::Relaxed;
     STREAMS_DROPPED_BY_BACKPRESSURE.fetch_add(1, Relaxed);
     match cause {
         BackpressureCause::Bytes(ReceiveBudgetScope::Stream) => {
@@ -109,11 +130,28 @@ impl std::fmt::Display for BackpressureCause {
 /// Default ceiling on queued inbound bytes for one logical stream.
 ///
 /// The queue holds what arrives while the stream's own destination is not
-/// taking it, so it has to cover roughly a high-latency path's worth of data
-/// in flight. Four frames -- the previous limit, and expressed in frames
-/// rather than bytes -- is a small fraction of that on a 200ms path, which is
-/// why ordinary congestion rather than a wedged peer was costing streams.
+/// taking it. Reaching it no longer costs the stream anything: the session
+/// stops reading the physical connection until the stream drains. It is the
+/// window a stream gets before its congestion becomes its siblings' problem,
+/// so it has to cover roughly a high-latency path's worth of data in flight
+/// without letting one stream monopolise the session's budget.
 const DEFAULT_STREAM_RECEIVE_BUFFER: usize = 256 * 1024;
+
+/// How long a logical stream may hold its session up without draining a byte
+/// before it is evicted.
+///
+/// smux v1 has no per-stream window, so when a stream's queue is full the only
+/// backpressure available is to stop reading the physical connection, which
+/// stops every other stream on it too. The reference implementation does that
+/// indefinitely. Waiting is right for congestion -- a destination slower than
+/// the client, a dial still in flight -- and dropping the stream there, which
+/// this used to do, failed ordinary uploads a few hundred kilobytes in. A
+/// destination that takes nothing at all for this long is wedged rather than
+/// slow, and its siblings have waited long enough. Twenty seconds rides out TCP
+/// retransmission backoff on the outbound path (1+2+4+8s) and still bounds the
+/// head-of-line stall one wedged stream can impose on everything sharing its
+/// connection.
+pub const DEFAULT_STALLED_STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Default ceiling on queued inbound bytes across a listener's sessions.
 /// Far above what healthy traffic queues -- data sits here only while a logical
@@ -189,9 +227,12 @@ pub struct SmuxServerConfig {
     /// listener's exposure is that figure times the number of connections.
     pub max_listener_receive_buffer: Option<usize>,
     /// Ceiling on queued inbound bytes for one logical stream. Bounds what a
-    /// single stream may take of the session's budget, and decides whether
-    /// congestion costs a stream or only a wedged peer does.
+    /// single stream may take of the session's budget before the session
+    /// stops reading on its behalf.
     pub max_stream_receive_buffer: usize,
+    /// How long a stream that blocks the session may go without draining
+    /// anything before it is evicted; see [`DEFAULT_STALLED_STREAM_GRACE`].
+    pub stalled_stream_grace: std::time::Duration,
 }
 
 impl Default for SmuxServerConfig {
@@ -205,6 +246,7 @@ impl Default for SmuxServerConfig {
             keepalive_timeout: None,
             max_listener_receive_buffer: Some(DEFAULT_LISTENER_RECEIVE_BUFFER),
             max_stream_receive_buffer: DEFAULT_STREAM_RECEIVE_BUFFER,
+            stalled_stream_grace: DEFAULT_STALLED_STREAM_GRACE,
         }
     }
 }
@@ -463,6 +505,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
         .await
 }
 
+#[cfg(test)]
 async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     version: u8,
@@ -470,15 +513,144 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     stream_id: u32,
     payload: &[u8],
 ) -> io::Result<()> {
-    let length = u16::try_from(payload.len())
-        .map_err(|_| invalid_error("smux payload exceeds 65535 bytes"))?;
+    let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+    frame.extend_from_slice(&frame_header(
+        version,
+        command,
+        stream_id,
+        frame_length(payload.len())?,
+    ));
+    frame.extend_from_slice(payload);
+    writer.write_all(&frame).await
+}
+
+const _: () = assert!(HEADER_SIZE == OUTBOUND_HEADER_ROOM);
+
+fn frame_header(version: u8, command: u8, stream_id: u32, length: u16) -> [u8; HEADER_SIZE] {
     let mut header = [0u8; HEADER_SIZE];
     header[0] = version;
     header[1] = command;
     header[2..4].copy_from_slice(&length.to_le_bytes());
     header[4..8].copy_from_slice(&stream_id.to_le_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(payload).await
+    header
+}
+
+fn frame_length(length: usize) -> io::Result<u16> {
+    u16::try_from(length).map_err(|_| invalid_error("smux payload exceeds 65535 bytes"))
+}
+
+/// How much the session writer coalesces into one write.
+///
+/// Every write to the physical stream costs at least one WebSocket frame, one
+/// TLS record and, under TCP_NODELAY, one segment -- however few bytes it
+/// carries. Writing a frame's header and payload separately therefore sent the
+/// eight header bytes as a packet of their own, and writing frames one at a
+/// time paid that cost once per frame even when many were already waiting.
+///
+/// 64 KiB is one maximal smux frame, the unit the writer can never split
+/// anyway. Beyond it the per-write cost is a small fraction of copying the
+/// bytes, while the batch is memory the session holds. A batch stops growing
+/// once it reaches this size, so it can exceed it by at most one frame.
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
+
+/// Frames drained from the session's queues but not yet written, and the
+/// flush barrier that ended the batch, if one did.
+#[derive(Default)]
+struct FrameBatch {
+    bytes: Vec<u8>,
+    barrier: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+impl FrameBatch {
+    /// A barrier ends a batch: it may only be answered once everything queued
+    /// before it has been written and flushed, and nothing after it has to wait
+    /// for that.
+    fn accepts_more(&self) -> bool {
+        self.barrier.is_none() && self.bytes.len() < WRITE_BATCH_BYTES
+    }
+
+    fn push_control(
+        &mut self,
+        version: u8,
+        command: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let header = frame_header(version, command, stream_id, frame_length(payload.len())?);
+        self.bytes.extend_from_slice(&header);
+        self.bytes.extend_from_slice(payload);
+        Ok(())
+    }
+
+    fn push_data(&mut self, version: u8, stream_id: u32, frame: OutboundFrame) -> io::Result<()> {
+        let length = frame_length(frame.payload().len())?;
+        let frame = frame.into_frame(frame_header(version, CMD_PSH, stream_id, length));
+        if self.bytes.is_empty() {
+            // The logical stream already left room for the header, so a batch
+            // of one data frame is written straight from its buffer.
+            self.bytes = frame;
+        } else {
+            self.bytes.extend_from_slice(&frame);
+        }
+        Ok(())
+    }
+
+    fn push_update(&mut self, version: u8, update: WindowUpdate) -> io::Result<()> {
+        let mut payload = [0_u8; UPDATE_PAYLOAD_SIZE];
+        payload[..4].copy_from_slice(&update.consumed.to_le_bytes());
+        payload[4..].copy_from_slice(&update.window.to_le_bytes());
+        self.push_control(version, CMD_UPD, update.stream_id, &payload)
+    }
+
+    fn push_command(&mut self, version: u8, command: OutboundCommand) -> io::Result<()> {
+        match command {
+            OutboundCommand::Data { stream_id, frame } => self.push_data(version, stream_id, frame),
+            OutboundCommand::Finished { stream_id } => {
+                self.push_control(version, CMD_FIN, stream_id, &[])
+            }
+            OutboundCommand::Barrier { complete } => {
+                debug_assert!(self.barrier.is_none(), "a barrier ends its batch");
+                self.barrier = Some(complete);
+                Ok(())
+            }
+        }
+    }
+
+    /// Write the batch in one write, flush it, and answer its barrier.
+    async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> io::Result<()> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let barrier = self.barrier.take();
+        if bytes.is_empty() && barrier.is_none() {
+            return Ok(());
+        }
+        let result = async {
+            if !bytes.is_empty() {
+                writer.write_all(&bytes).await?;
+            }
+            if barrier.is_none() {
+                return writer.flush().await;
+            }
+            // Bound the flush: a half-open physical stream can stall flush
+            // forever, which would hold the barrier's oneshot open, wedge the
+            // logical stream's shutdown, and leak the outbound connection in
+            // CLOSE_WAIT. On timeout report the error so the logical stream
+            // closes anyway.
+            tokio::time::timeout(std::time::Duration::from_secs(5), writer.flush())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "smux barrier flush timed out")
+                })?
+        }
+        .await;
+        if let Some(complete) = barrier {
+            let reported = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+            let _ = complete.send(reported);
+        }
+        result
+    }
 }
 
 struct StreamState {
@@ -491,6 +663,104 @@ struct StreamState {
     task: Option<tokio::task::AbortHandle>,
 }
 
+/// The session's only writer: turns queued frames into writes on the physical
+/// stream, batching whatever is already waiting.
+async fn run_session_writer<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    version: u8,
+    keepalive_interval: Option<std::time::Duration>,
+    mut outbound_rx: mpsc::Receiver<OutboundCommand>,
+    mut updates_rx: mpsc::Receiver<WindowUpdate>,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> io::Result<()> {
+    let mut updates_open = true;
+    let mut closing = false;
+    let ping_period =
+        keepalive_interval.unwrap_or_else(|| std::time::Duration::from_secs(365 * 24 * 60 * 60));
+    let mut ping = tokio::time::interval(ping_period);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` ticks immediately; consume that tick so NOP is sent after
+    // one complete keepalive period.
+    ping.tick().await;
+    // The loop's `?` used to leave the async block outright, taking every
+    // queued command with it. Anything still in the channel has a stream
+    // waiting on it, so the exit has to be observed rather than taken.
+    let outcome: io::Result<()> = async {
+        let mut batch = FrameBatch::default();
+        loop {
+            tokio::select! {
+            update = updates_rx.recv(), if updates_open => {
+                match update {
+                    Some(update) => batch.push_update(version, update)?,
+                    None => updates_open = false,
+                }
+            }
+            command = outbound_rx.recv() => {
+                let Some(command) = command else { break };
+                batch.push_command(version, command)?;
+            }
+            _ = ping.tick(), if keepalive_interval.is_some() => {
+                batch.push_control(version, CMD_NOP, 0, &[])?;
+            }
+            _ = shutdown.notified(), if !closing => {
+                // Closing the receiver rather than breaking: it refuses new
+                // sends but still yields what is already queued, so the
+                // barriers in flight are completed instead of dropped.
+                // The drain then ends the loop through the `None` arm.
+                outbound_rx.close();
+                closing = true;
+            }
+            }
+            // Whatever else is already queued goes out in the same write.
+            // A closed outbound queue is left for the `recv` arm above to
+            // observe, so the loop still ends in one place.
+            while batch.accepts_more() {
+                if updates_open {
+                    match updates_rx.try_recv() {
+                        Ok(update) => {
+                            batch.push_update(version, update)?;
+                            continue;
+                        }
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => updates_open = false,
+                    }
+                }
+                match outbound_rx.try_recv() {
+                    Ok(command) => batch.push_command(version, command)?,
+                    Err(_) => break,
+                }
+            }
+            batch.write_to(&mut writer).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Answer whatever is still queued instead of dropping it. A stream
+    // whose flush was in flight when the peer went away was being told
+    // "the session writer dropped a flush barrier", which names the
+    // messenger rather than the failure -- and that is the ordinary case,
+    // not a rare one: a client closing its WebSocket mid-flush produced
+    // one of these for every stream that had a barrier outstanding. It
+    // now hears why.
+    outbound_rx.close();
+    while let Some(command) = outbound_rx.recv().await {
+        if let OutboundCommand::Barrier { complete } = command {
+            let reported = match &outcome {
+                Ok(()) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("smux v{version} session ended before the flush completed"),
+                )),
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            };
+            let _ = complete.send(reported);
+        }
+    }
+
+    outcome?;
+    writer.shutdown().await
+}
+
 async fn serve_smux(
     stream: Box<dyn AsyncStream>,
     inner: Arc<dyn TcpServerHandler>,
@@ -501,9 +771,8 @@ async fn serve_smux(
 ) -> io::Result<()> {
     let version = config.version;
     let limits = config.limits;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (outbound_tx, mut outbound_rx) =
-        mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
+    let (mut reader, writer) = tokio::io::split(stream);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundCommand>(limits.outbound_frame_queue);
     let (drop_close_tx, mut drop_close_rx) = mpsc::channel::<u32>(limits.max_concurrent_streams);
     let close_outbound = outbound_tx.clone();
     let mut close_forwarder = tokio::spawn(async move {
@@ -515,7 +784,7 @@ async fn serve_smux(
         }
         Ok::<(), io::Error>(())
     });
-    let (updates_tx, mut updates_rx) = mpsc::channel::<WindowUpdate>(limits.outbound_frame_queue);
+    let (updates_tx, updates_rx) = mpsc::channel::<WindowUpdate>(limits.outbound_frame_queue);
     let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel::<BudgetEviction>();
     let receive_budget = Arc::new(ReceiveBudget::with_parent(
         config.max_receive_buffer,
@@ -535,117 +804,14 @@ async fn serve_smux(
     // depend on every nested sender clone disappearing in a particular order.
     let writer_shutdown = Arc::new(tokio::sync::Notify::new());
     let writer_shutdown_signal = writer_shutdown.clone();
-    let mut writer_task = tokio::spawn(async move {
-        let mut updates_open = true;
-        let mut closing = false;
-        let ping_period = config
-            .keepalive_interval
-            .unwrap_or_else(|| std::time::Duration::from_secs(365 * 24 * 60 * 60));
-        let mut ping = tokio::time::interval(ping_period);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // `interval` ticks immediately; consume that tick so NOP is sent after
-        // one complete keepalive period.
-        ping.tick().await;
-        // The loop's `?` used to leave the async block outright, taking every
-        // queued command with it. Anything still in the channel has a stream
-        // waiting on it, so the exit has to be observed rather than taken.
-        let outcome: io::Result<()> = async {
-            loop {
-                tokio::select! {
-                update = updates_rx.recv(), if updates_open => {
-                    match update {
-                        Some(update) => {
-                            let mut payload = [0_u8; UPDATE_PAYLOAD_SIZE];
-                            payload[..4].copy_from_slice(&update.consumed.to_le_bytes());
-                            payload[4..].copy_from_slice(&update.window.to_le_bytes());
-                            write_frame(
-                                &mut writer,
-                                version,
-                                CMD_UPD,
-                                update.stream_id,
-                                &payload,
-                            ).await?;
-                        }
-                        None => updates_open = false,
-                    }
-                }
-                command = outbound_rx.recv() => {
-                    let Some(command) = command else { break };
-                    match command {
-                        OutboundCommand::Data { stream_id, data } => {
-                            write_frame(&mut writer, version, CMD_PSH, stream_id, &data).await?;
-                        }
-                        OutboundCommand::Finished { stream_id } => {
-                            write_frame(&mut writer, version, CMD_FIN, stream_id, &[]).await?;
-                        }
-                        OutboundCommand::Barrier { complete } => {
-                            // Bound the flush: a half-open physical stream can
-                            // stall flush forever, which would hold the
-                            // barrier's oneshot open, wedge the logical
-                            // stream's shutdown, and leak the outbound
-                            // connection in CLOSE_WAIT. On timeout report the
-                            // error so the logical stream closes anyway.
-                            let result = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                writer.flush(),
-                            )
-                            .await
-                            .map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "smux barrier flush timed out",
-                                )
-                            })?;
-                            let reported = result
-                                .as_ref()
-                                .map(|_| ())
-                                .map_err(|error| io::Error::new(error.kind(), error.to_string()));
-                            let _ = complete.send(reported);
-                            result?;
-                        }
-                    }
-                }
-                _ = ping.tick(), if config.keepalive_interval.is_some() => {
-                    write_frame(&mut writer, version, CMD_NOP, 0, &[]).await?;
-                }
-                _ = writer_shutdown_signal.notified(), if !closing => {
-                    // Closing the receiver rather than breaking: it refuses new
-                    // sends but still yields what is already queued, so the
-                    // barriers in flight are completed instead of dropped.
-                    // The drain then ends the loop through the `None` arm.
-                    outbound_rx.close();
-                    closing = true;
-                }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        // Answer whatever is still queued instead of dropping it. A stream
-        // whose flush was in flight when the peer went away was being told
-        // "the session writer dropped a flush barrier", which names the
-        // messenger rather than the failure -- and that is the ordinary case,
-        // not a rare one: a client closing its WebSocket mid-flush produced
-        // one of these for every stream that had a barrier outstanding. It
-        // now hears why.
-        outbound_rx.close();
-        while let Some(command) = outbound_rx.recv().await {
-            if let OutboundCommand::Barrier { complete } = command {
-                let reported = match &outcome {
-                    Ok(()) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("smux v{version} session ended before the flush completed"),
-                    )),
-                    Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
-                };
-                let _ = complete.send(reported);
-            }
-        }
-
-        outcome?;
-        writer.shutdown().await
-    });
+    let mut writer_task = tokio::spawn(run_session_writer(
+        writer,
+        version,
+        config.keepalive_interval,
+        outbound_rx,
+        updates_rx,
+        writer_shutdown_signal,
+    ));
 
     let mut streams: HashMap<u32, StreamState> = HashMap::new();
     // Held rather than detached so the session can cancel what it started.
@@ -658,23 +824,13 @@ async fn serve_smux(
         let frame_result = tokio::select! {
             biased;
             Some(eviction) = eviction_rx.recv() => {
-                if let Some(state) = streams.remove(&eviction.stream_id) {
-                    let cause = BackpressureCause::Bytes(eviction.scope);
-                    record_backpressure_drop(
-                        format_args!("smux v{version}"),
-                        eviction.stream_id,
-                        cause,
-                    );
-                    if let Some(task) = state.task {
-                        task.abort();
-                    }
-                    if let Some(terminal) = state.terminal {
-                        let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
-                            io::ErrorKind::OutOfMemory,
-                            format!("smux v{version} {cause}"),
-                        )));
-                    }
-                }
+                evict_stream(
+                    &mut streams,
+                    eviction.stream_id,
+                    BackpressureCause::Bytes(eviction.scope),
+                    version,
+                    config.stalled_stream_grace,
+                );
                 continue;
             }
             result = async {
@@ -783,63 +939,16 @@ async fn serve_smux(
                 // server closed the logical stream and sent FIN while this frame
                 // was already on the wire. Discard the payload -- failing the
                 // session here would punish every other stream sharing it.
-                let mut backpressure = None;
-                if let Some(inbound) = streams.get_mut(&frame.stream_id)
-                    && !frame.payload.is_empty()
-                    && let Some(sender) = &inbound.inbound
-                {
-                    // Charged to this stream first, so a stream that will not
-                    // drain exhausts its own budget rather than the session's,
-                    // and the streams beside it keep their room. Exhausting it
-                    // costs this stream only: the reader never waits, because
-                    // waiting freezes every other stream the same client has
-                    // open, and never fails the session, because that takes
-                    // those streams down outright.
-                    match inbound.budget.track(frame.payload) {
-                        Ok(data) => match sender.try_send(InboundEvent::Data(data)) {
-                            Ok(()) => {}
-                            Err(TrySendError::Closed(_)) => inbound.inbound = None,
-                            Err(TrySendError::Full(_)) => {
-                                backpressure = Some(BackpressureCause::FrameQueue)
-                            }
-                        },
-                        Err(error) => backpressure = Some(BackpressureCause::Bytes(error.scope)),
-                    }
-                }
-                if let Some(cause) = backpressure {
-                    record_backpressure_drop(
-                        format_args!("smux v{version}"),
+                if !frame.payload.is_empty() {
+                    deliver_payload(
+                        &mut streams,
+                        &mut eviction_rx,
+                        version,
+                        config.stalled_stream_grace,
                         frame.stream_id,
-                        cause,
-                    );
-                    // This stream is not draining as fast as its peer is
-                    // sending, and smux v1 has no per-stream window to push
-                    // back with. Dropping the frame would leave a hole in the
-                    // stream's byte sequence, so the stream itself cannot
-                    // survive -- but only this one. Failing the session here
-                    // tore down every other logical stream multiplexed onto the
-                    // same connection over a condition caused by one of them,
-                    // and the collateral was invisible because those streams
-                    // report their failures at debug level.
-                    if let Some(state) = streams.remove(&frame.stream_id) {
-                        if let Some(task) = state.task {
-                            task.abort();
-                        }
-                        if let Some(terminal) = state.terminal {
-                            let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
-                                io::ErrorKind::OutOfMemory,
-                                format!("smux v{version} {cause}"),
-                            )));
-                        }
-                    }
-                    // Deliberately no close from here. The stream's own drop
-                    // sends one through a permit reserved at SYN time, which
-                    // cannot block. Enqueuing another would duplicate it and --
-                    // because the outbound queue is bounded -- park the
-                    // *physical reader* whenever the writer is backed up,
-                    // stalling every stream on the connection over one
-                    // stream's overflow. A congested path is exactly where the
-                    // overflow and the backed-up writer happen together.
+                        frame.payload,
+                    )
+                    .await;
                 }
             }
             CMD_FIN => {
@@ -952,6 +1061,182 @@ async fn serve_smux(
     read_result.and(close_result).and(writer_result)
 }
 
+/// Remove a logical stream the session has given up on and tell it why.
+///
+/// Deliberately no close from here. The stream's own drop sends one through a
+/// permit reserved at SYN time, which cannot block. Enqueuing another would
+/// duplicate it and -- because the outbound queue is bounded -- park the
+/// physical reader whenever the writer is backed up, stalling every stream on
+/// the connection over one stream's failure.
+fn evict_stream(
+    streams: &mut HashMap<u32, StreamState>,
+    stream_id: u32,
+    cause: BackpressureCause,
+    version: u8,
+    grace: std::time::Duration,
+) {
+    let Some(state) = streams.remove(&stream_id) else {
+        return;
+    };
+    record_stalled_eviction(version, stream_id, cause, grace);
+    if let Some(task) = state.task {
+        task.abort();
+    }
+    if let Some(terminal) = state.terminal {
+        let _ = terminal.send(InboundTerminal::Failed(InboundFailure::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "smux v{version} {cause} and nothing drained for {}s",
+                grace.as_secs()
+            ),
+        )));
+    }
+}
+
+/// Queue one PSH payload for its logical stream, waiting for room when the
+/// stream, its session or the listener is out of budget.
+///
+/// While this waits the physical reader is parked, and that is the point: the
+/// peer's writes back up into TCP instead of into this process, which is how
+/// the reference smux implementation pushes back on a stream without a window
+/// of its own. Dropping the stream instead -- the old behaviour -- turned
+/// ordinary congestion into failed uploads. Evictions are still serviced while
+/// parked, since one of them may be what frees the room; and a wait that sees
+/// no refund at all for `grace` is resolved by evicting the stalled stream
+/// holding the most, so a wedged destination cannot hold its siblings hostage
+/// for longer than that.
+async fn deliver_payload(
+    streams: &mut HashMap<u32, StreamState>,
+    eviction_rx: &mut mpsc::UnboundedReceiver<BudgetEviction>,
+    version: u8,
+    grace: std::time::Duration,
+    stream_id: u32,
+    payload: Vec<u8>,
+) {
+    let mut payload = Some(payload);
+    let mut charged = None;
+    loop {
+        // Looked up afresh every turn: servicing an eviction below may have
+        // removed this very stream, and its payload then has nowhere to go.
+        let Some(state) = streams.get_mut(&stream_id) else {
+            return;
+        };
+        let Some(sender) = state.inbound.clone() else {
+            return;
+        };
+        if sender.is_closed() {
+            state.inbound = None;
+            return;
+        }
+        let budget = state.budget.clone();
+
+        let data = match charged.take() {
+            Some(data) => data,
+            None => {
+                let bytes = payload.take().expect("payload is held until it is charged");
+                let refused = match budget.try_track(bytes) {
+                    Ok(data) => {
+                        charged = Some(data);
+                        continue;
+                    }
+                    Err(refused) => refused,
+                };
+                let BudgetBlocked {
+                    bytes,
+                    blocked,
+                    scope,
+                    stream_evicted,
+                } = refused;
+                if stream_evicted {
+                    // Its session hears of the eviction on its own channel.
+                    return;
+                }
+                let length = bytes.len();
+                let refunded = blocked.refund_wait();
+                // Checked again now that a refund can no longer slip past
+                // unheard; the room may have appeared in between.
+                match budget.try_track(bytes) {
+                    Ok(data) => data,
+                    Err(again) => {
+                        payload = Some(again.bytes);
+                        if again.stream_evicted {
+                            return;
+                        }
+                        // Out of a different budget now; wait on that one.
+                        if !Arc::ptr_eq(&again.blocked, &blocked) {
+                            continue;
+                        }
+                        tokio::select! {
+                            biased;
+                            Some(eviction) = eviction_rx.recv() => evict_stream(
+                                streams,
+                                eviction.stream_id,
+                                BackpressureCause::Bytes(eviction.scope),
+                                version,
+                                grace,
+                            ),
+                            () = refunded => {}
+                            () = sender.closed() => {}
+                            () = tokio::time::sleep(grace) => {
+                                // Nothing under `blocked` drained for the whole
+                                // grace, so whoever holds the most of it is
+                                // wedged. If that is this stream, its eviction
+                                // arrives on the channel above next turn.
+                                budget.evict_stalled(&blocked, scope, length);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(InboundEvent::Data(data));
+                return;
+            }
+            Err(TrySendError::Closed(())) => {
+                if let Some(state) = streams.get_mut(&stream_id) {
+                    state.inbound = None;
+                }
+                return;
+            }
+            Err(TrySendError::Full(())) => {}
+        }
+        // The frame queue is full even though the byte budget had room: a peer
+        // sending many small frames. Same policy, counted in frames.
+        tokio::select! {
+            biased;
+            Some(eviction) = eviction_rx.recv() => {
+                evict_stream(
+                    streams,
+                    eviction.stream_id,
+                    BackpressureCause::Bytes(eviction.scope),
+                    version,
+                    grace,
+                );
+                charged = Some(data);
+            }
+            permit = sender.reserve() => {
+                match permit {
+                    Ok(permit) => permit.send(InboundEvent::Data(data)),
+                    Err(_) => {
+                        if let Some(state) = streams.get_mut(&stream_id) {
+                            state.inbound = None;
+                        }
+                    }
+                }
+                return;
+            }
+            () = tokio::time::sleep(grace) => {
+                evict_stream(streams, stream_id, BackpressureCause::FrameQueue, version, grace);
+                return;
+            }
+        }
+    }
+}
+
 fn validate_config(config: SmuxServerConfig) -> io::Result<()> {
     let limits = config.limits;
     if !matches!(config.version, VERSION_V1 | VERSION_V2) {
@@ -1032,7 +1317,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use async_trait::async_trait;
-    use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1425,6 +1710,7 @@ mod tests {
                 max_receive_buffer: 5,
                 max_stream_buffer: 5,
                 max_stream_receive_buffer: 5,
+                stalled_stream_grace: std::time::Duration::from_millis(20),
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1483,6 +1769,7 @@ mod tests {
             max_receive_buffer: 8,
             max_stream_buffer: 8,
             max_stream_receive_buffer: 8,
+            stalled_stream_grace: std::time::Duration::from_millis(20),
             ..SmuxServerConfig::default()
         };
 
@@ -1596,6 +1883,7 @@ mod tests {
                 max_receive_buffer: 4096,
                 max_stream_buffer: 8,
                 max_stream_receive_buffer: 4,
+                stalled_stream_grace: std::time::Duration::from_millis(20),
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1769,6 +2057,7 @@ mod tests {
                 max_receive_buffer: 64,
                 max_stream_buffer: 8,
                 max_stream_receive_buffer: 64,
+                stalled_stream_grace: std::time::Duration::from_millis(20),
                 ..SmuxServerConfig::default()
             },
             None,
@@ -1870,6 +2159,94 @@ mod tests {
             closes, 1,
             "the reader must leave the close to the stream's own drop"
         );
+    }
+
+    /// Reads its logical stream to the end once released, and reports what it
+    /// read -- a proxied destination that is slower than the client.
+    struct DrainingHandler {
+        release: Arc<Notify>,
+        received: mpsc::UnboundedSender<io::Result<Vec<u8>>>,
+    }
+
+    impl fmt::Debug for DrainingHandler {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("DrainingHandler")
+        }
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for DrainingHandler {
+        async fn setup_server_stream(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            let release = self.release.clone();
+            let received = self.received.clone();
+            Ok(TcpServerSetupResult::connection_task(async move {
+                release.notified().await;
+                let mut bytes = Vec::new();
+                let result = stream.read_to_end(&mut bytes).await.map(|_| bytes);
+                let _ = received.send(result);
+                Ok(())
+            }))
+        }
+    }
+
+    /// An upload faster than its destination is ordinary congestion, not a
+    /// wedged peer. smux v1 has no per-stream window, so the only honest
+    /// response is the one the reference implementation gives: stop reading
+    /// the physical connection until the stream drains. Killing the stream
+    /// instead failed real uploads a few hundred kilobytes in.
+    #[tokio::test]
+    async fn a_congested_stream_is_backpressured_rather_than_dropped() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let session = tokio::spawn(serve_smux(
+            Box::new(TestStream(server)),
+            Arc::new(DrainingHandler {
+                release: release.clone(),
+                received: received_tx,
+            }),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig::default(),
+            None,
+        ));
+
+        // Eight times what one stream may queue.
+        let payload: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|index: usize| (index.wrapping_mul(31) + 7) as u8)
+            .collect();
+        let writer = tokio::spawn({
+            let payload = payload.clone();
+            let mut client = client;
+            async move {
+                write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[]).await?;
+                for chunk in payload.chunks(32 * 1024) {
+                    write_frame(&mut client, VERSION_V1, CMD_PSH, 1, chunk).await?;
+                }
+                write_frame(&mut client, VERSION_V1, CMD_FIN, 1, &[]).await?;
+                Ok::<_, io::Error>(client)
+            }
+        });
+
+        // Let the stream's queue run well past its budget before its consumer
+        // starts taking anything.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.notify_one();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv())
+            .await
+            .expect("the congested stream must finish once its consumer reads")
+            .expect("the handler reports what it read")
+            .expect("a congested stream must be backpressured, not dropped");
+        assert_eq!(received.len(), payload.len());
+        assert!(received == payload, "bytes must arrive intact and in order");
+
+        let mut client = writer.await.unwrap().unwrap();
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session).await;
     }
 
     #[derive(Debug, Default)]
@@ -2002,5 +2379,354 @@ mod tests {
             .await
             .expect("closed smux session must not leave the writer in a hot loop")
             .unwrap();
+    }
+
+    /// Records every write the session makes to its physical stream.
+    struct RecordingStream {
+        inner: DuplexStream,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+            self.writes
+                .lock()
+                .expect("recording mutex poisoned")
+                .push(buf[..written].to_vec());
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for RecordingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for RecordingStream {}
+
+    /// Writes one payload into the logical stream it is handed, then parks.
+    struct WritingHandler {
+        payload: &'static [u8],
+    }
+
+    impl fmt::Debug for WritingHandler {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("WritingHandler")
+        }
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for WritingHandler {
+        async fn setup_server_stream(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            let payload = self.payload;
+            Ok(TcpServerSetupResult::connection_task(async move {
+                stream.write_all(payload).await?;
+                stream.flush().await?;
+                std::future::pending::<()>().await;
+                Ok(())
+            }))
+        }
+    }
+
+    /// A frame's header used to be written on its own, and every write reaches
+    /// the wire as its own WebSocket frame, TLS record and -- with Nagle off --
+    /// its own segment: eight bytes of header per packet, on every frame.
+    #[tokio::test]
+    async fn a_data_frame_leaves_in_a_single_write() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let session = tokio::spawn(serve_smux(
+            Box::new(RecordingStream {
+                inner: server,
+                writes: writes.clone(),
+            }),
+            Arc::new(WritingHandler { payload: b"hello" }),
+            Arc::new(NativeResolver::new()),
+            None,
+            SmuxServerConfig::default(),
+            None,
+        ));
+
+        write_frame(&mut client, VERSION_V1, CMD_SYN, 1, &[])
+            .await
+            .unwrap();
+        let mut received = [0u8; HEADER_SIZE + 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_exact(&mut received),
+        )
+        .await
+        .expect("the logical stream's data must reach the peer")
+        .unwrap();
+
+        let mut expected = vec![VERSION_V1, CMD_PSH, 5, 0, 1, 0, 0, 0];
+        expected.extend_from_slice(b"hello");
+        assert_eq!(received.as_slice(), expected.as_slice());
+        let writes = writes.lock().expect("recording mutex poisoned").clone();
+        assert!(
+            writes.iter().any(|write| write == &expected),
+            "header and payload must share one write, got {writes:?}"
+        );
+        session.abort();
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WriterEvent {
+        Write(Vec<u8>),
+        /// `barrier` is what the watched barrier had been answered with by
+        /// the time of this flush: `None` while still outstanding.
+        Flush {
+            barrier: Option<bool>,
+        },
+        Shutdown,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        events: Arc<Mutex<Vec<WriterEvent>>>,
+        barrier: Arc<Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
+        fail_writes: bool,
+    }
+
+    impl RecordingWriter {
+        fn events(&self) -> Vec<WriterEvent> {
+            std::mem::take(&mut *self.events.lock().expect("events mutex poisoned"))
+        }
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_writes {
+                return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
+            self.events
+                .lock()
+                .expect("events mutex poisoned")
+                .push(WriterEvent::Write(buf.to_vec()));
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let barrier = self
+                .barrier
+                .lock()
+                .expect("barrier mutex poisoned")
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok())
+                .map(|result| result.is_ok());
+            self.events
+                .lock()
+                .expect("events mutex poisoned")
+                .push(WriterEvent::Flush { barrier });
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.events
+                .lock()
+                .expect("events mutex poisoned")
+                .push(WriterEvent::Shutdown);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn encoded(command: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = frame_header(VERSION_V1, command, stream_id, payload.len() as u16).to_vec();
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn data(stream_id: u32, payload: &[u8]) -> OutboundCommand {
+        OutboundCommand::Data {
+            stream_id,
+            frame: OutboundFrame::copy_from(payload),
+        }
+    }
+
+    /// Run the writer over commands that were all queued before it started,
+    /// the way a busy session finds its queue after a wakeup.
+    async fn drain_queued(
+        writer: RecordingWriter,
+        commands: Vec<OutboundCommand>,
+    ) -> io::Result<()> {
+        let (outbound_tx, outbound_rx) = mpsc::channel(commands.len().max(1));
+        for command in commands {
+            outbound_tx
+                .try_send(command)
+                .expect("queue sized for every command");
+        }
+        drop(outbound_tx);
+        let (_updates_tx, updates_rx) = mpsc::channel(1);
+        run_session_writer(
+            writer,
+            VERSION_V1,
+            None,
+            outbound_rx,
+            updates_rx,
+            Arc::new(Notify::new()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn queued_frames_from_several_streams_share_one_write() {
+        let writer = RecordingWriter::default();
+        drain_queued(
+            writer.clone(),
+            vec![
+                data(1, b"aa"),
+                data(3, b"bbb"),
+                data(1, b"c"),
+                OutboundCommand::Finished { stream_id: 1 },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut expected = encoded(CMD_PSH, 1, b"aa");
+        expected.extend(encoded(CMD_PSH, 3, b"bbb"));
+        expected.extend(encoded(CMD_PSH, 1, b"c"));
+        expected.extend(encoded(CMD_FIN, 1, &[]));
+        assert_eq!(
+            writer.events(),
+            vec![
+                WriterEvent::Write(expected),
+                WriterEvent::Flush { barrier: None },
+                WriterEvent::Shutdown,
+            ]
+        );
+    }
+
+    /// A barrier promises its stream that everything queued before it has been
+    /// written and flushed, so it closes its batch, is answered only after that
+    /// batch's flush, and does not hold back what was queued after it.
+    #[tokio::test]
+    async fn a_barrier_ends_its_batch_and_is_answered_after_the_flush() {
+        let writer = RecordingWriter::default();
+        let (complete, answered) = oneshot::channel();
+        *writer.barrier.lock().unwrap() = Some(answered);
+        drain_queued(
+            writer.clone(),
+            vec![
+                data(1, b"before"),
+                OutboundCommand::Barrier { complete },
+                data(1, b"after"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            writer.events(),
+            vec![
+                WriterEvent::Write(encoded(CMD_PSH, 1, b"before")),
+                WriterEvent::Flush { barrier: None },
+                WriterEvent::Write(encoded(CMD_PSH, 1, b"after")),
+                WriterEvent::Flush {
+                    barrier: Some(true)
+                },
+                WriterEvent::Shutdown,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_stops_growing_at_its_limit() {
+        let writer = RecordingWriter::default();
+        let payload = vec![7u8; 16 * 1024];
+        drain_queued(
+            writer.clone(),
+            (1..=10)
+                .map(|stream_id| data(stream_id, &payload))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        let writes: Vec<Vec<u8>> = writer
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                WriterEvent::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        let frame_len = HEADER_SIZE + payload.len();
+        // Four 16 KiB frames reach the limit, so ten go out as 4 + 4 + 2.
+        assert_eq!(
+            writes.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![4 * frame_len, 4 * frame_len, 2 * frame_len]
+        );
+        let expected: Vec<u8> = (1..=10)
+            .flat_map(|stream_id| encoded(CMD_PSH, stream_id, &payload))
+            .collect();
+        assert_eq!(writes.concat(), expected);
+    }
+
+    /// Batching must not turn a write failure into the generic "dropped a
+    /// flush barrier" for a stream whose barrier shared the failed batch.
+    #[tokio::test]
+    async fn a_failed_batch_reports_its_error_to_the_barrier() {
+        let writer = RecordingWriter {
+            fail_writes: true,
+            ..RecordingWriter::default()
+        };
+        let (complete, answered) = oneshot::channel();
+        let result = drain_queued(
+            writer,
+            vec![data(1, b"lost"), OutboundCommand::Barrier { complete }],
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            answered.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
+    fn outbound_frames_carry_room_for_the_header() {
+        let frame = OutboundFrame::copy_from(b"abc");
+        assert_eq!(frame.payload(), b"abc");
+        assert_eq!(
+            frame.into_frame(frame_header(VERSION_V1, CMD_PSH, 9, 3)),
+            encoded(CMD_PSH, 9, b"abc")
+        );
     }
 }

@@ -10,7 +10,17 @@ use crate::config::WebsocketPingType;
 use crate::util::{LazyBuffer, allocate_vec};
 
 const READ_BUFFER_SIZE: usize = 32 * 1024;
-const WRITE_BUFFER_SIZE: usize = 32 * 1024;
+/// Most frame bytes this stream holds unwritten at once.
+///
+/// Sized so the largest single write the proxy path issues -- one maximal
+/// Shadowsocks 2022 chunk, 0xFFFF bytes of payload plus 34 of AEAD framing --
+/// still leaves as one frame. At 32 KiB such a write was split into two frames
+/// and so two transport writes. This is only a ceiling: the storage is sized to
+/// the frames actually pending, so a small write takes a small allocation, and
+/// it is given back as soon as it drains.
+const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024 + 128;
+/// Two header bytes, an eight-byte extended length and a four-byte mask.
+const MAX_FRAME_HEADER_SIZE: usize = 14;
 const MAX_CONTROL_PAYLOAD_SIZE: usize = 125;
 
 pub struct WebsocketStream {
@@ -35,9 +45,10 @@ pub struct WebsocketStream {
     unprocessed_start_offset: usize,
     unprocessed_end_offset: usize,
 
-    write_frame: LazyBuffer,
+    /// Frames packed but not yet written; `write_frame_start_offset` of them
+    /// already have been. Empty, with no allocation, while nothing is pending.
+    write_frame: Vec<u8>,
     write_frame_start_offset: usize,
-    write_frame_end_offset: usize,
 
     control_data: Box<[u8]>,
     control_data_size: usize,
@@ -93,7 +104,6 @@ impl WebsocketStream {
         debug_assert!(unprocessed_data.len() <= READ_BUFFER_SIZE);
         let mut unprocessed_buf = LazyBuffer::new(READ_BUFFER_SIZE);
         let mut unprocessed_end_offset = 0;
-        let write_frame = LazyBuffer::new(WRITE_BUFFER_SIZE);
         let control_data = allocate_vec(MAX_CONTROL_PAYLOAD_SIZE).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
@@ -124,9 +134,8 @@ impl WebsocketStream {
             unprocessed_buf,
             unprocessed_start_offset: 0,
             unprocessed_end_offset,
-            write_frame,
+            write_frame: Vec::new(),
             write_frame_start_offset: 0,
-            write_frame_end_offset: 0,
             control_data,
             control_data_size: 0,
             pending_control: None,
@@ -415,15 +424,11 @@ impl WebsocketStream {
         let content_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
         if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
+            apply_mask(
+                content_bytes,
+                self.read_frame_mask,
+                self.read_frame_mask_offset,
             );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
             self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
         }
 
@@ -474,15 +479,11 @@ impl WebsocketStream {
         let content_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
         if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
+            apply_mask(
+                content_bytes,
+                self.read_frame_mask,
+                self.read_frame_mask_offset,
             );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
             self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
         }
 
@@ -523,39 +524,28 @@ impl WebsocketStream {
         Ok(())
     }
 
+    /// Room left for more frames under [`MAX_PENDING_WRITE_BYTES`].
+    fn write_frame_space(&self) -> usize {
+        MAX_PENDING_WRITE_BYTES.saturating_sub(self.write_frame.len())
+    }
+
     fn pack_write_ping_frame(&mut self) -> bool {
-        self.write_frame.ensure();
-        let available_space = self.write_frame.len() - self.write_frame_end_offset;
-        if available_space < 6 {
+        if self.write_frame_space() < 6 {
             return false;
         }
 
-        let written = pack_frame(
-            0x09,
-            self.is_client,
-            &[],
-            &mut self.write_frame[self.write_frame_end_offset..],
-        );
-        self.write_frame_end_offset += written;
+        pack_frame(0x09, self.is_client, &[], &mut self.write_frame);
 
         true
     }
 
     fn pack_write_empty_frame(&mut self) -> bool {
-        self.write_frame.ensure();
-        let available_space = self.write_frame.len() - self.write_frame_end_offset;
-        if available_space < 6 {
+        if self.write_frame_space() < 6 {
             return false;
         }
 
         // 0x02 is binary
-        let written = pack_frame(
-            0x02,
-            self.is_client,
-            &[],
-            &mut self.write_frame[self.write_frame_end_offset..],
-        );
-        self.write_frame_end_offset += written;
+        pack_frame(0x02, self.is_client, &[], &mut self.write_frame);
 
         true
     }
@@ -564,11 +554,8 @@ impl WebsocketStream {
         let Some(opcode) = self.pending_control else {
             return true;
         };
-        self.write_frame.ensure();
-        let available_space = self.write_frame.len() - self.write_frame_end_offset;
-
         // up to 14 bytes for header and mask
-        if available_space < self.control_data_size + 14 {
+        if self.write_frame_space() < self.control_data_size + MAX_FRAME_HEADER_SIZE {
             return false;
         }
 
@@ -577,13 +564,12 @@ impl WebsocketStream {
             OpCode::Pong => 0x0a,
             _ => unreachable!("only close and pong frames may be pending"),
         };
-        let written = pack_frame(
+        pack_frame(
             opcode_byte,
             self.is_client,
             &self.control_data[0..self.control_data_size],
-            &mut self.write_frame[self.write_frame_end_offset..],
+            &mut self.write_frame,
         );
-        self.write_frame_end_offset += written;
         self.pending_control = None;
         if opcode == OpCode::Close {
             self.close_sent = true;
@@ -593,32 +579,32 @@ impl WebsocketStream {
     }
 
     fn pack_write_frame(&mut self, input: &[u8]) -> usize {
-        self.write_frame.ensure();
-        let available_space = self.write_frame.len() - self.write_frame_end_offset;
+        let available_space = self.write_frame_space();
 
         // we need up to 14 bytes just for the header and mask.
         if available_space < 40 {
             return 0;
         }
 
-        let pack_amount = std::cmp::min(input.len(), available_space - 14);
+        let pack_amount = std::cmp::min(input.len(), available_space - MAX_FRAME_HEADER_SIZE);
 
         // 0x02 is binary
-        let written = pack_frame(
+        pack_frame(
             0x02,
             self.is_client,
             &input[0..pack_amount],
-            &mut self.write_frame[self.write_frame_end_offset..],
+            &mut self.write_frame,
         );
-        self.write_frame_end_offset += written;
 
         pack_amount
     }
 
     fn do_write_frame(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
         loop {
-            let remaining_data =
-                &self.write_frame[self.write_frame_start_offset..self.write_frame_end_offset];
+            let remaining_data = &self.write_frame[self.write_frame_start_offset..];
+            if remaining_data.is_empty() {
+                break;
+            }
 
             match Pin::new(&mut self.stream).poll_write(cx, remaining_data) {
                 Poll::Ready(Ok(written)) => {
@@ -630,9 +616,9 @@ impl WebsocketStream {
                         ));
                     }
                     self.write_frame_start_offset += written;
-                    if self.write_frame_start_offset == self.write_frame_end_offset {
+                    if self.write_frame_start_offset == self.write_frame.len() {
                         self.write_frame_start_offset = 0;
-                        self.write_frame_end_offset = 0;
+                        self.write_frame.clear();
                         break;
                     }
                 }
@@ -645,8 +631,10 @@ impl WebsocketStream {
             }
         }
 
-        if self.write_frame_end_offset == 0 {
-            self.write_frame.release();
+        if self.write_frame.is_empty() {
+            // Given back as soon as it drains, like the read buffer: a stream
+            // that is not mid-write needs no frame storage at all.
+            self.write_frame = Vec::new();
         }
 
         Ok(())
@@ -656,15 +644,15 @@ impl WebsocketStream {
         loop {
             if self.pending_control.is_some() && !self.pack_pending_control_frame() {
                 self.do_write_frame(cx)?;
-                if self.write_frame_end_offset > 0 {
+                if !self.write_frame.is_empty() {
                     return Poll::Pending;
                 }
                 continue;
             }
 
-            if self.write_frame_end_offset > 0 {
+            if !self.write_frame.is_empty() {
                 self.do_write_frame(cx)?;
-                if self.write_frame_end_offset > 0 {
+                if !self.write_frame.is_empty() {
                     return Poll::Pending;
                 }
             }
@@ -686,7 +674,7 @@ impl WebsocketStream {
 
     #[cfg(test)]
     fn held_write_bytes(&self) -> usize {
-        self.write_frame.held_bytes()
+        self.write_frame.capacity()
     }
 
     fn reset_unprocessed_buf_offset(&mut self) {
@@ -902,7 +890,7 @@ impl AsyncWrite for WebsocketStream {
                 return Poll::Ready(Err(e));
             }
 
-            if this.write_frame_end_offset > 0 {
+            if !this.write_frame.is_empty() {
                 // Not everything could be written.
                 break;
             }
@@ -925,15 +913,15 @@ impl AsyncWrite for WebsocketStream {
             ready!(this.poll_flush_pending_control(cx))?;
         }
 
-        if this.write_frame_end_offset == 0 {
+        if this.write_frame.is_empty() {
             return Pin::new(&mut this.stream).poll_flush(cx);
         }
 
         // Create a new write frame when flush is called when we don't have one.
-        while this.write_frame_end_offset > 0 {
+        while !this.write_frame.is_empty() {
             match this.do_write_frame(cx) {
                 Ok(()) => {
-                    if this.write_frame_end_offset > 0 {
+                    if !this.write_frame.is_empty() {
                         return Poll::Pending;
                     }
                 }
@@ -990,7 +978,7 @@ impl AsyncPing for WebsocketStream {
         }
 
         // Don't bother writing a ping if we have other things to write.
-        if this.write_frame_end_offset > 0 {
+        if !this.write_frame.is_empty() {
             return Poll::Ready(Ok(false));
         }
 
@@ -1013,58 +1001,68 @@ impl AsyncPing for WebsocketStream {
 
 impl AsyncStream for WebsocketStream {}
 
-#[inline]
-fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> usize {
+/// Appends one frame to `output`.
+///
+/// Appending rather than writing into a fixed buffer lets the pending storage
+/// be sized to what is actually pending, and copies the payload once with no
+/// zero-fill ahead of it.
+fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut Vec<u8>) {
     let input_len = input.len();
+    output.reserve_exact(MAX_FRAME_HEADER_SIZE + input_len);
 
     // 0x80 is final
-    output[0] = opcode | 0x80;
-
-    let mut offset = if input_len < 126 {
-        output[1] = input_len as u8;
-        2
-    } else if input_len <= 65535 {
-        output[1] = 0x7e;
-        let size_bytes = (input_len as u16).to_be_bytes();
-        output[2..4].copy_from_slice(&size_bytes);
-        4
-    } else {
-        output[1] = 0x7f;
-        let size_bytes = (input_len as u64).to_be_bytes();
-        output[2..10].copy_from_slice(&size_bytes);
-        10
-    };
+    output.push(opcode | 0x80);
 
     // Client must be masked, but optional for server.
-    let mask = if use_mask {
-        // set the masking bit
-        output[1] |= 0x80;
+    let mask_bit = if use_mask { 0x80 } else { 0 };
+    if input_len < 126 {
+        output.push(mask_bit | input_len as u8);
+    } else if input_len <= 65535 {
+        output.push(mask_bit | 0x7e);
+        output.extend_from_slice(&(input_len as u16).to_be_bytes());
+    } else {
+        output.push(mask_bit | 0x7f);
+        output.extend_from_slice(&(input_len as u64).to_be_bytes());
+    }
 
+    if use_mask {
         let mut mask_bytes = [0u8; 4];
         let mut rng = rand::rng();
         rng.fill_bytes(&mut mask_bytes);
+        output.extend_from_slice(&mask_bytes);
 
-        output[offset..offset + 4].copy_from_slice(&mask_bytes);
-        offset += 4;
-
-        Some(mask_bytes)
+        let payload_start = output.len();
+        output.extend_from_slice(input);
+        apply_mask(&mut output[payload_start..], mask_bytes, 0);
     } else {
-        None
-    };
-
-    if input_len > 0 {
-        output[offset..offset + input_len].copy_from_slice(input);
-        if let Some(mask_bytes) = mask {
-            let iter = output[offset..offset + input_len]
-                .iter_mut()
-                .zip(mask_bytes.iter().cycle());
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
-        }
+        output.extend_from_slice(input);
     }
+}
 
-    offset + input_len
+/// XORs `data` with a frame mask, `offset` bytes into the frame's payload.
+///
+/// Every byte a client sends passes through here, so it works a machine word
+/// at a time. The byte-at-a-time spelling (`zip` with a cycling mask) did not
+/// vectorize and was measured at over half of the process's CPU on a
+/// WebSocket upload -- more than the AEAD decryption of the same bytes.
+fn apply_mask(data: &mut [u8], mask: [u8; 4], offset: usize) {
+    let rotated = [
+        mask[offset % 4],
+        mask[(offset + 1) % 4],
+        mask[(offset + 2) % 4],
+        mask[(offset + 3) % 4],
+    ];
+    let half = u32::from_ne_bytes(rotated) as u64;
+    let word = half | (half << 32);
+
+    let mut chunks = data.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let value = u64::from_ne_bytes(chunk.try_into().expect("chunk is eight bytes")) ^ word;
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+    for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= rotated[index % 4];
+    }
 }
 
 fn validate_close_payload(payload: &[u8]) -> std::io::Result<()> {
@@ -1550,9 +1548,9 @@ mod tests {
             &[],
         );
 
-        let mut frame = [0u8; 16];
-        let frame_len = pack_frame(0x02, false, b"ok", &mut frame);
-        peer_io.write_all(&frame[..frame_len]).await.unwrap();
+        let mut frame = Vec::new();
+        pack_frame(0x02, false, b"ok", &mut frame);
+        peer_io.write_all(&frame).await.unwrap();
 
         let mut empty = [];
         let mut read_buf = ReadBuf::new(&mut empty);
@@ -1564,5 +1562,181 @@ mod tests {
         let mut out = [0u8; 2];
         stream.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"ok");
+    }
+
+    /// Reads one unmasked server frame header, returning (first byte, payload length).
+    async fn read_server_frame_header(peer_io: &mut DuplexStream) -> (u8, usize) {
+        let mut head = [0u8; 2];
+        peer_io.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[1] & 0x80, 0, "server frames must not be masked");
+        let length = match head[1] & 0x7f {
+            126 => {
+                let mut length = [0u8; 2];
+                peer_io.read_exact(&mut length).await.unwrap();
+                u16::from_be_bytes(length) as usize
+            }
+            127 => {
+                let mut length = [0u8; 8];
+                peer_io.read_exact(&mut length).await.unwrap();
+                u64::from_be_bytes(length) as usize
+            }
+            length => length as usize,
+        };
+        (head[0], length)
+    }
+
+    /// The largest single write on the proxy path is one Shadowsocks 2022
+    /// chunk: 0xFFFF bytes of payload and 34 of AEAD framing. It used to leave
+    /// as two frames -- two transport writes -- because the frame buffer held
+    /// only 32 KiB.
+    #[tokio::test]
+    async fn a_maximal_proxy_write_leaves_as_one_frame() {
+        for size in [50_000usize, 0xFFFF + 34] {
+            let (mut peer_io, server_io) = duplex(256 * 1024);
+            let mut stream = server_stream(server_io);
+            let payload = (0..size).map(|index| index as u8).collect::<Vec<_>>();
+
+            let written = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, &payload))
+                .await
+                .unwrap();
+            assert_eq!(written, size, "one poll_write must take the whole write");
+            stream.flush().await.unwrap();
+
+            let (first, length) = read_server_frame_header(&mut peer_io).await;
+            assert_eq!(first, 0x82);
+            assert_eq!(length, size, "the write must not be split across frames");
+            let mut received = vec![0u8; length];
+            peer_io.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+
+    fn bytewise_mask(data: &[u8], mask: [u8; 4], offset: usize) -> Vec<u8> {
+        data.iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[(offset + index) % 4])
+            .collect()
+    }
+
+    #[test]
+    fn word_mask_matches_bytewise_reference() {
+        let mask = [0xa1, 0x5b, 0x3c, 0xe7];
+        let mut lengths = (0..=70).collect::<Vec<_>>();
+        lengths.push(100_003);
+        for offset in 0..4 {
+            for &length in &lengths {
+                let original = (0..length)
+                    .map(|index| (index * 31 + 7) as u8)
+                    .collect::<Vec<_>>();
+                let mut masked = original.clone();
+                apply_mask(&mut masked, mask, offset);
+                assert_eq!(
+                    masked,
+                    bytewise_mask(&original, mask, offset),
+                    "offset {offset}, length {length}"
+                );
+
+                // A frame is unmasked in whatever pieces the transport hands
+                // over, carrying the offset from one piece to the next.
+                for split in [0, 1, 3, 5, length / 2, length] {
+                    if split > length {
+                        continue;
+                    }
+                    let mut pieces = original.clone();
+                    let (head, tail) = pieces.split_at_mut(split);
+                    apply_mask(head, mask, offset);
+                    apply_mask(tail, mask, (offset + split) % 4);
+                    assert_eq!(pieces, masked, "offset {offset}, split {split}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn masked_frames_split_across_partial_reads_decode_exactly() {
+        // A 64-byte pipe forces the transport to deliver every frame in many
+        // pieces, and the odd read sizes below split it again on the way out,
+        // so the mask offset has to carry across both.
+        let (mut peer_io, server_io) = duplex(64);
+        let mut stream = server_stream(server_io);
+        let first = (0..40_003u32)
+            .map(|index| (index * 7) as u8)
+            .collect::<Vec<_>>();
+        let second = (0..1_001u32)
+            .map(|index| (index * 13) as u8)
+            .collect::<Vec<_>>();
+        let mut wire = masked_frame(0x82, &first);
+        wire.extend_from_slice(&masked_frame(0x82, &second));
+
+        let writer = tokio::spawn(async move {
+            for piece in wire.chunks(37) {
+                peer_io.write_all(piece).await.unwrap();
+            }
+            peer_io
+        });
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        let mut received = Vec::with_capacity(expected.len());
+        let read_sizes = [1usize, 7, 13, 4099, 3, 64];
+        let mut next = 0;
+        while received.len() < expected.len() {
+            let want = read_sizes[next % read_sizes.len()].min(expected.len() - received.len());
+            next += 1;
+            let mut chunk = vec![0u8; want];
+            let read = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(read > 0, "stream ended early at {} bytes", received.len());
+            received.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(received, expected);
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn masked_control_payload_split_across_reads_is_echoed_intact() {
+        let (mut peer_io, server_io) = duplex(4096);
+        let mut stream = server_stream(server_io);
+        let read_task = tokio::spawn(async move {
+            let mut data = [0u8; 1];
+            stream.read(&mut data).await
+        });
+
+        let payload = (0..MAX_CONTROL_PAYLOAD_SIZE)
+            .map(|index| (index * 3 + 1) as u8)
+            .collect::<Vec<_>>();
+        let frame = masked_frame(0x89, &payload);
+        for piece in [&frame[..9], &frame[9..70], &frame[70..]] {
+            peer_io.write_all(piece).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let (first, length) = read_server_frame_header(&mut peer_io).await;
+        assert_eq!(first, 0x8a);
+        let mut pong = vec![0u8; length];
+        timeout(Duration::from_secs(1), peer_io.read_exact(&mut pong))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong, payload);
+        read_task.abort();
+    }
+
+    #[test]
+    fn client_frames_are_masked_with_the_advertised_key() {
+        let payload = (0..1_000u32).map(|index| index as u8).collect::<Vec<_>>();
+        let mut frame = Vec::new();
+        pack_frame(0x02, true, &payload, &mut frame);
+
+        assert_eq!(frame[0], 0x82);
+        assert_eq!(frame[1], 0x80 | 0x7e, "masked, with a 16-bit length");
+        assert_eq!(
+            u16::from_be_bytes([frame[2], frame[3]]) as usize,
+            payload.len()
+        );
+        let mask = [frame[4], frame[5], frame[6], frame[7]];
+        assert_eq!(bytewise_mask(&frame[8..], mask, 0), payload);
     }
 }
